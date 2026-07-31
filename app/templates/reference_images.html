@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Images de référence — Marinos AppBox{% endblock %}
+{% block page_title %}Images de référence{% endblock %}
+{% block content %}
+<section class="hero reference-hero-simple">
+ <div>
+  <div class="eyebrow">Catalogue applicatif</div>
+  <h1>Créer et gérer les références de déploiement</h1>
+  <p>Une référence est créée depuis une application existante, puis utilisée pour déployer de nouvelles AppBox avec la même configuration utile.</p>
+ </div>
+ <button type="button" data-open-dialog="reference-create-server">Ajouter une référence</button>
+</section>
+
+<div class="resource-section-tabs reference-tabs" data-resource-tabs>
+ <button class="active" data-target="library">Bibliothèque <span>{{images|length}}</span></button>
+ <button data-target="create">Depuis un serveur <span>{{builds|length}}</span></button>
+ <button data-target="import">Depuis un fichier</button>
+</div>
+
+<section class="resource-panel active" data-panel="library">
+ <div class="section-head"><div><h2>Bibliothèque</h2><p>Références disponibles pour les futurs déploiements.</p></div></div>
+ <div class="reference-grid">
+ {% for image in images %}
+  <article class="card reference-card">
+   <div class="card-top">
+    <div class="reference-heading"><span class="reference-brand {{image.media_type}}"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M8.2 2h4.2l5.4 10-5.4 10H8.2l5.4-10L8.2 2Z"/></svg></span><div><div class="eyebrow">{{image.media_type|upper}}</div><h3>{{image.name}}</h3></div></div>
+    <span class="pill {{'ok' if image.status=='published' else 'warn'}}">{{'DISPONIBLE' if image.status=='published' else image.status|upper}}</span>
+   </div>
+   <p class="metric-sub">{{image.description or 'Référence applicative prête à être utilisée.'}}</p>
+   <div class="reference-current compact">
+    <div><span>Version</span><strong>{{image.current_version or 'Non publiée'}}</strong></div>
+    <div><span>Application</span><strong>{{image.application_version or '—'}}</strong></div>
+    <div><span>Taille</span><strong>{{'%.2f Go'|format((image.size_bytes or 0) / 1073741824)}}</strong></div>
+    <div><span>Créée</span><strong>{{image.created_at[:10] if image.created_at else '—'}}</strong></div>
+   </div>
+  </article>
+ {% else %}
+  <div class="card empty reference-empty"><strong>Aucune référence disponible</strong><span>Commencez par analyser une instance Plex existante depuis l’onglet « Depuis un serveur ».</span><button type="button" data-open-dialog="reference-create-server">Ajouter une référence</button></div>
+ {% endfor %}
+ </div>
+</section>
+
+<section class="resource-panel" data-panel="create">
+ <div class="panel-toolbar"><div><h2>Créer depuis un serveur</h2><p>Sélectionnez un node, analysez son instance Plex, puis lancez la création lorsqu’elle sera disponible.</p></div><button type="button" data-open-dialog="reference-create-server">Nouvelle analyse</button></div>
+ <div class="reference-flow-strip">
+  <div class="active"><span>1</span><strong>Choisir le serveur</strong></div><i>→</i>
+  <div><span>2</span><strong>Analyser Plex</strong></div><i>→</i>
+  <div><span>3</span><strong>Créer la référence</strong></div><i>→</i>
+  <div><span>4</span><strong>Publier</strong></div>
+ </div>
+ <div class="reference-grid">
+ {% for build in builds %}
+  <article class="card reference-card">
+   <div class="card-top">
+    <div class="reference-heading"><span class="reference-brand plex"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M8.2 2h4.2l5.4 10-5.4 10H8.2l5.4-10L8.2 2Z"/></svg></span><div><div class="eyebrow">PLEX · {{build.source_node_name or build.source_node_id}}</div><h3>{{build.display_name}}</h3></div></div>
+    {% if build.status in ['completed','published'] %}<span class="pill ok">RÉFÉRENCE CRÉÉE</span>{% elif build.status=='discovered' %}<span class="pill ok">ANALYSE TERMINÉE</span>{% elif build.status in ['build_failed','discovery_failed','failed'] %}<span class="pill bad">ÉCHEC</span>{% elif build.status=='draft' %}<span class="pill">À ANALYSER</span>{% elif build.status=='building' %}<span class="pill warn">CAPTURE EN COURS</span>{% else %}<span class="pill warn">ANALYSE EN COURS</span>{% endif %}
+   </div>
+   <p class="metric-sub">{{build.description or 'Source de référence Plex.'}}</p>
+   {% if build.status=='build_failed' %}
+    <div class="reference-blocked"><strong>Capture échouée</strong><span>{{build.error_text or 'Une erreur est survenue pendant la capture.'}}</span></div>
+    <form method="post" action="/reference-builds/{{build.build_id}}/retry"><button type="submit">Relancer la capture</button></form>
+   {% elif build.source_report %}
+    {% set report = build.source_report %}{% set preflight = report.preflight or {} %}{% set totals = report.totals or {} %}
+    {% if preflight.can_build %}
+     <div class="reference-ready"><strong>Instance compatible</strong><span>L’analyse n’a détecté aucun blocage pour la future création.</span></div>
+    {% else %}
+     <div class="reference-blocked"><strong>Création impossible</strong><span>{{(preflight.errors or preflight.warnings or ['La pré-validation a échoué.'])|join(' · ')}}</span></div>
+    {% endif %}
+    <div class="reference-current compact">
+     <div><span>Version Plex</span><strong>{{report.instance.plex_version or 'Inconnue'}}</strong></div>
+     <div><span>Bibliothèques</span><strong>{{report.libraries|length}}</strong></div>
+     <div><span>Films</span><strong>{{totals.movies or 0}}</strong></div>
+     <div><span>Séries</span><strong>{{totals.shows or 0}}</strong></div>
+     <div><span>Saisons</span><strong>{{totals.seasons or 0}}</strong></div>
+     <div><span>Épisodes</span><strong>{{totals.episodes or 0}}</strong></div>
+    </div>
+    <details class="reference-details"><summary>Voir les bibliothèques et les volumes détectés</summary>
+     <div class="reference-detail-columns"><div><h4>Bibliothèques</h4><ul>{% for library in report.libraries %}<li><strong>{{library.name}}</strong><span>{{library.kind}}</span></li>{% else %}<li>Aucune bibliothèque détectée</li>{% endfor %}</ul></div><div><h4>Volumes</h4><ul>{% for mount in report.mounts %}<li><strong>{{mount.destination}}</strong><span>{{mount.category|upper}}</span></li>{% else %}<li>Aucun volume détecté</li>{% endfor %}</ul></div></div>
+    </details>
+    {% if preflight.can_build %}<button type="button" disabled title="La capture réelle sera activée dans le prochain sprint">Créer la référence</button>{% endif %}
+   {% elif build.status in ['draft','discovery_failed'] %}
+    {% if build.status=='discovery_failed' %}<div class="reference-blocked"><strong>Analyse échouée</strong><span>Vérifiez que l’agent est connecté et que le conteneur Plex est accessible.</span></div>{% endif %}
+    <form method="post" action="/reference-builds/{{build.build_id}}/discover" class="reference-analyze-form">
+     <label>Conteneur Plex <span class="muted">facultatif si une seule instance est présente</span><input name="source_instance" placeholder="plex-ouranos"></label>
+     <button type="submit">Analyser Plex</button>
+    </form>
+   {% elif build.status=='building' %}<div class="reference-ready pending"><strong>Capture en cours</strong><span>La base Plex est sauvegardée, assainie puis archivée sur le node source.</span></div>
+   {% else %}<div class="reference-ready pending"><strong>Analyse en cours</strong><span>Le résultat apparaîtra automatiquement dans le suivi des jobs.</span></div>{% endif %}
+  </article>
+ {% else %}<div class="card empty reference-empty"><strong>Aucune analyse créée</strong><span>Ajoutez une première source Plex pour commencer.</span><button type="button" data-open-dialog="reference-create-server">Choisir un serveur</button></div>{% endfor %}
+ </div>
+</section>
+
+<section class="resource-panel" data-panel="import">
+ <div class="card reference-import-placeholder">
+  <div class="reference-import-icon">↑</div>
+  <div><div class="eyebrow">Mode secondaire</div><h2>Importer depuis un fichier</h2><p>Ce parcours sera destiné aux restaurations, migrations et environnements hors ligne. Il restera séparé du flux principal depuis un serveur.</p></div>
+  <div class="reference-blocked neutral"><strong>Import non activé dans cette version</strong><span>La v1.5.2 prépare uniquement l’interface. Aucun fichier ne sera accepté sans validation automatique du format et de son contenu.</span></div>
+ </div>
+</section>
+
+<dialog id="reference-create-server" class="resource-dialog">
+ <div class="modal-head"><div><div class="eyebrow">Ajouter une référence</div><h3>Choisir une source Plex</h3></div><button class="close" data-close-dialog>×</button></div>
+ <form method="post" action="/reference-builds/draft" class="modal-form">
+  <input type="hidden" name="application" value="plex">
+  <label>Node source<select name="source_node_id" required><option value="">Choisir un node</option>{% for node in capable_nodes %}<option value="{{node.node_id}}">{{node.name}}{% if not node.builder_available %} — agent à mettre à jour{% endif %}</option>{% endfor %}</select></label>
+  <label>Nom de la référence<input name="display_name" required placeholder="Marinos Official"></label>
+  <label>Description <span class="muted">facultatif</span><textarea name="description" rows="3" placeholder="Référence Plex officielle"></textarea></label>
+  <div class="reference-safety-note"><strong>Analyse sans impact</strong><span>Plex ne sera ni arrêté ni modifié. L’agent effectue uniquement des lectures.</span></div>
+  <div class="modal-actions"><button>Continuer vers l’analyse</button><button type="button" class="secondary" data-close-dialog>Annuler</button></div>
+ </form>
+</dialog>
+{% endblock %}

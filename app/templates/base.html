@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Marinos AppBox{% endblock %}</title>
+<link rel="icon" href="/static/favicon.ico"><link rel="stylesheet" href="/static/app.css?v={{app_version}}">
+</head>
+<body>
+<div class="shell">
+<aside class="sidebar">
+  <a class="brand" href="/"><img src="/static/marinos-logo.png" alt="Marinos"><div><strong>AppBox Manager</strong><small>COMMAND CENTER</small></div></a>
+  <div class="nav-label">Administration</div>
+  <a class="nav-link {{'active' if active_page=='dashboard' else ''}}" href="/"><svg viewBox="0 0 24 24"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></svg>Command Center</a>
+  <a class="nav-link {{'active' if active_page=='nodes' else ''}}" href="/nodes"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7h.01M7 17h.01"/></svg>Nodes</a>
+  <a class="nav-link {{'active' if active_page=='appboxes' else ''}}" href="/appboxes"><svg viewBox="0 0 24 24"><path d="m21 8-9 5-9-5 9-5 9 5Z"/><path d="m3 8 9 5 9-5v8l-9 5-9-5V8Z"/></svg>AppBox</a>
+  <a class="nav-link {{'active' if active_page=='jobs' else ''}}" href="/jobs"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/><circle cx="19" cy="19" r="2"/></svg>Jobs</a>
+  <a class="nav-link {{'active' if active_page=='inventory' else ''}}" href="/inventory"><svg viewBox="0 0 24 24"><path d="M4 5h16v4H4zM4 11h16v4H4zM4 17h16v2H4z"/><path d="M8 7h.01M8 13h.01"/></svg>Inventaire</a>
+  <a class="nav-link {{'active' if active_page=='notifications' else ''}}" href="/notifications"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg>Notifications</a>
+  <div class="nav-label">Ressources</div>
+  <a class="nav-link {{'active' if active_page=='reference_images' else ''}}" href="/reference-images"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="m8 15 3-3 2 2 3-4 2 5"/><circle cx="9" cy="8" r="1"/></svg>Images de référence</a>
+  <a class="nav-link {{'active' if active_page=='deployments' else ''}}" href="/deployments"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>Déploiements</a>
+  <a class="nav-link {{'active' if active_page=='agents' else ''}}" href="/agents"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="12" rx="2"/><path d="M8 21h8M12 17v4"/><circle cx="9" cy="11" r="1"/><circle cx="15" cy="11" r="1"/></svg>Agents</a>
+  <a class="nav-link {{'active' if active_page=='storage' else ''}}" href="/storage"><svg viewBox="0 0 24 24"><path d="M4 6h16v12H4z"/><path d="M8 10h8M8 14h5"/></svg>Stockage</a>
+  <div class="nav-label">Plateforme</div>
+  <a class="nav-link {{'active' if active_page=='settings' else ''}}" href="/settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.8 1.8 0 0 0 .36 2l.04.04-2.12 2.12-.04-.04a1.8 1.8 0 0 0-2-.36 1.8 1.8 0 0 0-1.08 1.64V20h-3v-.06A1.8 1.8 0 0 0 10.5 18.3a1.8 1.8 0 0 0-2 .36l-.04.04-2.12-2.12.04-.04a1.8 1.8 0 0 0 .36-2A1.8 1.8 0 0 0 5.1 13.5H5v-3h.1A1.8 1.8 0 0 0 6.74 9.4a1.8 1.8 0 0 0-.36-2l-.04-.04 2.12-2.12.04.04a1.8 1.8 0 0 0 2 .36A1.8 1.8 0 0 0 11.5 4V4h3v.06a1.8 1.8 0 0 0 1.08 1.64 1.8 1.8 0 0 0 2-.36l.04-.04 2.12 2.12-.04.04a1.8 1.8 0 0 0-.36 2 1.8 1.8 0 0 0 1.64 1.08H21v3h-.06A1.8 1.8 0 0 0 19.4 15Z"/></svg>Paramètres</a>
+</aside>
+<section class="content">
+<header class="topbar"><div class="actions"><button class="icon-button mobile-toggle" data-mobile-toggle><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><div class="page-title">{% block page_title %}Command Center{% endblock %}</div></div>
+<div class="top-actions"><a class="icon-button" href="/notifications"><span class="notification-dot"></span><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg></a></div></header>
+<main class="main fade-in">{% block content %}{% endblock %}</main>
+<footer class="app-footer"><span>Marinos AppBox Manager · v{{app_version}}</span><a href="/changelog">Consulter le changelog</a></footer>
+</section></div>
+<div class="toast-wrap" id="toast-wrap"></div>
+<dialog id="job-progress-modal">
+ <div class="modal-head"><div><h3 id="job-modal-title">Opération AppBox</h3><div class="metric-sub">Suivi temps réel du moteur de tâches · <span id="job-ui-build">UI {{app_version}}</span></div></div><button class="close" id="job-modal-close" type="button" aria-label="Fermer">×</button></div>
+ <div class="modal-body">
+  <div class="deploy-hero"><div class="deploy-icon"><svg viewBox="0 0 24 24"><path d="m21 8-9 5-9-5 9-5 9 5Z"/><path d="m3 8 9 5 9-5v8l-9 5-9-5V8Z"/></svg></div><div><strong id="job-modal-client">APPBOX</strong><div class="metric-sub" id="job-current">Initialisation…</div></div></div>
+  <div class="progress-track"><div class="progress-bar" id="job-progress-bar"></div></div><div class="deploy-status"><span>Progression globale</span><strong id="job-progress-value">0 %</strong></div>
+  <div class="deploy-steps" id="job-steps"></div><details class="job-details" id="job-details"><summary>Afficher plus de détails</summary><div class="log-box" id="job-log">En attente des logs…</div></details>
+  <div class="modal-footer"><button type="button" id="job-modal-footer-close" hidden>Fermer</button></div>
+ </div>
+</dialog>
+<dialog id="delete-confirm-modal" class="confirm-modal secure-delete-modal">
+ <div class="modal-head"><div><h3>Suppression sécurisée</h3><div class="metric-sub">L’opération sera exécutée sur le node cible.</div></div><button class="close" type="button" data-delete-cancel aria-label="Fermer">×</button></div>
+ <div class="modal-body">
+  <div class="confirm-appbox"><span>AppBox</span><strong id="delete-confirm-client">—</strong></div>
+  <div class="confirm-appbox"><span>Node</span><strong id="delete-confirm-node">—</strong></div>
+  <fieldset class="delete-modes">
+   <label><input type="radio" name="delete-mode-ui" value="archive" checked><span><strong>Désinstaller et archiver</strong><small>Retire les conteneurs, conserve compose, configuration et cache.</small></span></label>
+   <label><input type="radio" name="delete-mode-ui" value="delete"><span><strong>Supprimer l’AppBox</strong><small>Retire les conteneurs et supprime le dossier persistant. Les médias RDAD restent intacts.</small></span></label>
+   <label><input type="radio" name="delete-mode-ui" value="purge"><span><strong>Purge complète</strong><small>Supprime aussi les références techniques associées. Confirmation renforcée obligatoire.</small></span></label>
+  </fieldset>
+  <div id="delete-confirm-strong" class="strong-confirm" hidden><label>Tapez <strong>SUPPRIMER</strong> pour confirmer<input id="delete-confirm-text" autocomplete="off" placeholder="SUPPRIMER"></label></div>
+  <p class="delete-warning" id="delete-mode-warning">Les données de configuration seront conservées sur le node.</p>
+  <div class="modal-actions"><button type="button" class="secondary" data-delete-cancel>Annuler</button><button type="button" class="danger" id="delete-confirm-submit">Archiver l’AppBox</button></div>
+ </div>
+</dialog>
+<script src="/static/app.js?v={{app_version}}"></script>
+</body></html>

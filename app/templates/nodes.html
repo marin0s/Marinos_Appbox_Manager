@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Nodes — Marinos AppBox{% endblock %}
+{% block page_title %}Nodes{% endblock %}
+{% block content %}
+<section class="hero">
+ <div><div class="eyebrow">Control Plane</div><h1>Registre des nodes</h1><p>Les tags déterminent le rôle métier et l’éligibilité au provisioning automatique.</p></div>
+ <button type="button" data-open-dialog="node-create">Ajouter un node</button>
+</section>
+
+<div class="node-policy-banner">
+ <div><strong>Placement automatique</strong><span>Tag requis : {{placement.automatic_required_tag}}</span></div>
+ <div><strong>Exclusion stricte</strong><span>{{placement.automatic_excluded_tag}}</span></div>
+ <div><strong>Mode par défaut</strong><span>{{placement.default_mode|upper}}</span></div>
+</div>
+
+<div class="node-grid">
+{% for node in nodes %}
+<article class="card control-node-card">
+ <div class="card-top">
+  <div><div class="eyebrow">{{node.node_id}}</div><h3><a href="/nodes/{{node.node_id}}">{{node.name}}</a></h3></div>
+  <span class="pill {{'ok' if node.status=='online' else 'warn'}}">{{node.status|upper}}</span>
+ </div>
+ <div class="node-tags">{% for tag in node.tags %}<span class="service-chip {{'warning' if tag.tag_id=='bare-metal' else ''}}">{{tag.name}}</span>{% else %}<span class="metric-sub">Aucun tag</span>{% endfor %}</div>
+ <div class="node-summary-grid">
+  <div><span>Agent</span><strong>{{node.agent_status or 'not_installed'}}</strong></div>
+  <div><span>AppBox</span><strong>{{node.appbox_count}}</strong></div>
+  <div><span>RDAD</span><strong>{{'OK' if node.rdad_ok else 'NON'}}</strong></div>
+  <div><span>Maintenance</span><strong>{{'OUI' if node.maintenance else 'NON'}}</strong></div>
+ </div>
+ <div class="actions">
+  <button type="button" class="secondary" data-open-dialog="node-edit-{{node.node_id}}">Modifier</button>
+  {% if not node.is_local %}
+  <button type="button" class="primary-agent-action" data-token-node="{{node.node_id}}" data-token-name="{{node.name}}">{{'Réinstaller l’agent' if node.agent_online else 'Installer l’agent'}}</button>
+  {% endif %}
+ </div>
+</article>
+{% endfor %}
+</div>
+
+<dialog id="node-create" class="resource-dialog">
+ <div class="modal-head"><div><div class="eyebrow">Registre</div><h3>Ajouter un node</h3></div><button class="close" data-close-dialog>×</button></div>
+ <form method="post" action="/nodes" class="modal-form">
+  <div class="grid two"><label>Identifiant<input name="node_id" required placeholder="demeter"></label><label>Nom affiché<input name="name" required placeholder="DEMETER"></label></div>
+  <label>État initial<select name="status"><option value="planned">Planifié</option><option value="offline">Hors ligne</option><option value="online">En ligne</option></select></label>
+  <div class="tag-check-grid">{% for tag in tags %}<label><input type="checkbox" name="tag_ids" value="{{tag.tag_id}}"><span><strong>{{tag.name}}</strong><small>{{tag.description}}</small></span></label>{% endfor %}</div>
+  <div class="modal-actions"><button>Enregistrer</button><button type="button" class="secondary" data-close-dialog>Annuler</button></div>
+ </form>
+</dialog>
+
+{% for node in nodes %}
+<dialog id="node-edit-{{node.node_id}}" class="resource-dialog">
+ <div class="modal-head">
+  <div><div class="eyebrow">{{node.node_id}}</div><h3>Modifier le node</h3></div>
+  <button class="close" data-close-dialog>×</button>
+ </div>
+ <form method="post" action="/nodes/{{node.node_id}}/edit" class="modal-form">
+  <div class="grid two">
+   <label>Nom affiché
+    <input name="name" required value="{{node.name}}">
+   </label>
+   <label>État administratif
+    <select name="status">
+     <option value="planned" {{'selected' if node.status=='planned' else ''}}>Planifié</option>
+     <option value="offline" {{'selected' if node.status=='offline' else ''}}>Hors ligne</option>
+     <option value="online" {{'selected' if node.status=='online' else ''}}>En ligne</option>
+    </select>
+   </label>
+  </div>
+  <div class="tag-check-grid">
+   {% for tag in tags %}
+   <label>
+    <input type="checkbox" name="tag_ids" value="{{tag.tag_id}}" {{'checked' if tag.tag_id in node.tag_ids else ''}}>
+    <span><strong>{{tag.name}}</strong><small>{{tag.description}}</small></span>
+   </label>
+   {% endfor %}
+  </div>
+  <label class="toggle-row">
+   <input type="checkbox" name="maintenance" value="true" {{'checked' if node.maintenance else ''}}>
+   <span><strong>Mode maintenance</strong><small>Exclut le node de tout nouveau placement.</small></span>
+  </label>
+  <div class="modal-actions">
+   <button>Enregistrer</button>
+   <button type="button" class="secondary" data-close-dialog>Fermer</button>
+  </div>
+ </form>
+ {% if not node.is_local %}
+ <form method="post" action="/nodes/{{node.node_id}}/delete" class="danger-zone" onsubmit="return confirm('Supprimer le node {{node.name}} du registre ?');">
+  <div><strong>Supprimer du registre</strong><small>Possible uniquement si aucune AppBox active ne lui est rattachée.</small></div>
+  <button class="danger">Supprimer</button>
+ </form>
+ {% endif %}
+</dialog>
+{% endfor %}
+<dialog id="agent-token-dialog" class="resource-dialog">
+ <div class="modal-head"><div><div class="eyebrow">Installation guidée</div><h3>Installer l’agent sur <span data-token-node-name></span></h3></div><button class="close" data-close-dialog>×</button></div>
+ <div class="modal-form"><p>Copiez cette commande unique et exécutez-la en root sur le nouveau serveur. Elle télécharge, configure et démarre automatiquement l’agent.</p><pre class="token-command" data-token-command>Génération…</pre><div class="modal-actions"><button type="button" data-copy-token>Copier la commande</button><button type="button" class="secondary" data-close-dialog>Fermer</button></div></div>
+</dialog>
+{% endblock %}

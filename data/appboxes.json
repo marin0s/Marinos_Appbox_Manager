@@ -1,0 +1,67 @@
+{
+  "appboxes": {
+    "ab34ah": {
+      "client_id": "ab34ah",
+      "host": "artemis",
+      "type": "plex",
+      "with_tautulli": true,
+      "plex_port": 32434,
+      "tautulli_port": 8181,
+      "status": "imported",
+      "path": "/root/appboxes/ab34ah",
+      "containers": [
+        "plex-appb-34ah",
+        "tautulli-ab34ah"
+      ]
+    },
+    "ab35ah": {
+      "client_id": "ab35ah",
+      "host": "artemis",
+      "type": "plex",
+      "with_tautulli": true,
+      "plex_port": 32435,
+      "tautulli_port": 8182,
+      "status": "running",
+      "path": "/srv/appboxes/ab35ah",
+      "containers": [
+        "plex-appb-35ah",
+        "tautulli-ab35ah"
+      ],
+      "created_at": "2026-07-24T17:58:35.459043+00:00",
+      "last_message": "Serveur Plex réclamé avec succès.",
+      "updated_at": "2026-07-24T18:24:33.103065+00:00",
+      "claimed_at": "2026-07-24T18:39:29.875216+00:00"
+    },
+    "testlab01": {
+      "client_id": "testlab01",
+      "host": "artemis",
+      "type": "plex",
+      "with_tautulli": false,
+      "plex_port": 32436,
+      "tautulli_port": null,
+      "status": "running",
+      "path": "/srv/appboxes/testlab01",
+      "containers": [
+        "plex-appb-testlab01"
+      ],
+      "created_at": "2026-07-25T03:31:32.568253+00:00",
+      "last_message": "Déploiement terminé.",
+      "updated_at": "2026-07-25T04:01:28.922198+00:00"
+    },
+    "testlab02": {
+      "client_id": "testlab02",
+      "host": "artemis",
+      "type": "plex",
+      "with_tautulli": false,
+      "plex_port": 32437,
+      "tautulli_port": null,
+      "status": "generated",
+      "path": "/srv/appboxes/testlab02",
+      "containers": [
+        "plex-appb-testlab02"
+      ],
+      "created_at": "2026-07-25T03:46:06.192779+00:00",
+      "last_message": "Configuration générée et ports réservés."
+    }
+  }
+}

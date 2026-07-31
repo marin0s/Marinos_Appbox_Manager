@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Déploiements — Marinos AppBox{% endblock %}
+{% block page_title %}Déploiements{% endblock %}
+{% block content %}
+<section class="hero"><div><div class="eyebrow">Orchestration</div><h1>Déploiements Control Plane</h1><p>Historique des préparations et des décisions de placement, séparé des jobs Docker détaillés.</p></div></section>
+<div class="grid two deployment-columns">
+ <section><div class="section-head"><div><h2>Déploiements</h2><p>{{deployments|length}} opération(s)</p></div></div>
+  <div class="deployment-list">{% for d in deployments %}<article class="card deployment-card"><div class="card-top"><div><div class="eyebrow">{{d.deployment_id[:8]}}</div><h3>{{d.client_id|upper}}</h3></div><span class="pill {{'ok' if d.status in ['success','prepared'] else 'warn'}}">{{d.status|upper}}</span></div><div class="progress-track"><span style="width:{{d.progress}}%"></span></div><div class="info-row"><span>Node</span><strong>{{d.node_name or d.node_id}}</strong></div><div class="info-row"><span>Étape</span><strong>{{d.current_step}}</strong></div><p class="metric-sub">{{d.detail}}</p></article>{% else %}<div class="card empty">Aucun déploiement Control Plane.</div>{% endfor %}</div>
+ </section>
+ <section><div class="section-head"><div><h2>Décisions de placement</h2><p>Traçabilité manuelle et automatique</p></div></div>
+  <div class="decision-list">{% for d in decisions %}<article class="card decision-card"><div class="card-top"><strong>{{d.client_id|upper if d.client_id else 'Prévisualisation'}}</strong><span class="pill">{{d.requested_mode|upper}}</span></div><div class="info-row"><span>Node retenu</span><strong>{{d.selected_node_name or d.selected_node_id}}</strong></div><p>{{d.reason}}</p><small>{{d.created_at}}</small></article>{% else %}<div class="card empty">Aucune décision enregistrée.</div>{% endfor %}</div>
+ </section>
+</div>
+{% endblock %}

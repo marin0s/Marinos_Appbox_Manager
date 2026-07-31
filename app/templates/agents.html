@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Agents — Marinos AppBox{% endblock %}
+{% block page_title %}Agents{% endblock %}
+{% block content %}
+<section class="hero">
+ <div><div class="eyebrow">Control Plane Agent V1</div><h1>Agents des nodes</h1><p>Supervision des agents, inventaire matériel et commandes de diagnostic. L’installation se fait uniquement depuis la page Nodes.</p></div>
+</section>
+
+<div class="agent-grid">
+{% for node in nodes %}
+<article class="card agent-card" id="node-{{node.node_id}}">
+ <div class="card-top">
+  <div><div class="eyebrow">{{node.node_id}}</div><h3>{{node.name}}</h3></div>
+  <span class="pill {{'ok' if node.agent_online else 'warn'}}">{{'ONLINE' if node.agent_online else (node.agent_status or 'NOT INSTALLED')|upper}}</span>
+ </div>
+ <div class="info-list">
+  <div class="info-row"><span>Version</span><strong>{{node.registered_agent_version or node.agent_version or '—'}}</strong></div>
+  <div class="info-row"><span>Dernier heartbeat</span><strong>{{node.last_heartbeat or 'Jamais'}}</strong></div>
+  <div class="info-row"><span>Docker</span><strong>{{node.docker_version or 'Inconnu'}}</strong></div>
+  <div class="info-row"><span>Système</span><strong>{{node.os_name or 'Inconnu'}}</strong></div>
+  <div class="info-row"><span>CPU</span><strong>{{node.cpu_model or 'Inconnu'}}</strong></div>
+  <div class="info-row"><span>RDAD</span><strong>{{'OK' if node.rdad_ok else 'NON'}}</strong></div>
+ </div>
+ <div class="capability-list">
+  {% for key,value in node.capabilities.items() %}
+  <span class="service-chip {{'ok' if value else ''}}">{{key}} : {{'oui' if value else 'non'}}</span>
+  {% endfor %}
+ </div>
+ {% if not node.is_local %}
+ <div class="agent-actions">
+  {% if node.agent_online %}
+  <form method="post" action="/nodes/{{node.node_id}}/agent-command"><input type="hidden" name="command_type" value="ping"><button class="secondary">Tester</button></form>
+  <form method="post" action="/nodes/{{node.node_id}}/agent-command"><input type="hidden" name="command_type" value="inventory"><button class="secondary">Rafraîchir inventaire</button></form>
+  {% else %}<span class="metric-sub">Installez l’agent depuis Nodes → {{node.name}} → Installer l’agent.</span>{% endif %}
+ </div>
+ {% else %}
+ <p class="metric-sub">Agent embarqué local au Control Plane.</p>
+ {% endif %}
+</article>
+{% endfor %}
+</div>
+
+<section class="section-block">
+ <div class="section-head"><div><h2>Commandes récentes</h2><p>File sécurisée limitée aux commandes d’inventaire.</p></div></div>
+ <div class="command-table card">
+  <table>
+   <thead><tr><th>Node</th><th>Commande</th><th>État</th><th>Créée</th><th>Terminée</th></tr></thead>
+   <tbody>{% for command in commands %}<tr><td>{{command.node_name or command.node_id}}</td><td>{{command.command_type}}</td><td><span class="pill {{'ok' if command.status=='success' else 'warn'}}">{{command.status|upper}}</span></td><td>{{command.created_at}}</td><td>{{command.completed_at or '—'}}</td></tr>{% else %}<tr><td colspan="5">Aucune commande agent.</td></tr>{% endfor %}</tbody>
+  </table>
+ </div>
+</section>
+
+
+{% endblock %}

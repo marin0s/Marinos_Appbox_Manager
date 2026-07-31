@@ -1,0 +1,104 @@
+{% extends "base.html" %}{% block title %}AppBox — Marinos AppBox{% endblock %}{% block page_title %}AppBox{% endblock %}
+{% block content %}
+<section class="hero"><div><div class="eyebrow">Provisioning</div><h1>Parc AppBox</h1><p>Création guidée des AppBox Plex et Jellyfin à partir de images de déploiement.</p></div></section>
+<div class="card"><div class="section-head" style="margin-top:0"><div><h2>Nouvelle AppBox</h2><p>La création peut être ajoutée immédiatement à la file globale.</p></div></div>
+<form method="post" action="/appboxes" data-appbox-create-form class="new-appbox-form">
+ <div class="primary-provision-fields">
+  <label>Identifiant client
+   <input name="client_id" placeholder="ab36ah" required pattern="[a-z0-9][a-z0-9-]{2,20}">
+  </label>
+  <label>Type d’AppBox
+   <select name="media_type" data-media-type>
+    <option value="plex">Plex</option>
+    <option value="jellyfin">Jellyfin</option>
+   </select>
+  </label>
+  <label>Image de déploiement
+   <select name="deployment_image_id" data-profile-select required>
+    {% for image in deployment_images %}
+    <option value="{{image.deployment_image_id}}" data-type="{{image.media_type}}" {{'disabled' if not image.available else ''}}>
+     {{image.name}}{% if image.version %} · {{image.version}}{% endif %}{% if not image.available %} · Indisponible{% endif %}
+    </option>
+    {% endfor %}
+   </select>
+  </label>
+  <button>Créer l’AppBox</button>
+ </div>
+
+ <div class="placement-panel">
+  <div class="placement-title"><strong>Placement</strong><small>Choisis un node ou laisse le Control Plane sélectionner un AppBox-Node éligible.</small></div>
+  <div class="placement-fields">
+   <label>Mode
+    <select name="placement_mode" data-placement-mode>
+     <option value="manual" {{'selected' if placement.default_mode!='automatic' else ''}}>Manuel</option>
+     <option value="automatic" {{'selected' if placement.default_mode=='automatic' else ''}}>Automatique — AppBox-Nodes</option>
+    </select>
+   </label>
+   <label data-target-node>Node cible
+    <select name="target_node_id">
+     {% for node in nodes %}
+     <option value="{{node.node_id}}" {{'selected' if node.node_id==hostname else ''}} {{'disabled' if not node.actionable else ''}}>
+      {{node.name}}{% if 'bare-metal' in node.tag_ids %} · Bare-Metal{% elif 'appbox-node' in node.tag_ids %} · AppBox-Node{% endif %}{% if not node.actionable %} · Agent absent{% endif %}
+     </option>
+     {% endfor %}
+    </select>
+   </label>
+   <label class="toggle-row compact-toggle" data-bare-metal-confirm>
+    <input type="checkbox" name="bare_metal_override" value="true">
+    <span><strong>Autoriser Bare-Metal</strong><small>Confirmation administrative pour un placement manuel.</small></span>
+   </label>
+  </div>
+  <div class="placement-preview" data-placement-preview>
+   Le mode automatique exclut toujours les nodes tagués Bare-Metal.
+  </div>
+ </div>
+
+ <details class="advanced-options" data-advanced-options>
+  <summary><span>Options avancées</span><small>Montages, port et accélération</small></summary>
+  <div class="advanced-options-body">
+   <label>Groupe de montages
+    <select name="mount_group_id">
+     {% for group in mount_groups %}
+     <option value="{{group.group_id}}" {{'selected' if group.is_default else ''}}>
+      {{group.name}} · {{group.mounts|length}} montage(s)
+     </option>
+     {% endfor %}
+    </select>
+    <small>Remplace le groupe défini dans le profil.</small>
+   </label>
+
+
+
+   <label>Accélération matérielle
+    <select name="acceleration_mode">
+     <option value="auto">Automatique — /dev/dri</option>
+     <option value="disabled">Désactivée</option>
+    </select>
+   </label>
+
+   <label>Attribution du port
+    <select name="port_mode" data-port-mode>
+     <option value="automatic">Automatique</option>
+     <option value="manual">Manuelle</option>
+    </select>
+   </label>
+
+   <label data-manual-port hidden>Port média
+    <input type="number" name="media_port_requested" min="1024" max="65535" placeholder="8105 ou 32460">
+   </label>
+
+   <label class="toggle-row compact-toggle" data-tautulli-option>
+    <input type="checkbox" name="with_tautulli" value="true">
+    <span><strong>Ajouter Tautulli</strong><small>Disponible uniquement pour Plex.</small></span>
+   </label>
+
+   <label class="toggle-row compact-toggle">
+    <input type="checkbox" name="deploy_now" value="true">
+    <span><strong>Déployer maintenant</strong><small>Lance le workflow après la création.</small></span>
+   </label>
+  </div>
+ </details>
+</form></div>
+<div class="section-head"><div><h2>AppBox enregistrées</h2><p>{{appboxes|length}} éléments dans l’inventaire SQLite</p></div></div>
+<div class="appbox-grid">{% for a in appboxes %}<article class="card interactive appbox-card"><div class="card-top"><div class="appbox-heading">{% if a.type=='jellyfin' %}<span class="media-icon jellyfin jellyfin-brand" title="Jellyfin"><img src="/static/jellyfin-logo.png" alt="Logo Jellyfin"></span>{% else %}<span class="media-icon plex" title="Plex"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8.2 2h4.2l5.4 10-5.4 10H8.2l5.4-10L8.2 2Z"/></svg></span>{% endif %}<div><div class="appbox-title">{{a.client_id|upper}}</div><div class="appbox-meta">Node {{a.host|upper}}</div></div></div><div class="status-stack">{% if a.archived_at %}<span class="pill warn">ARCHIVÉE</span>{% elif a.reconciliation_status=='missing' %}<span class="pill bad">MISSING</span>{% elif a.reconciliation_status=='drift' %}<span class="pill warn">DRIFT</span>{% elif a.runtime.status=='running' %}<span class="pill ok"><span class="dot"></span>ONLINE</span>{% elif a.runtime.exists %}<span class="pill warn">ARRÊTÉE</span>{% else %}<span class="pill">NON DÉPLOYÉE</span>{% endif %}<span class="pill">{{a.desired_state|upper}} → {{a.observed_state|upper}}</span>{% if a.type=='plex' %}<span class="pill {{'ok' if a.plex.claimed else 'warn'}}">{{'CLAIM OK' if a.plex.claimed else 'À RÉCLAMER'}}</span>{% endif %}</div></div><div class="service-list"><span class="service-chip">{{a.type|upper}}</span>{% if a.with_tautulli %}<span class="service-chip">TAUTULLI</span>{% endif %}</div><div class="info-list"><div class="info-row"><span>Port {{"Jellyfin" if a.type=="jellyfin" else "Plex"}}</span><strong>{{a.media_port}}</strong></div>{% if a.tautulli_port %}<div class="info-row"><span>Port Tautulli</span><strong>{{a.tautulli_port}}</strong></div>{% endif %}</div><div class="feature-row"><div class="feature-box"><span>Accélération</span><strong>VAAPI</strong></div><div class="feature-box"><span>Stockage</span><strong>RDAD</strong></div></div><div class="actions"><a class="button secondary" href="/appboxes/{{a.client_id}}">Ouvrir</a>{% if a.runtime.status!='running' %}<form method="post" action="/appboxes/{{a.client_id}}/deploy" data-job-form data-client="{{a.client_id}}" data-action="deploy" data-title="Déploiement de {{a.client_id|upper}}"><button>Déployer</button></form>{% endif %}</div></article>{% else %}<div class="card empty">Aucune AppBox enregistrée.</div>{% endfor %}</div>
+{% endblock %}

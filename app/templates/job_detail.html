@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Workflow {{job.job_id}} — Marinos AppBox{% endblock %}
+{% block page_title %}Workflow Inspector{% endblock %}
+{% block content %}
+<section class="hero workflow-hero">
+ <div>
+   <div class="eyebrow">Workflow Engine · Inspector</div>
+   <h1>{{job.title}}</h1>
+   <p>{{job.client_id|upper}} · {{job.node_id|upper}} · {{job.action|upper}} · {{job.job_id}}</p>
+ </div>
+ <div class="workflow-actions">
+   <a class="button ghost" href="/api/jobs/{{job.job_id}}/export.txt">Exporter TXT</a>
+   <a class="button ghost" href="/api/jobs/{{job.job_id}}/export.json">Exporter JSON</a>
+   <span class="pill {{'ok' if job.status=='success' else 'bad' if job.status=='error' else 'warn'}}">{{job.status|upper}}</span>
+ </div>
+</section>
+
+<div class="grid metrics workflow-kpis">
+ <div class="card metric-card"><div class="metric-label">Progression</div><div class="metric-value">{{job.progress}} %</div><small>{{job.statistics.completed_steps}} / {{job.statistics.total_steps}} étapes</small></div>
+ <div class="card metric-card"><div class="metric-label">Durée totale</div><div class="metric-value">{{'%.2f s'|format(job.duration_seconds) if job.duration_seconds is not none else '—'}}</div><small>{{job.started_at or 'En attente'}}</small></div>
+ <div class="card metric-card"><div class="metric-label">Validation</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.validation.duration)}}</div><small>{{job.statistics.groups.validation.steps}} étape(s)</small></div>
+ <div class="card metric-card"><div class="metric-label">Docker</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.docker.duration)}}</div><small>{{job.statistics.groups.docker.steps}} étape(s)</small></div>
+ <div class="card metric-card"><div class="metric-label">Healthcheck</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.healthcheck.duration)}}</div><small>{{job.statistics.failed_steps}} échec(s)</small></div>
+ <div class="card metric-card"><div class="metric-label">Intégrations</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.integration.duration)}}</div><small>{{job.statistics.skipped_steps}} ignorée(s)</small></div>
+</div>
+
+<div class="section-head"><div><h2>Timeline d’exécution</h2><p>Chronologie persistante enregistrée dans SQLite</p></div></div>
+<div class="card workflow-timeline">
+ {% for step in job.steps %}
+ <article class="timeline-entry {{step.status}}">
+   <div class="timeline-rail"><span class="timeline-dot">{{'✓' if step.status=='success' else '!' if step.status=='failed' else '—' if step.status=='skipped' else '●'}}</span></div>
+   <div class="timeline-content">
+     <div class="timeline-heading">
+       <div>
+         <h3>{{step.title}}</h3>
+         <div class="timeline-meta">
+           <span>{{step.started_at or 'Non démarrée'}}</span>
+           <span>Exécuteur : {{step.executor or 'control-plane'}}</span>
+           <span>{{'%.2f s'|format(step.duration_seconds) if step.duration_seconds is not none else '—'}}</span>
+         </div>
+       </div>
+       <span class="pill {{'ok' if step.status=='success' else 'bad' if step.status=='failed' else 'warn' if step.status=='running' else ''}}">{{step.status|upper}}</span>
+     </div>
+
+     {% if step.resources %}
+     <div class="resource-grid">
+       {% for key, value in step.resources.items() %}
+       <div class="resource-chip"><small>{{key}}</small><strong>{{value|join(', ') if value is iterable and value is not string and value is not mapping else value}}</strong></div>
+       {% endfor %}
+     </div>
+     {% endif %}
+
+     <details class="step-log" {% if step.status in ['failed','running'] %}open{% endif %}>
+       <summary><span>Journal de l’étape</span><small>{{step.step_key}}</small></summary>
+       <pre>{{step.detail or 'Aucun journal pour cette étape.'}}</pre>
+     </details>
+   </div>
+ </article>
+ {% endfor %}
+</div>
+
+<div class="section-head"><div><h2>Journal global</h2><p>Synthèse brute de l’exécution</p></div></div>
+<details class="card global-log" open>
+ <summary>Afficher ou masquer le journal global</summary>
+ <pre>{{job.detail or 'Aucun journal global.'}}</pre>
+</details>
+{% endblock %}

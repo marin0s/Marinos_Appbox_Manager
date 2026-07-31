@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Distribution — Marinos AppBox{% endblock %}
+{% block page_title %}Distribution{% endblock %}
+{% block content %}
+<section class="hero"><div><div class="eyebrow">Images de référence</div><h1>Matrice de distribution</h1><p>Cette fondation suit la présence des versions sur chaque node. Le transfert effectif sera exécuté par les agents distants.</p></div></section>
+{% if matrix %}
+<div class="distribution-table card">
+ <table>
+  <thead><tr><th>Image / version</th>{% for node in nodes %}<th>{{node.name}}</th>{% endfor %}</tr></thead>
+  <tbody>{% for item in matrix %}<tr>
+   <td><strong>{{item.image_name}}</strong><small>{{item.version}} · {{item.media_type|upper}}</small></td>
+   {% for cell in item.nodes %}<td><span class="pill {{'ok' if cell.distribution.status in ['local','synced'] else 'warn'}}">{{cell.distribution.status|upper}}</span><small>{{cell.node.agent_status or 'agent absent'}}</small></td>{% endfor %}
+  </tr>{% endfor %}</tbody>
+ </table>
+</div>
+{% else %}
+<div class="card empty">Aucune version d’image de référence enregistrée. La matrice se remplira dès la publication de la première image Plex ou Jellyfin.</div>
+{% endif %}
+{% endblock %}

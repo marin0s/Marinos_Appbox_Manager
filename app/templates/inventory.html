@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}Inventaire — Marinos AppBox{% endblock %}
+{% block page_title %}Inventaire métier{% endblock %}
+{% block content %}
+<section class="hero">
+ <div>
+   <div class="eyebrow">Source de vérité SQLite</div>
+   <h1>Inventaire central</h1>
+   <p>Conteneurs, réseaux, volumes, modèles et réservations de ports du node {{hostname|upper}}.</p>
+ </div>
+ <button class="button" id="inventory-sync-button" type="button">Synchroniser Docker</button>
+</section>
+
+<div class="grid metrics inventory-kpis">
+ <div class="card metric-card"><div class="metric-label">Conteneurs</div><div class="metric-value">{{inventory.counts.containers}}</div></div>
+ <div class="card metric-card"><div class="metric-label">Réseaux</div><div class="metric-value">{{inventory.counts.networks}}</div></div>
+ <div class="card metric-card"><div class="metric-label">Volumes</div><div class="metric-value">{{inventory.counts.volumes}}</div></div>
+ <div class="card metric-card"><div class="metric-label">Modèles</div><div class="metric-value">{{inventory.counts.templates}}</div></div>
+ <div class="card metric-card"><div class="metric-label">Ports réservés</div><div class="metric-value">{{inventory.counts.port_reservations}}</div></div>
+ <div class="card metric-card"><div class="metric-label">Notifications</div><div class="metric-value">{{inventory.counts.notifications_pending}}</div></div>
+</div>
+
+<div class="inventory-tabs" data-inventory-tabs>
+ <button class="active" data-target="containers">Conteneurs</button>
+ <button data-target="networks">Réseaux</button>
+ <button data-target="volumes">Volumes</button>
+ <button data-target="ports">Ports</button>
+ <button data-target="templates">Modèles</button>
+</div>
+
+<section class="inventory-panel active" data-panel="containers">
+ <div class="section-head"><div><h2>Conteneurs Docker</h2><p>Association automatique aux AppBox à partir des noms et labels Compose.</p></div></div>
+ <div class="card table-wrap">
+ <table>
+   <thead><tr><th>Nom</th><th>AppBox</th><th>Image</th><th>État</th><th>Health</th><th>Ports</th><th>Réseaux</th></tr></thead>
+   <tbody>
+   {% for item in inventory.containers %}
+   <tr>
+     <td><strong>{{item.name}}</strong><small class="subline">{{item.container_id[:12]}}</small></td>
+     <td>{{item.appbox_id|upper if item.appbox_id else 'Système'}}</td>
+     <td><span class="mono">{{item.image or '—'}}</span></td>
+     <td><span class="pill {{'ok' if item.state=='running' else 'bad' if item.state in ['dead','exited'] else 'warn'}}">{{item.state|upper}}</span></td>
+     <td>{{item.health or '—'}}</td>
+     <td>{% for port in item.ports %}<span class="resource-chip compact">{{port.host_port or '—'}} → {{port.container_port}}/{{port.protocol}}</span>{% else %}—{% endfor %}</td>
+     <td>{% for network in item.networks %}<span class="resource-chip compact">{{network.name}}</span>{% else %}—{% endfor %}</td>
+   </tr>
+   {% else %}
+   <tr><td colspan="7" class="empty">Aucun conteneur inventorié.</td></tr>
+   {% endfor %}
+   </tbody>
+ </table>
+ </div>
+</section>
+
+<section class="inventory-panel" data-panel="networks">
+ <div class="section-head"><div><h2>Réseaux Docker</h2><p>Topologie locale et rattachement aux stacks.</p></div></div>
+ <div class="card table-wrap">
+ <table>
+   <thead><tr><th>Nom</th><th>AppBox</th><th>Driver</th><th>Scope</th><th>Interne</th><th>Conteneurs</th></tr></thead>
+   <tbody>
+   {% for item in inventory.networks %}
+   <tr><td><strong>{{item.name}}</strong></td><td>{{item.appbox_id|upper if item.appbox_id else 'Plateforme'}}</td><td>{{item.driver}}</td><td>{{item.scope}}</td><td>{{'Oui' if item.internal else 'Non'}}</td><td>{{item.containers|length}}</td></tr>
+   {% else %}<tr><td colspan="6" class="empty">Aucun réseau inventorié.</td></tr>{% endfor %}
+   </tbody>
+ </table>
+ </div>
+</section>
+
+<section class="inventory-panel" data-panel="volumes">
+ <div class="section-head"><div><h2>Volumes Docker</h2><p>Volumes nommés persistants connus du node.</p></div></div>
+ <div class="card table-wrap">
+ <table>
+   <thead><tr><th>Nom</th><th>AppBox</th><th>Driver</th><th>Scope</th><th>Mountpoint</th></tr></thead>
+   <tbody>
+   {% for item in inventory.volumes %}
+   <tr><td><strong>{{item.name}}</strong></td><td>{{item.appbox_id|upper if item.appbox_id else 'Plateforme'}}</td><td>{{item.driver}}</td><td>{{item.scope or 'local'}}</td><td><span class="mono">{{item.mountpoint or '—'}}</span></td></tr>
+   {% else %}<tr><td colspan="5" class="empty">Aucun volume inventorié.</td></tr>{% endfor %}
+   </tbody>
+ </table>
+ </div>
+</section>
+
+<section class="inventory-panel" data-panel="ports">
+ <div class="section-head"><div><h2>Réservations de ports</h2><p>Réservations persistantes indépendantes de l’état instantané de Docker.</p></div></div>
+ <div class="card table-wrap">
+ <table>
+   <thead><tr><th>Port</th><th>Protocole</th><th>Service</th><th>AppBox</th><th>Node</th><th>Réservé le</th></tr></thead>
+   <tbody>
+   {% for item in inventory.reservations %}
+   <tr><td><strong>{{item.port}}</strong></td><td>{{item.protocol|upper}}</td><td>{{item.service|upper}}</td><td>{{item.client_id|upper}}</td><td>{{item.node_id|upper}}</td><td>{{item.reserved_at}}</td></tr>
+   {% else %}<tr><td colspan="6" class="empty">Aucune réservation active.</td></tr>{% endfor %}
+   </tbody>
+ </table>
+ </div>
+</section>
+
+<section class="inventory-panel" data-panel="templates">
+ <div class="section-head"><div><h2>Modèles de déploiement</h2><p>Première couche déclarative avant le moteur de templates complet.</p></div></div>
+ <div class="template-grid">
+ {% for item in inventory.templates %}
+ <article class="card template-card">
+   <div class="template-card-head"><div><div class="eyebrow">{{item.media_type|upper}}</div><h3>{{item.name}}</h3></div><span class="pill {{'ok' if item.enabled else ''}}">V{{item.version}}</span></div>
+   <div class="template-definition">
+   {% for key,value in item.definition.items() %}
+     <div><span>{{key}}</span><strong>{{value}}</strong></div>
+   {% endfor %}
+   </div>
+ </article>
+ {% endfor %}
+ </div>
+</section>
+{% endblock %}

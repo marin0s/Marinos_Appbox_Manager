@@ -1,0 +1,12 @@
+{% extends "base.html" %}{% block title %}Changelog — Marinos AppBox{% endblock %}{% block page_title %}Changelog{% endblock %}
+{% block content %}
+<section class="hero"><div><div class="eyebrow">Historique produit</div><h1>Changelog</h1><p>Les évolutions majeures du Marinos AppBox Manager. Les correctifs intermédiaires ne sont volontairement pas listés.</p></div><span class="pill info">VERSION {{version}}</span></section>
+<div class="changelog-list">
+{% for release in changelog %}
+<article class="card release-card">
+  <div><div class="release-version">v{{release.version}}</div><div class="release-date">{{release.released_at}}</div></div>
+  <div><h2>{{release.title}}</h2><ul>{% for item in release['items'] %}<li>{{item}}</li>{% endfor %}</ul></div>
+</article>
+{% endfor %}
+</div>
+{% endblock %}

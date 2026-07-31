@@ -1,0 +1,28 @@
+{% extends "base.html" %}{% block title %}Command Center — Marinos AppBox{% endblock %}{% block page_title %}Command Center{% endblock %}
+{% block content %}
+<section class="hero"><div><div class="eyebrow">Infrastructure média</div><h1>Vue d’ensemble de la plateforme</h1><p>Supervision centralisée des nodes, AppBox, tâches et alertes. ARTEMIS est actif ; DEMETER rejoindra la plateforme lors du passage au multinode.</p></div><a class="button" href="/appboxes">Gérer les AppBox</a></section>
+<div class="grid metrics">
+ <div class="card metric-card"><div class="metric-label">AppBox enregistrées</div><div class="metric-value">{{appboxes|length}}</div><div class="metric-sub">{{running}} en fonctionnement</div></div>
+ <div class="card metric-card"><div class="metric-label">Serveurs Plex réclamés</div><div class="metric-value">{{claimed}}</div><div class="metric-sub">{{stopped}} AppBox arrêtée(s)</div></div>
+ <div class="card metric-card"><div class="metric-label">Jobs actifs</div><div class="metric-value">{{node.running_jobs + node.queued_jobs}}</div><div class="metric-sub" data-node-field="queue">{{node.running_jobs}} en cours · {{node.queued_jobs}} en attente</div></div>
+ <div class="card metric-card"><div class="metric-label">État RDAD</div><div class="metric-value {{'ok' if node.rdad_ok else 'bad'}}">{{'ONLINE' if node.rdad_ok else 'OFFLINE'}}</div><div class="metric-sub">Montage partagé ARTEMIS</div></div>
+</div>
+
+<div class="section-head"><div><h2>Nodes</h2><p>État et ressources en temps réel</p></div><a class="button ghost" href="/nodes">Voir tous les nodes</a></div>
+<div class="grid nodes" data-node-poll="{{hostname}}">
+ <a class="card interactive" href="/nodes/{{hostname}}"><div class="actions" style="justify-content:space-between"><div><div class="appbox-title">ARTEMIS</div><div class="appbox-meta">Node local · Docker · Intel VAAPI</div></div><span class="pill ok"><span class="dot"></span>ONLINE</span></div>
+ <div class="resource-grid">
+  <div class="resource chart-card"><div class="resource-top"><span>CPU</span><strong data-node-field="cpu">{{'%.1f'|format(node.metrics.cpu_percent or 0)}} %</strong></div><canvas class="node-chart" data-node-chart="cpu" data-node="{{hostname}}"></canvas></div>
+  <div class="resource chart-card"><div class="resource-top"><span>RAM</span><strong data-node-field="ram">{{'%.1f'|format(node.metrics.ram_percent or 0)}} %</strong></div><canvas class="node-chart" data-node-chart="ram" data-node="{{hostname}}"></canvas></div>
+  <div class="resource chart-card"><div class="resource-top"><span>Disque</span><strong data-node-field="disk">{{'%.1f'|format(node.metrics.disk_percent or 0)}} %</strong></div><canvas class="node-chart" data-node-chart="disk" data-node="{{hostname}}"></canvas></div>
+  <div class="resource"><div class="resource-top"><span>Conteneurs</span><strong data-node-field="containers">{{node.metrics.running_containers}} / {{node.metrics.docker_containers}}</strong></div><div class="metric-sub">Running / total</div></div>
+ </div></a>
+ <div class="card" style="opacity:.72"><div class="actions" style="justify-content:space-between"><div><div class="appbox-title">DEMETER</div><div class="appbox-meta">Futur node AppBox multinode</div></div><span class="pill">NON ENRÔLÉ</span></div><div class="empty">Disponible à partir de la V0.6 multinode.</div></div>
+</div>
+
+<div class="grid two">
+ <section><div class="section-head"><div><h2>AppBox récentes</h2><p>Accès rapide aux services</p></div><a class="button ghost" href="/appboxes">Parc complet</a></div>
+ <div class="appbox-grid">{% for a in appboxes[:4] %}<article class="card interactive appbox-card"><div class="card-top"><div class="appbox-heading">{% if a.type=='jellyfin' %}<span class="media-icon jellyfin jellyfin-brand" title="Jellyfin"><img src="/static/jellyfin-logo.png" alt="Logo Jellyfin"></span>{% else %}<span class="media-icon plex" title="Plex"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8.2 2h4.2l5.4 10-5.4 10H8.2l5.4-10L8.2 2Z"/></svg></span>{% endif %}<div><div class="appbox-title">{{a.client_id|upper}}</div><div class="appbox-meta">{{a.host|upper}} · {{a.type|upper}} {% if a.with_tautulli %}+ Tautulli{% endif %}</div></div></div>{% if a.runtime.status=='running' %}<span class="pill ok"><span class="dot"></span>ONLINE</span>{% else %}<span class="pill">ARRÊTÉE</span>{% endif %}</div><div class="service-list"><span class="service-chip">{{a.type|capitalize}} : {{a.plex_port}}</span>{% if a.tautulli_port %}<span class="service-chip">Tautulli : {{a.tautulli_port}}</span>{% endif %}</div><div class="actions"><a class="button secondary" href="/appboxes/{{a.client_id}}">Ouvrir</a></div></article>{% else %}<div class="card empty">Aucune AppBox.</div>{% endfor %}</div></section>
+ <section><div class="section-head"><div><h2>Activité récente</h2><p>Jobs et événements</p></div></div><div class="card"><div class="timeline">{% for job in recent_jobs[:6] %}<div class="timeline-item {{'success' if job.status=='success' else 'error' if job.status=='error' else 'progress'}}"><div class="timeline-icon">{{'✓' if job.status=='success' else '!' if job.status=='error' else '…'}}</div><div><div class="timeline-title">{{job.title}}</div><div class="timeline-meta">{{job.client_id|upper}} · {{job.created_at}}</div><div class="timeline-message">{{job.detail}}</div></div><span class="pill {{'ok' if job.status=='success' else 'bad' if job.status=='error' else 'warn'}}">{{job.status|upper}}</span></div>{% else %}<div class="empty">Aucune activité récente.</div>{% endfor %}</div></div></section>
+</div>
+{% endblock %}

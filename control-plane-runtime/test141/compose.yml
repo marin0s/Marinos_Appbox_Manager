@@ -1,0 +1,34 @@
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin-test141
+    restart: unless-stopped
+    user: "0:0"
+    environment:
+      TZ: Europe/Paris
+    ports:
+      - "8104:8096"
+
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./jellyfin-config:/config
+      - ./jellyfin-cache:/cache
+      - type: bind
+        source: /mnt/decypharr-poc
+        target: /data
+        read_only: true
+        bind:
+          propagation: rshared
+      - /mnt/ATHENA:/ATHENA:ro
+      - /mnt/NEMESIS:/NEMESIS:ro
+    labels:
+      io.portainer.accesscontrol.users: appboxtest141
+      marinos.appbox.id: test141
+      marinos.appbox.type: jellyfin
+      marinos.appbox.node: artemis
+
+networks:
+  default:
+    name: appbox-shared
+    external: true

@@ -1,0 +1,5 @@
+{% extends "base.html" %}{% block title %}Notifications — Marinos AppBox{% endblock %}{% block page_title %}Notifications{% endblock %}
+{% block content %}
+<section class="hero"><div><div class="eyebrow">Centre de notifications</div><h1>Événements de la plateforme</h1><p>Cette vue prépare la future intégration Discord, les alertes watchdog et les événements multinodes.</p></div><span class="pill warn">DISCORD EN V0.4.3</span></section>
+<div class="card"><div class="timeline">{% for e in events %}<div class="timeline-item {{'success' if e.level=='success' else 'error' if e.level=='error' else 'progress'}}"><div class="timeline-icon">{{'✓' if e.level=='success' else '!' if e.level=='error' else '•'}}</div><div><div class="timeline-title">{{e.event_type}}</div><div class="timeline-meta">{{e.node_id|upper}}{% if e.client_id %} · {{e.client_id|upper}}{% endif %} · {{e.created_at}}</div><div class="timeline-message">{{e.message}}</div></div><span class="pill {{'ok' if e.level=='success' else 'bad' if e.level=='error' else 'info'}}">{{e.level|upper}}</span></div>{% else %}<div class="empty">Aucun événement.</div>{% endfor %}</div></div>
+{% endblock %}

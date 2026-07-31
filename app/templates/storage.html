@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Stockage — Marinos AppBox{% endblock %}
+{% block page_title %}Stockage{% endblock %}
+{% block content %}
+<section class="hero storage-hero">
+ <div><div class="eyebrow">Volume Manager</div><h1>Montages des AppBox</h1><p>Définissez les chemins disponibles sur les nodes et regroupez-les pour les appliquer aux AppBox.</p></div>
+ <button type="button" data-open-dialog="mount-create">Ajouter un montage</button>
+</section>
+<div class="workflow-guide storage-workflow">
+ <div class="workflow-step active"><span>1</span><div><strong>Créer les montages</strong><small>RDAD, NAS et chemins locaux.</small></div></div><div class="workflow-arrow">→</div>
+ <div class="workflow-step"><span>2</span><div><strong>Créer un groupe</strong><small>Associer les chemins appliqués ensemble.</small></div></div><div class="workflow-arrow">→</div>
+ <div class="workflow-step"><span>3</span><div><strong>Utiliser dans une AppBox</strong><small>Sélectionner le groupe au déploiement.</small></div></div>
+</div>
+<div class="resource-section-tabs" data-resource-tabs>
+ <button class="active" data-target="mounts">Volume Mounts <span>{{mounts|length}}</span></button>
+ <button data-target="groups">Groupes <span>{{groups|length}}</span></button>
+</div>
+<section class="resource-panel active" data-panel="mounts">
+ <div class="panel-toolbar"><div><h2>Volume Mounts</h2><p>Chemins injectés dans les conteneurs AppBox.</p></div><button type="button" data-open-dialog="mount-create">Ajouter un montage</button></div>
+ <div class="resource-card-grid">{% for mount in mounts %}<article class="card resource-definition"><div class="card-top"><div><div class="eyebrow">{{mount.mount_id}}</div><h3>{{mount.name}}</h3></div><span class="pill {{'ok' if mount.available else 'bad'}}">{{'DISPONIBLE' if mount.available else 'ABSENT'}}</span></div><div class="path-pair"><code>{{mount.host_path}}</code><span>→</span><code>{{mount.container_path}}</code></div><div class="service-list">{% for t in mount.media_types %}<span class="service-chip">{{t|upper}}</span>{% endfor %}<span class="service-chip">{{'RO' if mount.read_only else 'RW'}}</span><span class="service-chip">{{mount.propagation}}</span></div></article>{% else %}<div class="card empty">Aucun montage configuré.</div>{% endfor %}</div>
+</section>
+<section class="resource-panel" data-panel="groups">
+ <div class="panel-toolbar"><div><h2>Groupes de montages</h2><p>Un groupe rassemble les mounts appliqués ensemble à une AppBox.</p></div><button type="button" data-open-dialog="group-create">Créer un groupe</button></div>
+ <div class="resource-card-grid">{% for group in groups %}<article class="card resource-definition"><div class="card-top"><div><div class="eyebrow">{{group.group_id}}</div><h3>{{group.name}}</h3></div>{% if group.is_default %}<span class="pill ok">PAR DÉFAUT</span>{% endif %}</div><p class="metric-sub">{{group.description}}</p><div class="mount-stack">{% for m in group.mounts %}<div><span>{{m.name}}</span><code>{{m.container_path}}</code></div>{% else %}<div>Aucun montage dans ce groupe</div>{% endfor %}</div></article>{% else %}<div class="card empty">Aucun groupe configuré.</div>{% endfor %}</div>
+</section>
+<dialog id="mount-create" class="resource-dialog">
+ <div class="modal-head"><div><div class="eyebrow">Étape 1</div><h3>Nouveau Volume Mount</h3></div><button class="close" data-close-dialog>×</button></div>
+ <form method="post" action="/storage/mounts" class="modal-form">
+  <label>Nom<input name="name" required placeholder="NAS APOLLON"></label>
+  <div class="grid two"><label>Chemin hôte<input name="host_path" required placeholder="/mnt/APOLLON"></label><label>Chemin conteneur<input name="container_path" required placeholder="/APOLLON"></label></div>
+  <label>Propagation<select name="propagation"><option value="rprivate">rprivate</option><option value="rshared">rshared</option><option value="rslave">rslave</option></select></label>
+  <label>Description<input name="description"></label>
+  <div class="compact-options"><label><input type="checkbox" name="media_types" value="plex" checked><span>Plex</span></label><label><input type="checkbox" name="media_types" value="jellyfin" checked><span>Jellyfin</span></label><label><input type="checkbox" name="read_only" value="true" checked><span>Lecture seule</span></label><label><input type="checkbox" name="required" value="true"><span>Obligatoire</span></label></div>
+  <div class="modal-actions"><button>Ajouter</button><button type="button" class="secondary" data-close-dialog>Annuler</button></div>
+ </form>
+</dialog>
+
+<dialog id="group-create" class="resource-dialog">
+ <div class="modal-head"><div><div class="eyebrow">Étape 2</div><h3>Nouveau groupe</h3></div><button class="close" data-close-dialog>×</button></div>
+ <form method="post" action="/storage/groups" class="modal-form">
+  <label>Nom<input name="name" required placeholder="NAS complets"></label>
+  <label>Description<input name="description"></label>
+  <div class="mount-check-list">{% for mount in mounts %}<label><input type="checkbox" name="mount_ids" value="{{mount.mount_id}}"><span><strong>{{mount.name}}</strong><small>{{mount.host_path}} → {{mount.container_path}}</small></span></label>{% endfor %}</div>
+  <div class="modal-actions"><button>Créer</button><button type="button" class="secondary" data-close-dialog>Annuler</button></div>
+ </form>
+</dialog>
+
+
+{% endblock %}

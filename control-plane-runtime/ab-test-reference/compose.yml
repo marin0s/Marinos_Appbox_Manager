@@ -1,0 +1,38 @@
+services:
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex-appb--test-reference
+    restart: unless-stopped
+    environment:
+      PUID: "0"
+      PGID: "0"
+      TZ: Europe/Paris
+      VERSION: docker
+    ports:
+      - "32444:32400"
+
+    devices:
+      - /dev/dri:/dev/dri
+    tmpfs:
+      - /transcode:size=8G
+    volumes:
+      - ./plex-config:/config
+      - type: bind
+        source: /mnt/decypharr-poc
+        target: /data
+        read_only: true
+        bind:
+          propagation: rshared
+      - /mnt/ATHENA:/ATHENA:ro
+      - /mnt/NEMESIS:/NEMESIS:ro
+    labels:
+      io.portainer.accesscontrol.users: appbox-test-reference
+      marinos.appbox.id: ab-test-reference
+      marinos.appbox.type: plex
+      marinos.appbox.node: artemis
+
+
+networks:
+  default:
+    name: appbox-shared
+    external: true

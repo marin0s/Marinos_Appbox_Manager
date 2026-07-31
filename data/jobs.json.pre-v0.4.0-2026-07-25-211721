@@ -1,0 +1,39 @@
+{
+  "jobs": {
+    "20260725-034357-55db85": {
+      "job_id": "20260725-034357-55db85",
+      "client_id": "testlab01",
+      "action": "deploy",
+      "title": "Déploiement de l’AppBox",
+      "status": "success",
+      "detail": "Container plex-appb-testlab01 Creating \n Container plex-appb-testlab01 Created \n Container plex-appb-testlab01 Starting \n Container plex-appb-testlab01 Started",
+      "created_at": "2026-07-25T03:43:57.227236+00:00"
+    },
+    "20260725-035337-0d544e": {
+      "job_id": "20260725-035337-0d544e",
+      "client_id": "testlab01",
+      "action": "deploy",
+      "title": "Déploiement de l’AppBox",
+      "status": "success",
+      "progress": 100,
+      "detail": "Container plex-appb-testlab01 Starting \n Container plex-appb-testlab01 Started",
+      "created_at": "2026-07-25T03:53:37.047353+00:00",
+      "updated_at": "2026-07-25T03:53:37.369979+00:00",
+      "started_at": "2026-07-25T03:53:37.049765+00:00",
+      "finished_at": "2026-07-25T03:53:37.369979+00:00"
+    },
+    "20260725-040128-2ab26d": {
+      "job_id": "20260725-040128-2ab26d",
+      "client_id": "testlab01",
+      "action": "deploy",
+      "title": "Démarrage de l’AppBox",
+      "status": "success",
+      "progress": 100,
+      "detail": "Container plex-appb-testlab01 Starting \n Container plex-appb-testlab01 Started",
+      "created_at": "2026-07-25T04:01:28.646903+00:00",
+      "updated_at": "2026-07-25T04:01:28.922666+00:00",
+      "started_at": "2026-07-25T04:01:28.648941+00:00",
+      "finished_at": "2026-07-25T04:01:28.922666+00:00"
+    }
+  }
+}

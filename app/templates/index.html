@@ -1,0 +1,54 @@
+{% extends "base.html" %}{% block title %}Marinos AppBox — Artemis{% endblock %}
+{% block content %}
+<section class="hero"><h1>Provisionner. Superviser. Diffuser.</h1><p>Console mononode des AppBox Plex sur {{ hostname|upper }} — fondation du futur control-plane.</p></section>
+
+<div class="grid" data-node-poll="{{hostname}}">
+  <div class="card"><div class="muted">AppBox enregistrées</div><div class="metric">{{ appboxes|length }}</div></div>
+  <div class="card"><div class="muted">Conteneurs Plex actifs</div><div class="metric">{{ running }}</div></div>
+  <div class="card"><div class="muted">Serveurs réclamés</div><div class="metric">{{ claimed }}</div></div>
+  <div class="card"><div class="muted">File globale</div><div class="metric" style="font-size:20px" data-node-field="queue">{{node.running_jobs}} en cours · {{node.queued_jobs}} en attente</div></div>
+</div>
+
+<div class="card" style="margin-top:20px">
+  <div class="actions" style="justify-content:space-between">
+    <div><h2 style="margin-bottom:4px">Node {{hostname|upper}}</h2><span class="pill {{'ok' if node.rdad_ok else 'bad'}}">RDAD {{'ONLINE' if node.rdad_ok else 'OFFLINE'}}</span></div>
+    <a class="button secondary" href="/nodes/{{hostname}}">Ouvrir la supervision</a>
+  </div>
+  <div class="node-grid" style="margin-top:18px">
+    <div><span class="muted">CPU</span><div class="metric" style="font-size:22px" data-node-field="cpu">{{'%.1f'|format(node.metrics.cpu_percent or 0)}} %</div></div>
+    <div><span class="muted">RAM</span><div class="metric" style="font-size:22px" data-node-field="ram">{{'%.1f'|format(node.metrics.ram_percent or 0)}} %</div></div>
+    <div><span class="muted">Disque</span><div class="metric" style="font-size:22px" data-node-field="disk">{{'%.1f'|format(node.metrics.disk_percent or 0)}} %</div></div>
+    <div><span class="muted">Conteneurs</span><div class="metric" style="font-size:22px" data-node-field="containers">{{node.metrics.running_containers}} / {{node.metrics.docker_containers}}</div></div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:20px"><h2>Nouvelle AppBox</h2>
+<form method="post" action="/appboxes" data-appbox-create-form>
+ <div class="row">
+  <label>Identifiant<input name="client_id" placeholder="ab36ah" required pattern="[a-z0-9][a-z0-9-]{2,20}"></label>
+  <label>Type<select name="media_type" data-media-type><option value="plex">Plex</option><option value="jellyfin">Jellyfin</option></select></label>
+  <label>Image de déploiement<select name="deployment_image_id" data-profile-select required>{% for image in deployment_images %}<option value="{{image.deployment_image_id}}" data-type="{{image.media_type}}" {{'disabled' if not image.available else ''}}>{{image.name}}{% if image.version %} · {{image.version}}{% endif %}</option>{% endfor %}</select></label>
+  <input type="hidden" name="mount_group_id" value="rdad-standard">
+  <input type="hidden" name="port_mode" value="automatic">
+  <input type="hidden" name="acceleration_mode" value="auto">
+  <label><input type="checkbox" name="deploy_now" value="true" style="width:auto"> Déployer</label>
+  <button>Créer</button>
+ </div>
+</form></div>
+
+<div class="card" style="margin-top:20px"><h2>Parc AppBox</h2><table>
+<thead><tr><th>Client</th><th>Node</th><th>Services</th><th>Ports</th><th>Plex</th><th>Image</th><th>Actions</th></tr></thead><tbody>
+{% for a in appboxes %}<tr>
+<td><a href="/appboxes/{{a.client_id}}"><strong>{{a.client_id|upper}}</strong></a></td>
+<td>{{a.host|upper}}</td>
+<td>{{a.containers|join(", ")}}</td><td>{{a.plex_port}}{% if a.tautulli_port %} / {{a.tautulli_port}}{% endif %}</td>
+<td data-auto-poll="{{a.client_id}}">{% if a.plex.claimed is true %}<span data-client="{{a.client_id}}" data-field="plex-status" class="pill live-status ok"><span class="dot"></span>Réclamé</span>{% elif a.runtime.exists %}<span data-client="{{a.client_id}}" data-field="plex-status" class="pill live-status warn"><span class="dot"></span>Non réclamé</span>{% else %}<span data-client="{{a.client_id}}" data-field="plex-status" class="pill live-status">Non déployé</span>{% endif %}</td>
+<td><span data-client="{{a.client_id}}" data-field="image-status" class="pill {{ 'ok' if a.image_info.state=='current' else 'warn' }}">{{a.image_info.label}}</span></td>
+<td class="actions"><a class="button secondary" href="/appboxes/{{a.client_id}}">Ouvrir</a><span data-client="{{a.client_id}}" data-field="claim-action" {% if not (a.runtime.exists and not a.plex.claimed) %}hidden{% endif %}><button onclick="openClaim('{{a.client_id}}')">Réclamer Plex</button></span></td>
+</tr>
+<dialog id="claim-{{a.client_id}}"><div class="modal-head"><strong>Réclamer {{a.client_id|upper}}</strong><button class="close" onclick="closeClaim('{{a.client_id}}')">×</button></div><div class="modal-body">
+<p class="muted">Saisis le code temporaire Plex.</p>
+<form method="post" action="/appboxes/{{a.client_id}}/claim" data-claim-form><label>Claim Plex<input name="claim_code" placeholder="claim-xxxxxxxxxxxxxxxx" autocomplete="off" required></label><div class="actions" style="margin-top:18px"><button>Associer le serveur</button><button type="button" class="secondary" onclick="closeClaim('{{a.client_id}}')">Annuler</button></div></form>
+</div></dialog>
+{% endfor %}</tbody></table></div>
+{% endblock %}

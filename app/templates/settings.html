@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Paramètres — Marinos AppBox{% endblock %}
+{% block page_title %}Paramètres{% endblock %}
+{% block content %}
+<section class="hero">
+ <div>
+  <div class="eyebrow">Configuration</div>
+  <h1>Paramètres de la plateforme</h1>
+  <p>Configuration du Control Plane et de la politique de placement.</p>
+ </div>
+</section>
+
+<div class="grid two">
+ <div class="card">
+  <h2>Node local</h2>
+  <div class="info-list">
+   <div class="info-row"><span>Nom</span><strong>{{node.name}}</strong></div>
+   <div class="info-row"><span>Agent</span><strong>{{node.agent_version}}</strong></div>
+   <div class="info-row"><span>Mode</span><strong>{{node.mode}}</strong></div>
+   <div class="info-row"><span>RDAD</span><strong>{{'Disponible' if node.rdad_ok else 'Indisponible'}}</strong></div>
+   <div class="info-row"><span>GPU</span><strong>{{'Disponible' if node.gpu_ok else 'Indisponible'}}</strong></div>
+  </div>
+ </div>
+ <div class="card">
+  <h2>Modules futurs</h2>
+  <div class="service-list">
+   <span class="service-chip">Discord</span><span class="service-chip">Refresh ciblé</span>
+   <span class="service-chip">Watchdog</span><span class="service-chip">Backups</span>
+   <span class="service-chip">Audit</span><span class="service-chip">API</span>
+  </div>
+  <p class="metric-sub">Ces modules s’intégreront dans la navigation sans nouvelle refonte globale.</p>
+ </div>
+</div>
+
+<section class="card settings-section">
+ <div class="section-head compact">
+  <div>
+   <div class="eyebrow">Provisioning</div>
+   <h2>Politique de placement</h2>
+   <p>Le placement automatique cible uniquement les AppBox-Nodes et exclut toujours les Bare-Metal.</p>
+  </div>
+ </div>
+ <form method="post" action="/settings/placement" class="stack-form">
+  <label>Mode par défaut
+   <select name="default_mode">
+    <option value="manual" {{'selected' if placement.default_mode=='manual' else ''}}>Sélection manuelle</option>
+    <option value="automatic" {{'selected' if placement.default_mode=='automatic' else ''}}>Placement automatique</option>
+    <option value="ask" {{'selected' if placement.default_mode=='ask' else ''}}>Demander à chaque création</option>
+   </select>
+  </label>
+  <div class="grid two">
+   <label>Tag requis en automatique
+    <select name="automatic_required_tag">{% for tag in tags %}<option value="{{tag.tag_id}}" {{'selected' if tag.tag_id==placement.automatic_required_tag else ''}}>{{tag.name}}</option>{% endfor %}</select>
+   </label>
+   <label>Tag exclu en automatique
+    <select name="automatic_excluded_tag">{% for tag in tags %}<option value="{{tag.tag_id}}" {{'selected' if tag.tag_id==placement.automatic_excluded_tag else ''}}>{{tag.name}}</option>{% endfor %}</select>
+   </label>
+  </div>
+  <label class="toggle-row"><input type="checkbox" name="allow_manual_bare_metal" value="true" {{'checked' if placement.allow_manual_bare_metal else ''}}><span><strong>Autoriser le choix manuel d’un Bare-Metal</strong><small>Jamais utilisé par le placement automatique.</small></span></label>
+  <label class="toggle-row"><input type="checkbox" name="require_confirmation_bare_metal" value="true" {{'checked' if placement.require_confirmation_bare_metal else ''}}><span><strong>Exiger une confirmation Bare-Metal</strong><small>Bloque le provisioning tant que la confirmation n’est pas cochée.</small></span></label>
+  <button>Enregistrer la politique</button>
+ </form>
+</section>
+{% endblock %}

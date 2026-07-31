@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{node.name}} — Marinos AppBox{% endblock %}
+{% block page_title %}Node {{node.name}}{% endblock %}
+{% block content %}
+<section class="hero">
+ <div><div class="eyebrow">Supervision node</div><h1>{{node.name}}</h1>
+ <p>{{'Monitoring temps réel du Control Plane local.' if node.is_local else 'Inventaire et heartbeat remontés par l’agent distant.'}}</p></div>
+ <span class="pill {{'ok' if node.agent_online or node.is_local else 'warn'}}"><span class="dot"></span>{{'ONLINE' if node.agent_online or node.is_local else 'OFFLINE'}}</span>
+</section>
+
+{% if node.is_local %}
+<div class="grid metrics" data-node-poll="{{node.node_id}}">
+ <div class="card metric-card chart-card"><div class="metric-label">CPU</div><div class="metric-value" data-node-field="cpu">{{'%.1f'|format(node.metrics.cpu_percent or 0)}} %</div><canvas class="node-chart large" data-node-chart="cpu" data-node="{{node.node_id}}"></canvas></div>
+ <div class="card metric-card chart-card"><div class="metric-label">RAM</div><div class="metric-value" data-node-field="ram">{{'%.1f'|format(node.metrics.ram_percent or 0)}} %</div><canvas class="node-chart large" data-node-chart="ram" data-node="{{node.node_id}}"></canvas></div>
+ <div class="card metric-card chart-card"><div class="metric-label">Disque AppBox</div><div class="metric-value" data-node-field="disk">{{'%.1f'|format(node.metrics.disk_percent or 0)}} %</div><canvas class="node-chart large" data-node-chart="disk" data-node="{{node.node_id}}"></canvas></div>
+ <div class="card metric-card chart-card"><div class="metric-label">Réseau total</div><div class="metric-value" style="font-size:24px" data-node-field="rx">0 o/s</div><canvas class="node-chart large" data-node-chart="network" data-node="{{node.node_id}}"></canvas></div>
+</div>
+{% else %}
+<div class="grid metrics">
+ <div class="card"><div class="metric-label">CPU</div><div class="metric-value" style="font-size:21px">{{node.cpu_model or 'Inconnu'}}</div><div class="metric-sub">{{node.cpu_count or 0}} thread(s) · charge {{'%.2f'|format(node.load_1 or 0)}}</div></div>
+ <div class="card"><div class="metric-label">RAM utilisée</div><div class="metric-value">{{'%.1f'|format(node.metrics.ram_percent or 0)}} %</div></div>
+ <div class="card"><div class="metric-label">Disque utilisé</div><div class="metric-value">{{'%.1f'|format(node.metrics.disk_percent or 0)}} %</div></div>
+ <div class="card"><div class="metric-label">Température</div><div class="metric-value">{{'%.1f'|format(node.temperature_c or 0)}} °C</div></div>
+</div>
+<div class="grid two">
+ <div class="card"><h2>Système</h2><div class="info-list">
+  <div class="info-row"><span>Hostname</span><strong>{{node.hostname or node.name}}</strong></div>
+  <div class="info-row"><span>OS</span><strong>{{node.os_name or 'Inconnu'}}</strong></div>
+  <div class="info-row"><span>Kernel</span><strong>{{node.kernel_version or 'Inconnu'}}</strong></div>
+  <div class="info-row"><span>Dernier heartbeat</span><strong>{{node.last_heartbeat or node.last_seen or 'Jamais'}}</strong></div>
+ </div></div>
+ <div class="card"><h2>Agent</h2><div class="info-list">
+  <div class="info-row"><span>Version</span><strong>{{node.registered_agent_version or node.agent_version or 'Inconnue'}}</strong></div>
+  <div class="info-row"><span>Docker</span><strong>{{node.docker_version or 'Inconnu'}}</strong></div>
+  <div class="info-row"><span>Compose</span><strong>{{node.compose_version or 'Inconnu'}}</strong></div>
+  <div class="info-row"><span>Inventaire</span><strong>{{node.metrics_collected_at or 'Jamais'}}</strong></div>
+ </div></div>
+</div>
+{% endif %}
+
+<div class="section-head"><div><h2>Services système</h2></div></div>
+<div class="grid metrics">
+ <div class="card"><div class="metric-label">RDAD</div><div class="metric-value {{'ok' if node.rdad_ok else 'bad'}}">{{'ONLINE' if node.rdad_ok else 'OFFLINE'}}</div></div>
+ <div class="card"><div class="metric-label">GPU /dev/dri</div><div class="metric-value {{'ok' if node.gpu_ok else 'warn'}}">{{'PRÉSENT' if node.gpu_ok else 'ABSENT'}}</div></div>
+ <div class="card"><div class="metric-label">AppBox</div><div class="metric-value">{{node.appbox_count}}</div></div>
+ <div class="card"><div class="metric-label">État agent</div><div class="metric-value" style="font-size:22px">{{node.agent_status|upper}}</div></div>
+</div>
+
+{% if node.is_local %}
+<div class="section-head"><div><h2>Logs du node</h2><p>Activité Docker et journal du provisioner</p></div></div>
+<div class="card">
+ <div class="log-toolbar"><div class="log-tabs">
+  <button type="button" class="log-tab active" data-log-source="docker" data-node="{{node.node_id}}">Docker</button>
+  <button type="button" class="log-tab" data-log-source="provisioner" data-node="{{node.node_id}}">Provisioner</button>
+ </div><span class="metric-sub" id="node-log-meta">Chargement…</span></div>
+ <div class="log-box node-log-box" id="node-log-output">Chargement des logs…</div>
+</div>
+{% endif %}
+{% endblock %}

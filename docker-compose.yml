@@ -1,0 +1,37 @@
+services:
+  appbox-manager:
+    build: .
+    container_name: appbox-manager-cronos
+    restart: unless-stopped
+
+    ports:
+      - "8090:8000"
+
+    environment:
+      APPBOX_MODE: "real"
+      APPBOX_HOSTNAME: "cronos"
+
+      APPBOX_BASE_DIR: "/srv/appboxes"
+      APPBOX_DATA_DIR: "/data"
+      APPBOX_DATABASE: "/data/appbox-manager.db"
+      APPBOX_INVENTORY: "/data/appboxes.json"
+      APPBOX_JOBS: "/data/jobs.json"
+
+      APPBOX_PROCFS: "/host/proc"
+      APPBOX_METRICS_INTERVAL: "10"
+
+      APPBOX_PLEX_PORT_START: "32435"
+      APPBOX_PLEX_PORT_END: "32499"
+
+      APPBOX_TAUTULLI_PORT_START: "8182"
+      APPBOX_TAUTULLI_PORT_END: "8249"
+
+      APPBOX_JELLYFIN_PORT_START: "8100"
+      APPBOX_JELLYFIN_PORT_END: "8179"
+
+    volumes:
+      - ./data:/data
+      - ./control-plane-runtime:/srv/appboxes
+      - /srv/appbox-manager/reference-images:/srv/appbox-manager/reference-images
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
