@@ -20,6 +20,8 @@ Pendant une capture complète, l'arrêt temporaire de Plex est autorisé lorsque
 
 ## Contrat d’archive Plex — Phase 1
 
+La version produit reste `1.6.0-alpha.5` en développement. L’agent se déclare `1.6.0-alpha.5-dev` tant que cette version n’est pas livrée, tandis que les rapports et capacités du builder Plex identifient précisément l’implémentation `1.6.0-alpha.5-phase1` et le schéma d’archive `1`. Ces champs de capacité sont optionnels afin de rester compatibles avec le Control Plane existant.
+
 L’archive est construite depuis le montage `/config` d’un conteneur Plex arrêté. Elle contient uniquement les données applicatives suivantes sous `Library/Application Support/Plex Media Server/` :
 
 - `Metadata/` ;
@@ -35,7 +37,7 @@ Sont exclus les caches, logs, crash reports, codecs, diagnostics, sessions, tran
 
 ### Cohérence et restauration de la source
 
-Le builder lit l’état Docker initial. Si Plex est actif, il demande un arrêt propre et attend l’état `exited` avant de capturer. La restauration est exécutée dans un bloc `finally` : une source initialement arrêtée reste arrêtée ; une source initialement active est redémarrée, puis l’état `running` et l’endpoint Plex `/identity` sont vérifiés. Une erreur de redémarrage ou de santé est remontée comme erreur explicite de restauration et n’est jamais masquée par une erreur de capture.
+Le builder lit l’état Docker initial. Si Plex est actif, il demande un arrêt propre et attend l’état `exited` avant de capturer. La restauration est exécutée dans un bloc `finally` : une source initialement arrêtée reste arrêtée ; une source initialement active est redémarrée, puis l’état `running` et l’endpoint Plex `/identity` sont vérifiés. Le contrôle interroge d’abord Plex depuis l’hôte via l’adresse IP fournie par Docker ; `127.0.0.1:32400` n’est utilisé que lorsque Docker confirme le mode réseau `host`. `curl` ou `wget` dans le conteneur restent un repli secondaire et leur absence seule ne provoque pas l’échec. Une erreur de redémarrage ou de santé est remontée comme erreur explicite de restauration et n’est jamais masquée par une erreur de capture.
 
 Chaque base canonique est copiée vers l’overlay assaini avec le mécanisme SQLite pris en charge, contrôlée par `quick_check` lorsque possible et décrite par son nom, ses tailles, son SHA-256, son moteur et son résultat de validation. Les fichiers WAL et SHM ne sont jamais archivés.
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import hashlib
+import ipaddress
 import re
 import secrets
 import os
@@ -17,12 +18,13 @@ import urllib.parse
 import http.client
 import sqlite3
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-VERSION = "1.6.0-alpha.4"
+PRODUCT_VERSION = "1.6.0-alpha.5"
+VERSION = f"{PRODUCT_VERSION}-dev"
 
 PLEX_REFERENCE_ARCHIVE_SCHEMA = 1
-PLEX_REFERENCE_BUILDER_VERSION = "1.6.0-alpha.5-phase1"
+PLEX_REFERENCE_BUILDER_VERSION = f"{PRODUCT_VERSION}-phase1"
 PLEX_REFERENCE_ROOT = Path("Library/Application Support/Plex Media Server")
 PLEX_REFERENCE_INCLUDED_DIRECTORIES = (
     "Metadata",
@@ -583,12 +585,24 @@ def _tar_tree(tar: tarfile.TarFile, source: Path, arcname: str) -> None:
         return
 
     def archive_filter(info: tarfile.TarInfo):
-        relative = Path(info.name).relative_to(PLEX_REFERENCE_ROOT.as_posix())
-        if info.issym() or info.islnk() or _plex_archive_member_excluded(relative):
+        relative = _plex_archive_relative(info.name)
+        if relative is None or info.issym() or info.islnk() or _plex_archive_member_excluded(relative):
             return None
         return info
 
     tar.add(source, arcname=arcname, recursive=True, filter=archive_filter)
+
+
+def _plex_archive_relative(member_name: str) -> Path | None:
+    member = PurePosixPath(member_name)
+    root = PurePosixPath(PLEX_REFERENCE_ROOT.as_posix())
+    if member.is_absolute() or ".." in member.parts:
+        return None
+    try:
+        relative = member.relative_to(root)
+    except ValueError:
+        return None
+    return Path(*relative.parts)
 
 
 def _inspect_plex_reference_archive(archive: Path) -> dict:
@@ -615,7 +629,10 @@ def _inspect_plex_reference_archive(archive: Path) -> dict:
             included_paths.append(preferences)
         for member in members:
             normalized = member.name.rstrip("/")
-            relative = Path(normalized).relative_to(root) if normalized != root else Path()
+            relative = _plex_archive_relative(normalized)
+            if relative is None:
+                excluded_violations.append(normalized)
+                continue
             if relative.parts and _plex_archive_member_excluded(relative):
                 excluded_violations.append(normalized)
             if member.isfile():
@@ -685,23 +702,70 @@ def _wait_for_container_state(container_name: str, expected: str, timeout: int =
     )
 
 
+def _plex_identity_host_urls(container_name: str) -> list[str]:
+    code, output, error = run([
+        "docker", "inspect", "-f",
+        "{{.HostConfig.NetworkMode}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+        container_name,
+    ], timeout=30)
+    if code != 0:
+        raise RuntimeError(f"Réseau Docker de {container_name} indisponible : {(error or output).strip()}")
+    network_mode, _, raw_addresses = output.strip().partition("|")
+    if network_mode.strip().lower() == "host":
+        return ["http://127.0.0.1:32400/identity"]
+    urls = []
+    for value in raw_addresses.split():
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        host = f"[{address}]" if address.version == 6 else str(address)
+        urls.append(f"http://{host}:32400/identity")
+    return urls
+
+
+def _parse_plex_identity(output: str, method: str) -> dict:
+    if "<MediaContainer" not in output:
+        raise RuntimeError("réponse sans MediaContainer")
+    start = output.find("<?xml") if "<?xml" in output else output.find("<MediaContainer")
+    identity = ET.fromstring(output[start:]).attrib
+    return {
+        "reachable": True,
+        "version": identity.get("version"),
+        "claimed": identity.get("claimed") == "1",
+        "method": method,
+    }
+
+
 def _wait_for_plex_identity(container_name: str, timeout: int = 120) -> dict:
     deadline = time.monotonic() + timeout
     last_error = "endpoint indisponible"
+    try:
+        host_urls = _plex_identity_host_urls(container_name)
+    except Exception as exc:
+        host_urls = []
+        last_error = str(exc)
     while time.monotonic() < deadline:
+        for url in host_urls:
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": f"marinos-appbox-agent/{VERSION}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    output = response.read().decode("utf-8", errors="replace")
+                return _parse_plex_identity(output, f"host-http:{url}")
+            except Exception as exc:
+                last_error = f"{url}: {exc}"
         code, output, error = run([
             "docker", "exec", container_name, "sh", "-c",
             "curl -fsS http://127.0.0.1:32400/identity || wget -qO- http://127.0.0.1:32400/identity",
         ], timeout=15)
-        if code == 0 and "<MediaContainer" in output:
+        if code == 0:
             try:
-                start = output.find("<?xml") if "<?xml" in output else output.find("<MediaContainer")
-                identity = ET.fromstring(output[start:]).attrib
-                return {"reachable": True, "version": identity.get("version"), "claimed": identity.get("claimed") == "1"}
-            except ET.ParseError as exc:
-                last_error = f"XML /identity invalide : {exc}"
+                return _parse_plex_identity(output, "container-curl-or-wget")
+            except Exception as exc:
+                last_error = f"conteneur : {exc}"
         else:
-            last_error = (error or output or "endpoint indisponible").strip()
+            tool_error = (error or output or "curl/wget indisponible").strip()
+            last_error = f"{last_error}; conteneur : {tool_error}"
         time.sleep(2)
     raise RuntimeError(f"Plex /identity ne répond pas après le redémarrage : {last_error}")
 
@@ -920,6 +984,8 @@ def heartbeat(config):
             "reference_builder_foundation": True,
             "reference_discovery": True,
             "reference_builders": ["plex"],
+            "reference_builder_versions": {"plex": PLEX_REFERENCE_BUILDER_VERSION},
+            "reference_archive_schemas": {"plex": PLEX_REFERENCE_ARCHIVE_SCHEMA},
             "reference_builder_intrusive_actions": False,
             "deployment_executor": True,
         },

@@ -5,7 +5,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 AGENT_PATH = Path(__file__).resolve().parents[1] / "agent" / "marinos-appbox-agent.py"
@@ -134,21 +134,60 @@ class PlexSourceCaptureTests(unittest.TestCase):
             (0, "exited\n", ""),
             (0, "plex-source\n", ""),
             (0, "running\n", ""),
-            (0, '<MediaContainer claimed="0" version="1.0"/>', ""),
+            (0, "host|\n", ""),
             (0, "running\n", ""),
         ]
-        with patch.object(agent, "run", side_effect=docker_results) as docker:
+        response = MagicMock()
+        response.read.return_value = b'<MediaContainer claimed="0" version="1.0"/>'
+        response.__enter__.return_value = response
+        with patch.object(agent, "run", side_effect=docker_results) as docker, \
+             patch.object(agent.urllib.request, "urlopen", return_value=response):
             result = agent._capture_plex_reference(self.config, self.root / "capture-running", "plex-source")
         commands = [call.args[0] for call in docker.call_args_list]
         self.assertIn(["docker", "stop", "--time", "60", "plex-source"], commands)
         self.assertIn(["docker", "start", "plex-source"], commands)
-        self.assertTrue(any(command[:3] == ["docker", "exec", "plex-source"] for command in commands))
+        self.assertFalse(any(command[:3] == ["docker", "exec", "plex-source"] for command in commands))
         self.assertTrue(result["builder_stopped_container"])
         self.assertTrue(result["restart_attempted"])
         self.assertTrue(result["stop_result"]["success"])
         self.assertTrue(result["restart_result"]["success"])
         self.assertEqual(result["final_container_state"], "running")
         self.assertTrue(result["plex_identity_health_after_restart"]["reachable"])
+        self.assertIn("host-http:http://127.0.0.1:32400/identity", result["plex_identity_health_after_restart"]["method"])
+
+    def test_identity_uses_container_ip_before_container_tools(self):
+        response = MagicMock()
+        response.read.return_value = b'<MediaContainer claimed="1" version="1.2.3"/>'
+        response.__enter__.return_value = response
+        with patch.object(agent, "run", return_value=(0, "bridge|172.18.0.9\n", "")) as docker, \
+             patch.object(agent.urllib.request, "urlopen", return_value=response) as urlopen:
+            identity = agent._wait_for_plex_identity("plex-source", timeout=1)
+        self.assertEqual(urlopen.call_args.args[0].full_url, "http://172.18.0.9:32400/identity")
+        self.assertEqual(identity["method"], "host-http:http://172.18.0.9:32400/identity")
+        self.assertTrue(identity["claimed"])
+        self.assertEqual(len(docker.call_args_list), 1)
+
+    def test_archive_inspection_rejects_members_outside_plex_root_explicitly(self):
+        archive = self.root / "outside-root.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            info = tarfile.TarInfo("../../escape.txt")
+            info.size = 0
+            tar.addfile(info)
+        self.assertIsNone(agent._plex_archive_relative("../../escape.txt"))
+        self.assertIsNone(agent._plex_archive_relative("unrelated/file.txt"))
+        with self.assertRaisesRegex(RuntimeError, "chemins exclus"):
+            agent._inspect_plex_reference_archive(archive)
+
+    def test_development_agent_and_phase1_builder_versions_are_reported(self):
+        metrics = {"docker_ok": True, "compose_version": "v2"}
+        config = {"node_id": "test-node", "agent_id": "agent-test"}
+        with patch.object(agent, "collect_metrics", return_value=metrics), \
+             patch.object(agent, "api", side_effect=lambda _config, _method, _path, payload=None: payload):
+            payload = agent.heartbeat(config)
+        self.assertEqual(agent.VERSION, "1.6.0-alpha.5-dev")
+        self.assertEqual(payload["agent_version"], "1.6.0-alpha.5-dev")
+        self.assertEqual(payload["capabilities"]["reference_builder_versions"]["plex"], "1.6.0-alpha.5-phase1")
+        self.assertEqual(payload["capabilities"]["reference_archive_schemas"]["plex"], 1)
 
     def test_initially_stopped_plex_remains_stopped(self):
         with patch.object(agent, "_docker_container_state", side_effect=["exited", "exited"]), \
