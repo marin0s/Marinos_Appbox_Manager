@@ -1,3 +1,17 @@
+# Changelog
+
+## 1.6.0-alpha.5 — En développement
+
+### Documentation et dépôt
+- Ajout des fondations du dépôt : `.gitignore`, guide de contribution, contexte agents, architecture, roadmap et templates GitHub.
+- Confirmation de `1.6.0-alpha.4` comme version de production et de `1.6.0-alpha.5` comme prochaine livraison.
+
+### Prévu pour cette version
+- Fiabilisation complète des images de référence Plex.
+- Conservation explicite des bibliothèques, `Metadata`, `Media` et bases cohérentes.
+- Arrêt temporaire sécurisé du Plex source lorsque nécessaire, avec redémarrage garanti.
+- Validation d'un déploiement from scratch, du claim distant et du nommage sans double tiret.
+
 ## 1.6.0-alpha.3
 
 - Plex SQLite native hot backup and validation.
@@ -25,7 +39,6 @@
 - Correctif d’archivage et packaging agent systemd.
 - Exclusion de `control-plane-runtime/` du script de mise à niveau.
 
-# Changelog
 
 ## 1.2.3 — 2026-07-30
 
