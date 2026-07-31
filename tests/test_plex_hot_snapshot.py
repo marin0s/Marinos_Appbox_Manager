@@ -1,9 +1,11 @@
+import hashlib
 import importlib.util
 import sqlite3
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 AGENT_PATH = Path(__file__).resolve().parents[1] / "agent" / "marinos-appbox-agent.py"
@@ -13,69 +15,167 @@ assert spec.loader is not None
 spec.loader.exec_module(agent)
 
 
-class PlexHotSnapshotTests(unittest.TestCase):
+class PlexSourceCaptureTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.config = self.root / "config"
-        self.plex = self.config / "Library/Application Support/Plex Media Server"
+        self.plex = self.config / agent.PLEX_REFERENCE_ROOT
         self.db_dir = self.plex / "Plug-in Support/Databases"
         self.db_dir.mkdir(parents=True)
-        self.plex.joinpath("Metadata/item").mkdir(parents=True)
-        self.plex.joinpath("Metadata/item/poster.jpg").write_bytes(b"poster")
-        self.plex.joinpath("Cache").mkdir()
-        self.plex.joinpath("Cache/temporary.bin").write_bytes(b"cache")
-        self.plex.joinpath("Logs").mkdir()
-        self.plex.joinpath("Logs/Plex Media Server.log").write_text("secret log")
-        self.plex.joinpath("Preferences.xml").write_text(
-            '<Preferences MachineIdentifier="machine" PlexOnlineToken="token" FriendlyName="Reference" />'
+
+        files = {
+            "Metadata/item/poster.jpg": b"poster",
+            "Media/localhost/index.bin": b"media-index",
+            "Plug-ins/example.bundle/Contents/plugin.py": b"plugin",
+            "Scanners/Series/scanner.py": b"scanner",
+            "Profiles/profile.xml": b"profile",
+            "Resources/resource.dat": b"resource",
+        }
+        for relative, content in files.items():
+            target = self.plex / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+        for directory in ("Cache", "Logs", "Crash Reports", "Codecs", "Diagnostics", "Sessions", "Transcode"):
+            target = self.plex / directory
+            target.mkdir(parents=True)
+            (target / "excluded.bin").write_bytes(b"excluded")
+
+        for relative in (
+            "Metadata/item/process.pid",
+            "Metadata/item/work.tmp",
+            "Media/localhost/.transcode-session",
+        ):
+            target = self.plex / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"transient")
+
+        self.preferences = self.plex / "Preferences.xml"
+        self.preferences.write_text(
+            '<Preferences MachineIdentifier="machine" ProcessedMachineIdentifier="processed" '
+            'AnonymousMachineIdentifier="anonymous" PlexOnlineToken="token" '
+            'PlexOnlineUsername="user" PlexOnlineMail="mail@example.invalid" '
+            'PlexOnlineHome="1" CertificateUUID="certificate" PubSubServer="server" '
+            'PubSubServerRegion="region" FriendlyName="Reference" Language="fr" />',
+            encoding="utf-8",
         )
+        self._create_database("com.plexapp.plugins.library.db", rows=3)
+        self._create_database("com.plexapp.plugins.library.blobs.db", rows=2)
+        self._create_database("com.plexapp.plugins.library-2026-07-30.db", rows=1)
+        self._create_database("library-backup.db", rows=1)
+        (self.db_dir / "com.plexapp.plugins.library.db-wal").write_bytes(b"wal")
+        (self.db_dir / "com.plexapp.plugins.library.db-shm").write_bytes(b"shm")
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_hot_backup_is_consistent_and_drops_wal_files(self):
-        source = self.db_dir / "com.plexapp.plugins.library.db"
-        writer = sqlite3.connect(source)
-        writer.execute("PRAGMA journal_mode=WAL")
-        writer.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT)")
-        writer.executemany("INSERT INTO items(title) VALUES(?)", [(f"item-{i}",) for i in range(100)])
-        writer.commit()
-        writer.execute("INSERT INTO items(title) VALUES('committed-in-wal')")
-        writer.commit()
+    def _create_database(self, name, rows):
+        connection = sqlite3.connect(self.db_dir / name)
+        try:
+            connection.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT)")
+            connection.executemany("INSERT INTO items(title) VALUES(?)", [(f"item-{index}",) for index in range(rows)])
+            connection.commit()
+        finally:
+            connection.close()
 
-        overlay, report = agent._prepare_plex_reference_overlay(self.config, self.root / "work")
-        snapshot = overlay / "Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
-        with sqlite3.connect(snapshot) as db:
-            self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 101)
-        self.assertFalse(snapshot.with_name(snapshot.name + "-wal").exists())
-        self.assertEqual(report["sqlite_strategy"], "python-sqlite3")
-        self.assertEqual(report["sqlite_snapshots"][0]["quick_check"], "ok")
-        writer.close()
-
-    def test_archive_uses_sanitized_overlay_and_excludes_runtime_data(self):
-        source = self.db_dir / "com.plexapp.plugins.library.db"
-        with sqlite3.connect(source) as db:
-            db.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT)")
-            db.execute("INSERT INTO items(title) VALUES('ok')")
-
-        overlay, _ = agent._prepare_plex_reference_overlay(self.config, self.root / "work")
+    def _build_archive(self):
+        workdir = self.root / "work"
+        overlay, sanitization = agent._prepare_plex_reference_overlay(self.config, workdir)
         archive = self.root / "reference.tar.gz"
-        agent._archive_plex_reference(self.config, overlay, archive)
+        report = agent._archive_plex_reference(self.config, overlay, archive)
+        return archive, sanitization, report
 
+    def test_canonical_archive_preserves_application_data_and_excludes_runtime_data(self):
+        archive, sanitization, report = self._build_archive()
         with tarfile.open(archive, "r:gz") as tar:
             names = set(tar.getnames())
-            prefs_name = "Library/Application Support/Plex Media Server/Preferences.xml"
-            self.assertIn(prefs_name, names)
-            self.assertNotIn("Library/Application Support/Plex Media Server/Metadata/item/poster.jpg", names)
-            self.assertIn("Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db", names)
-            self.assertFalse(any("/Cache/" in f"/{name}/" for name in names))
-            self.assertFalse(any("/Logs/" in f"/{name}/" for name in names))
-            prefs = tar.extractfile(prefs_name).read().decode()
-            self.assertNotIn("MachineIdentifier", prefs)
-            self.assertNotIn("PlexOnlineToken", prefs)
-            self.assertIn("FriendlyName", prefs)
+            prefix = agent.PLEX_REFERENCE_ROOT.as_posix()
+            self.assertIn(f"{prefix}/Metadata/item/poster.jpg", names)
+            self.assertIn(f"{prefix}/Media/localhost/index.bin", names)
+            self.assertIn(f"{prefix}/Plug-ins/example.bundle/Contents/plugin.py", names)
+            self.assertIn(f"{prefix}/Scanners/Series/scanner.py", names)
+            self.assertIn(f"{prefix}/Profiles/profile.xml", names)
+            self.assertIn(f"{prefix}/Resources/resource.dat", names)
+            canonical = f"{prefix}/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+            blobs = f"{prefix}/Plug-in Support/Databases/com.plexapp.plugins.library.blobs.db"
+            self.assertIn(canonical, names)
+            self.assertIn(blobs, names)
+            self.assertFalse(any("2026-07-30" in name or "backup" in name.lower() for name in names))
+            for excluded in ("Cache", "Logs", "Crash Reports", "Codecs", "Diagnostics", "Sessions", "Transcode"):
+                self.assertFalse(any(name == f"{prefix}/{excluded}" or name.startswith(f"{prefix}/{excluded}/") for name in names))
+            self.assertFalse(any(name.endswith((".db-wal", ".db-shm", ".pid", ".tmp")) for name in names))
+            self.assertFalse(any(".transcode" in name.lower() for name in names))
+            preferences = tar.extractfile(f"{prefix}/Preferences.xml").read().decode("utf-8")
+
+        for attribute in agent.PLEX_REFERENCE_IDENTITY_ATTRIBUTES:
+            self.assertNotIn(attribute, preferences)
+        self.assertIn('FriendlyName="Reference"', preferences)
+        self.assertIn('Language="fr"', preferences)
+        self.assertEqual(set(sanitization["identity_attributes_removed"]), set(agent.PLEX_REFERENCE_IDENTITY_ATTRIBUTES))
+        self.assertEqual(report["metadata"], {"size_bytes": len(b"poster"), "file_count": 1})
+        self.assertEqual(report["media"], {"size_bytes": len(b"media-index"), "file_count": 1})
+        self.assertEqual(report["databases"]["file_count"], 2)
+        self.assertEqual(set(report["databases"]["names"]), {
+            "com.plexapp.plugins.library.db", "com.plexapp.plugins.library.blobs.db",
+        })
+        with tarfile.open(archive, "r:gz") as tar:
+            actual_uncompressed_size = sum(member.size for member in tar.getmembers() if member.isfile())
+        self.assertEqual(report["uncompressed_size_bytes"], actual_uncompressed_size)
+        for validation in sanitization["sqlite_snapshots"]:
+            snapshot = self.root / "work/overlay" / agent.PLEX_REFERENCE_ROOT / "Plug-in Support/Databases" / validation["name"]
+            self.assertEqual(validation["sha256"], hashlib.sha256(snapshot.read_bytes()).hexdigest())
+            self.assertIn(validation["validation"], {"quick_check", "schema-readable-tokenizer-unavailable"})
+
+    def test_initially_running_plex_is_stopped_and_restarted(self):
+        docker_results = [
+            (0, "running\n", ""),
+            (0, "plex-source\n", ""),
+            (0, "exited\n", ""),
+            (0, "plex-source\n", ""),
+            (0, "running\n", ""),
+            (0, '<MediaContainer claimed="0" version="1.0"/>', ""),
+            (0, "running\n", ""),
+        ]
+        with patch.object(agent, "run", side_effect=docker_results) as docker:
+            result = agent._capture_plex_reference(self.config, self.root / "capture-running", "plex-source")
+        commands = [call.args[0] for call in docker.call_args_list]
+        self.assertIn(["docker", "stop", "--time", "60", "plex-source"], commands)
+        self.assertIn(["docker", "start", "plex-source"], commands)
+        self.assertTrue(any(command[:3] == ["docker", "exec", "plex-source"] for command in commands))
+        self.assertTrue(result["builder_stopped_container"])
+        self.assertTrue(result["restart_attempted"])
+        self.assertTrue(result["stop_result"]["success"])
+        self.assertTrue(result["restart_result"]["success"])
+        self.assertEqual(result["final_container_state"], "running")
+        self.assertTrue(result["plex_identity_health_after_restart"]["reachable"])
+
+    def test_initially_stopped_plex_remains_stopped(self):
+        with patch.object(agent, "_docker_container_state", side_effect=["exited", "exited"]), \
+             patch.object(agent, "_stop_plex_for_capture") as stop, \
+             patch.object(agent, "_restart_plex_after_capture") as restart:
+            result = agent._capture_plex_reference(self.config, self.root / "capture-stopped", "plex-source")
+        stop.assert_not_called()
+        restart.assert_not_called()
+        self.assertFalse(result["builder_stopped_container"])
+        self.assertFalse(result["restart_attempted"])
+        self.assertEqual(result["final_container_state"], "exited")
+
+    def test_archive_failure_still_restarts_initially_running_plex(self):
+        with patch.object(agent, "_docker_container_state", side_effect=["running", "running"]), \
+             patch.object(agent, "_stop_plex_for_capture", return_value={"success": True, "confirmed_state": "exited", "output": "plex"}), \
+             patch.object(agent, "_archive_plex_reference", side_effect=RuntimeError("archive failed")), \
+             patch.object(agent, "_restart_plex_after_capture", return_value=({"success": True, "confirmed_state": "running", "output": "plex"}, {"reachable": True})) as restart:
+            with self.assertRaisesRegex(RuntimeError, "archive failed"):
+                agent._capture_plex_reference(self.config, self.root / "capture-error", "plex-source")
+        restart.assert_called_once_with("plex-source")
+
+    def test_restart_failure_is_an_explicit_restoration_error(self):
+        with patch.object(agent, "_docker_container_state", side_effect=["running", "exited"]), \
+             patch.object(agent, "_stop_plex_for_capture", return_value={"success": True, "confirmed_state": "exited", "output": "plex"}), \
+             patch.object(agent, "_restart_plex_after_capture", side_effect=RuntimeError("docker start failed")):
+            with self.assertRaisesRegex(RuntimeError, "Restauration explicite.*docker start failed"):
+                agent._capture_plex_reference(self.config, self.root / "capture-restart-error", "plex-source")
 
 
 if __name__ == "__main__":
