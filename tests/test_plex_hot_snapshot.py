@@ -126,6 +126,9 @@ class PlexSourceCaptureTests(unittest.TestCase):
             snapshot = self.root / "work/overlay" / agent.PLEX_REFERENCE_ROOT / "Plug-in Support/Databases" / validation["name"]
             self.assertEqual(validation["sha256"], hashlib.sha256(snapshot.read_bytes()).hexdigest())
             self.assertIn(validation["validation"], {"quick_check", "schema-readable-tokenizer-unavailable"})
+        self.assertEqual(sanitization["sqlite_engine_selection"]["selected_engine"], "python-sqlite3")
+        self.assertEqual(sanitization["sqlite_engine_selection"]["reason"], "source-container-frozen")
+        self.assertFalse(sanitization["sqlite_engine_selection"]["container_exec_attempted"])
 
     def test_initially_running_plex_is_stopped_and_restarted(self):
         docker_results = [
