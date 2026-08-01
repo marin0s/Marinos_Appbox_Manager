@@ -8,7 +8,9 @@ import os
 import platform
 import shutil
 import socket
+import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -47,6 +49,190 @@ PLEX_REFERENCE_IDENTITY_ATTRIBUTES = (
     "CertificateUUID", "PubSubServer", "PubSubServerRegion",
 )
 CONFIG = Path("/etc/marinos-appbox-agent/agent.json")
+PLEX_SQLITE_EXECUTABLE = "/usr/lib/plexmediaserver/Plex SQLite"
+SQLITE_DIAGNOSTIC_TEXT_LIMIT = 4096
+
+
+class PlexSQLiteCaptureError(RuntimeError):
+    def __init__(self, message: str, diagnostics: dict):
+        super().__init__(message)
+        self.diagnostics = _sanitize_diagnostics(diagnostics)
+
+    def add_diagnostics(self, key: str, value) -> None:
+        self.diagnostics[key] = _sanitize_diagnostics(value)
+
+
+def _sanitize_diagnostic_text(value: str) -> str:
+    text = str(value)
+    substitutions = (
+        (r"(?i)(authorization\s*:\s*)\S+(?:\s+\S+)?", r"\1[REDACTED]"),
+        (
+            r"(?i)([\"']?(?:PlexOnlineToken|PLEX_CLAIM|access_token|refresh_token|password|api[_-]?key|secret|token)[\"']?\s*[:=]\s*)[\"']?[^\"',;\s}&]+[\"']?",
+            r"\1[REDACTED]",
+        ),
+        (r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@", r"\1[REDACTED]@"),
+        (r"(?i)([?&](?:access_token|refresh_token|token|password|api[_-]?key|secret)=)[^&#\s]+", r"\1[REDACTED]"),
+        (r"(?i)\bclaim-[A-Za-z0-9_-]{8,}\b", "claim-[REDACTED]"),
+    )
+    for pattern, replacement in substitutions:
+        text = re.sub(pattern, replacement, text)
+    if len(text) > SQLITE_DIAGNOSTIC_TEXT_LIMIT:
+        return text[:SQLITE_DIAGNOSTIC_TEXT_LIMIT] + "...[truncated]"
+    return text
+
+
+def _sanitize_diagnostics(value):
+    if isinstance(value, dict):
+        return {str(key): _sanitize_diagnostics(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_diagnostics(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_diagnostic_text(value)
+    return value
+
+
+def _path_diagnostics(path: Path) -> dict:
+    path = Path(path)
+    result = {
+        "path": os.path.abspath(str(path)),
+        "exists": False,
+        "file_type": "missing",
+        "permissions": None,
+        "uid": None,
+        "gid": None,
+        "readable": False,
+        "writable": False,
+        "searchable": False,
+    }
+    try:
+        details = path.lstat()
+        result.update({
+            "exists": True,
+            "permissions": f"{stat.S_IMODE(details.st_mode):04o}",
+            "uid": getattr(details, "st_uid", None),
+            "gid": getattr(details, "st_gid", None),
+            "readable": os.access(path, os.R_OK),
+            "writable": os.access(path, os.W_OK),
+            "searchable": os.access(path, os.X_OK),
+            "size_bytes": details.st_size,
+        })
+        if stat.S_ISREG(details.st_mode):
+            result["file_type"] = "file"
+        elif stat.S_ISDIR(details.st_mode):
+            result["file_type"] = "directory"
+        elif stat.S_ISLNK(details.st_mode):
+            result["file_type"] = "symlink"
+        else:
+            result["file_type"] = "other"
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        result["diagnostic_error"] = _sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}")
+    return result
+
+
+def _disk_space_diagnostics(path: Path) -> dict:
+    candidate = Path(path)
+    try:
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        usage = shutil.disk_usage(candidate)
+        return {
+            "checked_path": os.path.abspath(str(candidate)),
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+        }
+    except Exception as exc:
+        return {
+            "checked_path": os.path.abspath(str(candidate)),
+            "diagnostic_error": _sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}"),
+        }
+
+
+def _sqlite_diagnostics(source: Path, destination: Path, engine: str, executable: str) -> dict:
+    source = Path(source)
+    destination = Path(destination)
+    return {
+        "engine": engine,
+        "selected_sqlite_executable": executable,
+        "sqlite_library_version": sqlite3.sqlite_version,
+        "source": _path_diagnostics(source),
+        "source_parent": _path_diagnostics(source.parent),
+        "source_sidecars": {
+            suffix: _path_diagnostics(source.with_name(source.name + suffix))
+            for suffix in ("-wal", "-shm", "-journal")
+        },
+        "destination": _path_diagnostics(destination),
+        "destination_parent": _path_diagnostics(destination.parent),
+        "destination_free_disk": _disk_space_diagnostics(destination.parent),
+        "cwd": os.path.abspath(os.getcwd()),
+        "subprocesses": [],
+    }
+
+
+def _refresh_sqlite_paths(diagnostics: dict, source: Path, destination: Path) -> None:
+    diagnostics["source"] = _path_diagnostics(source)
+    diagnostics["source_parent"] = _path_diagnostics(source.parent)
+    diagnostics["destination"] = _path_diagnostics(destination)
+    diagnostics["destination_parent"] = _path_diagnostics(destination.parent)
+    diagnostics["destination_free_disk"] = _disk_space_diagnostics(destination.parent)
+
+
+def _sqlite_capture_failure(
+    *, stage: str, role: str, failed_path: Path, source: Path,
+    destination: Path, diagnostics: dict, error: Exception,
+) -> PlexSQLiteCaptureError:
+    _refresh_sqlite_paths(diagnostics, source, destination)
+    failed = _path_diagnostics(failed_path)
+    diagnostics["failure"] = {
+        "stage": stage,
+        "role": role,
+        "failed_path": failed,
+        "exception_type": type(error).__name__,
+        "original_error": _sanitize_diagnostic_text(str(error)),
+    }
+    parent = _path_diagnostics(Path(failed_path).parent)
+    message = (
+        f"Plex SQLite capture failed at {stage}: role={role}, path={failed['path']}, "
+        f"engine={diagnostics['engine']}, exists={failed['exists']}, type={failed['file_type']}, "
+        f"permissions={failed['permissions']}, uid={failed['uid']}, gid={failed['gid']}, "
+        f"readable={failed['readable']}, writable={failed['writable']}; "
+        f"parent={parent['path']}, parent_exists={parent['exists']}, "
+        f"parent_permissions={parent['permissions']}, parent_uid={parent['uid']}, "
+        f"parent_gid={parent['gid']}, parent_writable={parent['writable']}; "
+        f"original={_sanitize_diagnostic_text(str(error))}"
+    )
+    return PlexSQLiteCaptureError(message, diagnostics)
+
+
+def _run_sqlite_subprocess(arguments: list[str], timeout: int, diagnostics: dict) -> tuple[int, str, str]:
+    code, output, error = run(arguments, timeout=timeout)
+    diagnostics["subprocesses"].append({
+        "arguments": list(arguments),
+        "cwd": os.path.abspath(os.getcwd()),
+        "return_code": code,
+        "stdout": _sanitize_diagnostic_text(output),
+        "stderr": _sanitize_diagnostic_text(error),
+    })
+    return code, output, error
+
+
+def _close_sqlite_connections(diagnostics: dict, **connections) -> None:
+    errors = []
+    for role, connection in connections.items():
+        if connection is None:
+            continue
+        try:
+            connection.close()
+        except Exception as exc:
+            errors.append({
+                "role": role,
+                "exception_type": type(exc).__name__,
+                "error": _sanitize_diagnostic_text(str(exc)),
+            })
+    if errors:
+        diagnostics.setdefault("connection_cleanup_errors", []).extend(errors)
 
 
 def run(command, timeout=15):
@@ -413,38 +599,162 @@ def discover_plex_instance(config, payload):
 
 
 def _python_sqlite_hot_backup(source: Path, destination: Path) -> dict:
-    """Fallback transactionally consistent snapshot for non-Plex SQLite databases."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.unlink(missing_ok=True)
-    source_uri = f"file:{urllib.parse.quote(str(source))}?mode=ro"
-    source_connection = sqlite3.connect(source_uri, uri=True, timeout=60)
-    destination_connection = sqlite3.connect(destination, timeout=60)
+    """Snapshot a frozen database through private writable staging."""
+    source = Path(source)
+    destination = Path(destination)
+    diagnostics = _sqlite_diagnostics(source, destination, "python-sqlite3", sys.executable)
+    diagnostics["source_staging_strategy"] = "private-writable-copy"
+
+    if not source.is_file():
+        error = FileNotFoundError(f"SQLite source database is missing: {source}")
+        raise _sqlite_capture_failure(
+            stage="source_preflight", role="source", failed_path=source,
+            source=source, destination=destination, diagnostics=diagnostics, error=error,
+        ) from error
+
+    parent_existed = destination.parent.is_dir()
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise _sqlite_capture_failure(
+            stage="destination_parent_prepare", role="destination_parent",
+            failed_path=destination.parent, source=source, destination=destination,
+            diagnostics=diagnostics, error=exc,
+        ) from exc
+    diagnostics["destination_parent_created"] = not parent_existed
+
+    try:
+        destination.unlink(missing_ok=True)
+    except Exception as exc:
+        raise _sqlite_capture_failure(
+            stage="destination_prepare", role="destination", failed_path=destination,
+            source=source, destination=destination, diagnostics=diagnostics, error=exc,
+        ) from exc
+
+    staging_path = None
+    staging_lifecycle = {
+        "created": False,
+        "cleanup_policy": "TemporaryDirectory",
+        "cleanup_completed": False,
+    }
     validation = "schema-only"
     try:
-        source_connection.execute("PRAGMA busy_timeout=60000")
-        destination_connection.execute("PRAGMA journal_mode=DELETE")
-        source_connection.backup(destination_connection, pages=2048, sleep=0.05)
-        destination_connection.execute("PRAGMA journal_mode=DELETE")
+        staging_context = tempfile.TemporaryDirectory(prefix="sqlite-source-", dir=destination.parent)
+    except Exception as exc:
+        raise _sqlite_capture_failure(
+            stage="source_staging_prepare", role="destination_parent",
+            failed_path=destination.parent, source=source, destination=destination,
+            diagnostics=diagnostics, error=exc,
+        ) from exc
+    try:
+        with staging_context as staging_directory:
+            staging_path = Path(staging_directory)
+            staging_lifecycle.update({
+                "path": os.path.abspath(str(staging_path)),
+                "created": True,
+                "exists_during_snapshot": staging_path.is_dir(),
+            })
+            staged_source = staging_path / source.name
+            copied_sidecars = []
+            copy_pairs = [(source, staged_source)]
+            copy_pairs.extend(
+                (source.with_name(source.name + suffix), staged_source.with_name(staged_source.name + suffix))
+                for suffix in ("-wal", "-shm", "-journal")
+                if source.with_name(source.name + suffix).is_file()
+            )
+            for copy_source, copy_destination in copy_pairs:
+                try:
+                    shutil.copy2(copy_source, copy_destination)
+                    copy_destination.chmod(0o600)
+                except Exception as exc:
+                    reported_path = getattr(exc, "filename", None)
+                    failed_path = Path(reported_path) if reported_path else copy_destination
+                    diagnostics["copy_operation"] = {
+                        "source": _path_diagnostics(copy_source),
+                        "destination": _path_diagnostics(copy_destination),
+                    }
+                    raise _sqlite_capture_failure(
+                        stage="source_stage_copy", role="source_staging",
+                        failed_path=failed_path, source=source, destination=destination,
+                        diagnostics=diagnostics, error=exc,
+                    ) from exc
+                if copy_source != source:
+                    copied_sidecars.append(copy_source.name[len(source.name):])
+
+            diagnostics["staged_source"] = _path_diagnostics(staged_source)
+            diagnostics["staged_source_parent"] = _path_diagnostics(staging_path)
+            diagnostics["staged_source_sidecars"] = copied_sidecars
+
+            try:
+                source_connection = sqlite3.connect(staged_source, timeout=60)
+            except Exception as exc:
+                raise _sqlite_capture_failure(
+                    stage="source_open", role="staged_source", failed_path=staged_source,
+                    source=source, destination=destination, diagnostics=diagnostics, error=exc,
+                ) from exc
+
+            try:
+                destination_connection = sqlite3.connect(destination, timeout=60)
+            except Exception as exc:
+                _close_sqlite_connections(diagnostics, source=source_connection)
+                raise _sqlite_capture_failure(
+                    stage="destination_open", role="destination", failed_path=destination,
+                    source=source, destination=destination, diagnostics=diagnostics, error=exc,
+                ) from exc
+
+            stage = "backup"
+            try:
+                source_connection.execute("PRAGMA busy_timeout=60000")
+                destination_connection.execute("PRAGMA journal_mode=DELETE")
+                source_connection.backup(destination_connection, pages=2048, sleep=0.05)
+                destination_connection.execute("PRAGMA journal_mode=DELETE")
+                stage = "quick_check"
+                try:
+                    check = destination_connection.execute("PRAGMA quick_check").fetchone()
+                    if not check or str(check[0]).lower() != "ok":
+                        raise RuntimeError(f"Sauvegarde SQLite incohérente pour {source.name}: {check}")
+                    validation = "quick_check"
+                except sqlite3.OperationalError as exc:
+                    # Plex databases may reference proprietary FTS tokenizers. The
+                    # Python SQLite library cannot load them; validate basic readability
+                    # without interpreting those virtual tables.
+                    if "unknown tokenizer" not in str(exc).lower():
+                        raise
+                    destination_connection.execute("SELECT schema_version FROM pragma_schema_version").fetchone()
+                    destination_connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                    validation = "schema-readable-tokenizer-unavailable"
+                destination_connection.commit()
+            except Exception as exc:
+                raise _sqlite_capture_failure(
+                    stage=stage, role="destination", failed_path=destination,
+                    source=source, destination=destination, diagnostics=diagnostics, error=exc,
+                ) from exc
+            finally:
+                _close_sqlite_connections(
+                    diagnostics,
+                    destination=destination_connection,
+                    source=source_connection,
+                )
+            if diagnostics.get("connection_cleanup_errors"):
+                error = RuntimeError("SQLite connection cleanup failed")
+                raise _sqlite_capture_failure(
+                    stage="connection_cleanup", role="destination", failed_path=destination,
+                    source=source, destination=destination, diagnostics=diagnostics, error=error,
+                ) from error
+    except PlexSQLiteCaptureError as exc:
+        staging_lifecycle["cleanup_completed"] = bool(staging_path) and not staging_path.exists()
+        exc.add_diagnostics("source_staging_lifecycle", staging_lifecycle)
         try:
-            check = destination_connection.execute("PRAGMA quick_check").fetchone()
-            if not check or str(check[0]).lower() != "ok":
-                raise RuntimeError(f"Sauvegarde SQLite incohérente pour {source.name}: {check}")
-            validation = "quick_check"
-        except sqlite3.OperationalError as exc:
-            # Plex databases may reference proprietary FTS tokenizers. The
-            # Python SQLite library cannot load them; validate basic readability
-            # without interpreting those virtual tables.
-            if "unknown tokenizer" not in str(exc).lower():
-                raise
-            destination_connection.execute("SELECT schema_version FROM pragma_schema_version").fetchone()
-            destination_connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
-            validation = "schema-readable-tokenizer-unavailable"
-        destination_connection.commit()
-    finally:
-        destination_connection.close()
-        source_connection.close()
+            destination.unlink(missing_ok=True)
+        except Exception as cleanup_exc:
+            exc.add_diagnostics("destination_cleanup_error", f"{type(cleanup_exc).__name__}: {cleanup_exc}")
+        raise
+    staging_lifecycle["cleanup_completed"] = bool(staging_path) and not staging_path.exists()
+    diagnostics["source_staging_lifecycle"] = staging_lifecycle
+
     destination.with_name(destination.name + "-wal").unlink(missing_ok=True)
     destination.with_name(destination.name + "-shm").unlink(missing_ok=True)
+    _refresh_sqlite_paths(diagnostics, source, destination)
     digest = hashlib.sha256()
     with destination.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -455,49 +765,112 @@ def _python_sqlite_hot_backup(source: Path, destination: Path) -> dict:
         "snapshot_size_bytes": destination.stat().st_size,
         "sha256": digest.hexdigest(),
         "engine": "python-sqlite3",
+        "engine_path": sys.executable,
         "validation": validation,
         "quick_check": "ok" if validation == "quick_check" else validation,
+        "diagnostics": _sanitize_diagnostics(diagnostics),
     }
 
 
 def _plex_sqlite_hot_backup(container_name: str, container_source: Path, host_source: Path, destination: Path) -> dict:
     """Use Plex SQLite inside the running container for backup and validation."""
-    plex_sqlite = "/usr/lib/plexmediaserver/Plex SQLite"
+    plex_sqlite = PLEX_SQLITE_EXECUTABLE
     token = uuid.uuid4().hex
     container_snapshot = f"/tmp/appbox-reference-{token}.db"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.unlink(missing_ok=True)
-
-    probe_code, _, _ = run(["docker", "exec", container_name, "test", "-x", plex_sqlite], timeout=15)
-    if probe_code != 0:
-        return _python_sqlite_hot_backup(host_source, destination)
-
+    diagnostics = _sqlite_diagnostics(host_source, destination, "plex-sqlite", plex_sqlite)
+    diagnostics.update({
+        "container_name": container_name,
+        "container_source_path": str(container_source),
+        "container_snapshot_path": container_snapshot,
+    })
     try:
-        backup_code, backup_out, backup_err = run([
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.unlink(missing_ok=True)
+    except Exception as exc:
+        raise _sqlite_capture_failure(
+            stage="destination_prepare", role="destination", failed_path=destination,
+            source=host_source, destination=destination, diagnostics=diagnostics, error=exc,
+        ) from exc
+
+    probe_args = ["docker", "exec", container_name, "test", "-x", plex_sqlite]
+    probe_code, _, _ = _run_sqlite_subprocess(probe_args, 15, diagnostics)
+    if probe_code != 0:
+        try:
+            result = _python_sqlite_hot_backup(host_source, destination)
+        except PlexSQLiteCaptureError as exc:
+            exc.add_diagnostics("engine_selection", {
+                "requested_engine": "plex-sqlite",
+                "selected_engine": "python-sqlite3",
+                "plex_probe": diagnostics["subprocesses"][-1],
+            })
+            raise
+        result.setdefault("diagnostics", {})["engine_selection"] = {
+            "requested_engine": "plex-sqlite",
+            "selected_engine": "python-sqlite3",
+            "plex_probe": diagnostics["subprocesses"][-1],
+        }
+        return result
+
+    failure = None
+    try:
+        backup_args = [
             "docker", "exec", container_name, plex_sqlite,
             str(container_source), ".timeout 60000", f".backup '{container_snapshot}'",
-        ], timeout=900)
+        ]
+        backup_code, backup_out, backup_err = _run_sqlite_subprocess(backup_args, 900, diagnostics)
         if backup_code != 0:
-            raise RuntimeError(f"Plex SQLite .backup a échoué pour {host_source.name}: {(backup_err or backup_out).strip()}")
-
-        check_code, check_out, check_err = run([
-            "docker", "exec", container_name, plex_sqlite,
-            container_snapshot, "PRAGMA quick_check;",
-        ], timeout=900)
-        checks = [line.strip().lower() for line in check_out.splitlines() if line.strip()]
-        if check_code != 0 or checks != ["ok"]:
-            raise RuntimeError(f"Plex SQLite quick_check a échoué pour {host_source.name}: {(check_err or check_out).strip()}")
-
-        copy_code, copy_out, copy_err = run([
-            "docker", "cp", f"{container_name}:{container_snapshot}", str(destination),
-        ], timeout=900)
-        if copy_code != 0 or not destination.exists():
-            raise RuntimeError(f"Impossible de récupérer le snapshot SQLite {host_source.name}: {(copy_err or copy_out).strip()}")
+            failure = (
+                "plex_backup_subprocess", "source", container_source,
+                RuntimeError(backup_err or backup_out or "Plex SQLite backup failed"),
+            )
+        else:
+            check_args = [
+                "docker", "exec", container_name, plex_sqlite,
+                container_snapshot, "PRAGMA quick_check;",
+            ]
+            check_code, check_out, check_err = _run_sqlite_subprocess(check_args, 900, diagnostics)
+            checks = [line.strip().lower() for line in check_out.splitlines() if line.strip()]
+            if check_code != 0 or checks != ["ok"]:
+                failure = (
+                    "plex_quick_check_subprocess", "container_snapshot", Path(container_snapshot),
+                    RuntimeError(check_err or check_out or "Plex SQLite quick_check failed"),
+                )
+            else:
+                copy_args = ["docker", "cp", f"{container_name}:{container_snapshot}", str(destination)]
+                copy_code, copy_out, copy_err = _run_sqlite_subprocess(copy_args, 900, diagnostics)
+                if copy_code != 0 or not destination.exists():
+                    failure = (
+                        "plex_snapshot_copy", "destination", destination,
+                        RuntimeError(copy_err or copy_out or "Docker copy did not create destination"),
+                    )
     finally:
-        run(["docker", "exec", container_name, "rm", "-f", container_snapshot, container_snapshot + "-wal", container_snapshot + "-shm"], timeout=30)
+        cleanup_args = [
+            "docker", "exec", container_name, "rm", "-f",
+            container_snapshot, container_snapshot + "-wal", container_snapshot + "-shm",
+        ]
+        cleanup_code, cleanup_out, cleanup_err = _run_sqlite_subprocess(cleanup_args, 30, diagnostics)
+        diagnostics["container_snapshot_cleanup"] = {
+            "attempted": True,
+            "success": cleanup_code == 0,
+            "return_code": cleanup_code,
+        }
+        if cleanup_code != 0:
+            cleanup_failure = RuntimeError(cleanup_err or cleanup_out or "Container snapshot cleanup failed")
+            if failure is None:
+                failure = ("plex_snapshot_cleanup", "container_snapshot", Path(container_snapshot), cleanup_failure)
+            else:
+                diagnostics["container_snapshot_cleanup"]["error"] = _sanitize_diagnostic_text(str(cleanup_failure))
+
+    if failure is not None:
+        stage, role, failed_path, error = failure
+        raise _sqlite_capture_failure(
+            stage=stage, role=role, failed_path=Path(failed_path),
+            source=host_source, destination=destination, diagnostics=diagnostics, error=error,
+        ) from error
 
     destination.with_name(destination.name + "-wal").unlink(missing_ok=True)
     destination.with_name(destination.name + "-shm").unlink(missing_ok=True)
+    _refresh_sqlite_paths(diagnostics, host_source, destination)
     digest = hashlib.sha256()
     with destination.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -511,6 +884,7 @@ def _plex_sqlite_hot_backup(container_name: str, container_source: Path, host_so
         "engine_path": plex_sqlite,
         "validation": "quick_check",
         "quick_check": "ok",
+        "diagnostics": _sanitize_diagnostics(diagnostics),
     }
 
 
@@ -547,11 +921,18 @@ def _prepare_plex_reference_overlay(config_path: Path, workdir: Path, container_
                 snapshots.append(_plex_sqlite_hot_backup(container_name, container_database, item, target_databases / item.name) if container_name else _python_sqlite_hot_backup(item, target_databases / item.name))
 
     engines = sorted({snapshot.get("engine", "unknown") for snapshot in snapshots})
+    engine_selection = {
+        "selected_engine": "plex-sqlite-with-python-fallback" if container_name else "python-sqlite3",
+        "reason": "container-engine-requested" if container_name else "source-container-frozen",
+        "plex_executable_candidate": PLEX_SQLITE_EXECUTABLE,
+        "container_exec_attempted": bool(container_name),
+    }
     return overlay, {
         "identity_attributes_removed": removed,
         "sqlite_snapshots": snapshots,
         "database_auxiliary_files": copied_auxiliary,
         "sqlite_strategy": "+".join(engines) if engines else "no-database",
+        "sqlite_engine_selection": engine_selection,
     }
 
 
@@ -840,9 +1221,23 @@ def _capture_plex_reference(config_path: Path, workdir: Path, container_name: st
         else:
             lifecycle["final_container_state"] = _docker_container_state(container_name)
 
+    capture_diagnostics = {
+        "container_lifecycle": lifecycle,
+        "capture_work_directory": _path_diagnostics(workdir),
+        "archive_staging_path": _path_diagnostics(archive),
+    }
+    if isinstance(capture_error, PlexSQLiteCaptureError):
+        for key, value in capture_diagnostics.items():
+            capture_error.add_diagnostics(key, value)
+
     if restoration_error is not None:
         capture_detail = f" Capture également échouée : {capture_error}" if capture_error else ""
-        raise RuntimeError(f"Restauration explicite du Plex source échouée : {restoration_error}.{capture_detail}") from restoration_error
+        message = f"Restauration explicite du Plex source échouée : {restoration_error}.{capture_detail}"
+        if isinstance(capture_error, PlexSQLiteCaptureError):
+            error = PlexSQLiteCaptureError(message, capture_error.diagnostics)
+            error.add_diagnostics("restoration_error", f"{type(restoration_error).__name__}: {restoration_error}")
+            raise error from restoration_error
+        raise RuntimeError(message) from restoration_error
     if capture_error is not None:
         raise capture_error
     return {
@@ -852,6 +1247,33 @@ def _capture_plex_reference(config_path: Path, workdir: Path, container_name: st
         "sanitization": sanitization,
         **lifecycle,
     }
+
+
+def _reference_build_temp_parent(config: dict) -> Path:
+    configured = str(config.get("reference_build_temp_dir") or "").strip()
+    parent = Path(configured) if configured else (
+        Path("/var/lib/marinos-appbox-agent/reference-builds")
+        if os.name == "posix" else Path(tempfile.gettempdir())
+    )
+    stage = "temporary_parent_prepare"
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        stage = "temporary_parent_write_preflight"
+        with tempfile.NamedTemporaryFile(prefix=".appbox-write-probe-", dir=parent):
+            pass
+    except Exception as exc:
+        diagnostics = {
+            "stage": stage,
+            "temporary_directory_parent": _path_diagnostics(parent),
+            "free_disk": _disk_space_diagnostics(parent),
+            "cwd": os.path.abspath(os.getcwd()),
+        }
+        raise PlexSQLiteCaptureError(
+            f"Plex reference temporary parent is not writable: {os.path.abspath(str(parent))}; "
+            f"original={_sanitize_diagnostic_text(str(exc))}",
+            diagnostics,
+        ) from exc
+    return parent
 
 
 def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
@@ -868,8 +1290,32 @@ def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
 
     # The allowlisted archive is streamed from a frozen /config tree plus a small
     # sanitized overlay. Metadata and Media are Plex application data, not RDAD media.
-    with tempfile.TemporaryDirectory(prefix="appbox-reference-build-") as tempdir:
-        workdir = Path(tempdir)
+    temp_parent = _reference_build_temp_parent(config)
+    try:
+        workdir = Path(tempfile.mkdtemp(prefix="appbox-reference-build-", dir=temp_parent))
+    except Exception as exc:
+        raise PlexSQLiteCaptureError(
+            f"Plex reference temporary directory creation failed under {temp_parent}; "
+            f"original={_sanitize_diagnostic_text(str(exc))}",
+            {
+                "stage": "temporary_directory_create",
+                "temporary_directory_parent": _path_diagnostics(temp_parent),
+                "free_disk": _disk_space_diagnostics(temp_parent),
+                "cwd": os.path.abspath(os.getcwd()),
+            },
+        ) from exc
+    temp_lifecycle = {
+        "path": os.path.abspath(str(workdir)),
+        "parent": _path_diagnostics(temp_parent),
+        "created": workdir.is_dir(),
+        "exists_during_capture": workdir.is_dir(),
+        "cleanup_attempted": False,
+        "cleanup_completed": False,
+    }
+    result = None
+    failure = None
+    cleanup_error = None
+    try:
         container_name = str((discovery.get("instance") or {}).get("container_name") or payload.get("source_instance") or "")
         if not container_name:
             raise RuntimeError("Nom du conteneur Plex source introuvable.")
@@ -921,7 +1367,7 @@ def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
                 )
             },
         }
-        return {
+        result = {
             "archive_path": stored.get("archive_path"),
             "sha256": checksum,
             "compressed_size_bytes": archive.stat().st_size,
@@ -940,6 +1386,35 @@ def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
             "manifest": manifest,
             **capture,
         }
+    except Exception as exc:
+        failure = exc
+    finally:
+        temp_lifecycle["cleanup_attempted"] = True
+        try:
+            shutil.rmtree(workdir)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            cleanup_error = exc
+        temp_lifecycle["exists_after_cleanup"] = workdir.exists()
+        temp_lifecycle["cleanup_completed"] = not workdir.exists()
+
+    if failure is not None:
+        if isinstance(failure, PlexSQLiteCaptureError):
+            failure.add_diagnostics("temporary_directory_lifecycle", temp_lifecycle)
+            if cleanup_error is not None:
+                failure.add_diagnostics("temporary_directory_cleanup_error", f"{type(cleanup_error).__name__}: {cleanup_error}")
+        raise failure.with_traceback(failure.__traceback__)
+    if cleanup_error is not None:
+        raise PlexSQLiteCaptureError(
+            f"Plex reference temporary directory cleanup failed: {workdir}; "
+            f"original={_sanitize_diagnostic_text(str(cleanup_error))}",
+            {"temporary_directory_lifecycle": temp_lifecycle},
+        ) from cleanup_error
+    if result is None:
+        raise RuntimeError("La construction Plex n’a produit aucun résultat.")
+    result["temporary_directory_lifecycle"] = temp_lifecycle
+    return result
 
 
 def send_inventory(config):
@@ -1351,7 +1826,9 @@ def command_cycle(config):
                 result["inventory_warning"] = str(inventory_exc)
         payload = {"status": "success", "result": result}
     except Exception as exc:
-        payload = {"status": "failed", "error": str(exc), "result": {}}
+        diagnostics = getattr(exc, "diagnostics", None)
+        result = {"diagnostics": _sanitize_diagnostics(diagnostics)} if isinstance(diagnostics, dict) else {}
+        payload = {"status": "failed", "error": _sanitize_diagnostic_text(str(exc)), "result": result}
     api(
         config,
         "POST",
