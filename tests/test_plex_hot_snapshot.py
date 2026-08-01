@@ -189,6 +189,21 @@ class PlexSourceCaptureTests(unittest.TestCase):
         self.assertEqual(payload["capabilities"]["reference_builder_versions"]["plex"], "1.6.0-alpha.5-phase1")
         self.assertEqual(payload["capabilities"]["reference_archive_schemas"]["plex"], 1)
 
+    def test_plex_sqlite_snapshot_path_has_uuid_dependency(self):
+        source = self.db_dir / "com.plexapp.plugins.library.db"
+        destination = self.root / "snapshot" / source.name
+        fallback_result = {"name": source.name, "engine": "python-sqlite3"}
+        with patch.object(agent, "run", return_value=(1, "", "Plex SQLite unavailable")), \
+             patch.object(agent, "_python_sqlite_hot_backup", return_value=fallback_result) as fallback:
+            result = agent._plex_sqlite_hot_backup(
+                "plex-source",
+                Path("/config") / source.relative_to(self.config),
+                source,
+                destination,
+            )
+        self.assertEqual(result, fallback_result)
+        fallback.assert_called_once_with(source, destination)
+
     def test_initially_stopped_plex_remains_stopped(self):
         with patch.object(agent, "_docker_container_state", side_effect=["exited", "exited"]), \
              patch.object(agent, "_stop_plex_for_capture") as stop, \

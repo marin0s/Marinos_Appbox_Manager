@@ -12,6 +12,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.request
 import urllib.parse
