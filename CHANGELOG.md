@@ -9,6 +9,7 @@
 - Rapports de construction enrichis avec le cycle de vie du conteneur, les contenus réellement archivés, les tailles, les checksums et les validations SQLite.
 - Tests synthétiques sans accès à Docker couvrant le contenu de l’archive, l’assainissement, les états initialement actif ou arrêté et les erreurs de capture ou de restauration.
 - Harmonisation des versions de développement de l’agent et du builder Phase 1, contrôle `/identity` depuis l’hôte avec repli conteneur, et durcissement des chemins tar hors contrat.
+- Correction de l’import `uuid` manquant dans le chemin de snapshot SQLite Plex et alignement du footer, de `/health` et de l’agent embarqué sur la version de validation `1.6.0-alpha.5-dev`.
 
 ### Documentation et dépôt
 - Ajout des fondations du dépôt : `.gitignore`, guide de contribution, contexte agents, architecture, roadmap et templates GitHub.

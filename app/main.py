@@ -28,7 +28,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-VERSION = "1.6.0-alpha.4"
+PRODUCT_VERSION = "1.6.0-alpha.5"
+VERSION = f"{PRODUCT_VERSION}-dev"
 APP_DIR = Path(__file__).resolve().parent
 APPBOX_MODE = os.getenv("APPBOX_MODE", "mock").lower()
 HOSTNAME = os.getenv("APPBOX_HOSTNAME", "artemis").lower()
