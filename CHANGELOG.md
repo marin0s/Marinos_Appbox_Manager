@@ -2,6 +2,14 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Images de référence Plex — Phase 1
+- Définition d’un contrat d’archive Plex fondé sur une liste d’inclusion explicite, avec conservation de `Metadata`, `Media`, bases canoniques, plugins, scanners, profils, ressources et préférences assainies.
+- Capture cohérente après arrêt propre d’un Plex initialement actif, restauration garantie dans un bloc `finally` et contrôle de l’état Docker ainsi que de l’endpoint `/identity` après redémarrage.
+- Exclusion des caches, logs, diagnostics, sessions, transcodes, fichiers temporaires, PID, WAL/SHM et sauvegardes de bases datées ou dupliquées.
+- Rapports de construction enrichis avec le cycle de vie du conteneur, les contenus réellement archivés, les tailles, les checksums et les validations SQLite.
+- Tests synthétiques sans accès à Docker couvrant le contenu de l’archive, l’assainissement, les états initialement actif ou arrêté et les erreurs de capture ou de restauration.
+- Harmonisation des versions de développement de l’agent et du builder Phase 1, contrôle `/identity` depuis l’hôte avec repli conteneur, et durcissement des chemins tar hors contrat.
+
 ### Documentation et dépôt
 - Ajout des fondations du dépôt : `.gitignore`, guide de contribution, contexte agents, architecture, roadmap et templates GitHub.
 - Confirmation de `1.6.0-alpha.4` comme version de production et de `1.6.0-alpha.5` comme prochaine livraison.

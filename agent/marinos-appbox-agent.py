@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import hashlib
+import ipaddress
 import re
 import secrets
 import os
@@ -17,9 +18,33 @@ import urllib.parse
 import http.client
 import sqlite3
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-VERSION = "1.6.0-alpha.4"
+PRODUCT_VERSION = "1.6.0-alpha.5"
+VERSION = f"{PRODUCT_VERSION}-dev"
+
+PLEX_REFERENCE_ARCHIVE_SCHEMA = 1
+PLEX_REFERENCE_BUILDER_VERSION = f"{PRODUCT_VERSION}-phase1"
+PLEX_REFERENCE_ROOT = Path("Library/Application Support/Plex Media Server")
+PLEX_REFERENCE_INCLUDED_DIRECTORIES = (
+    "Metadata",
+    "Media",
+    "Plug-in Support/Databases",
+    "Plug-ins",
+    "Scanners",
+    "Profiles",
+    "Resources",
+)
+PLEX_REFERENCE_EXCLUDED_DIRECTORIES = {
+    "cache", "logs", "crash reports", "codecs", "diagnostics",
+    "sessions", "session", "transcode", "transcodes", "tmp", "temp",
+}
+PLEX_REFERENCE_IDENTITY_ATTRIBUTES = (
+    "MachineIdentifier", "ProcessedMachineIdentifier",
+    "AnonymousMachineIdentifier", "PlexOnlineToken",
+    "PlexOnlineUsername", "PlexOnlineMail", "PlexOnlineHome",
+    "CertificateUUID", "PubSubServer", "PubSubServerRegion",
+)
 CONFIG = Path("/etc/marinos-appbox-agent/agent.json")
 
 
@@ -419,10 +444,15 @@ def _python_sqlite_hot_backup(source: Path, destination: Path) -> dict:
         source_connection.close()
     destination.with_name(destination.name + "-wal").unlink(missing_ok=True)
     destination.with_name(destination.name + "-shm").unlink(missing_ok=True)
+    digest = hashlib.sha256()
+    with destination.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
     return {
         "name": source.name,
         "source_size_bytes": source.stat().st_size,
         "snapshot_size_bytes": destination.stat().st_size,
+        "sha256": digest.hexdigest(),
         "engine": "python-sqlite3",
         "validation": validation,
         "quick_check": "ok" if validation == "quick_check" else validation,
@@ -467,10 +497,15 @@ def _plex_sqlite_hot_backup(container_name: str, container_source: Path, host_so
 
     destination.with_name(destination.name + "-wal").unlink(missing_ok=True)
     destination.with_name(destination.name + "-shm").unlink(missing_ok=True)
+    digest = hashlib.sha256()
+    with destination.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
     return {
         "name": host_source.name,
         "source_size_bytes": host_source.stat().st_size,
         "snapshot_size_bytes": destination.stat().st_size,
+        "sha256": digest.hexdigest(),
         "engine": "plex-sqlite",
         "engine_path": plex_sqlite,
         "validation": "quick_check",
@@ -479,7 +514,7 @@ def _plex_sqlite_hot_backup(container_name: str, container_source: Path, host_so
 
 
 def _prepare_plex_reference_overlay(config_path: Path, workdir: Path, container_name: str = "") -> tuple[Path, dict]:
-    plex_rel = Path("Library/Application Support/Plex Media Server")
+    plex_rel = PLEX_REFERENCE_ROOT
     source_plex = config_path / plex_rel
     overlay = workdir / "overlay"
     overlay.mkdir(parents=True, exist_ok=True)
@@ -491,12 +526,7 @@ def _prepare_plex_reference_overlay(config_path: Path, workdir: Path, container_
         target_preferences.parent.mkdir(parents=True, exist_ok=True)
         tree = ET.parse(source_preferences)
         root = tree.getroot()
-        for key in (
-            "MachineIdentifier", "ProcessedMachineIdentifier",
-            "AnonymousMachineIdentifier", "PlexOnlineToken",
-            "PlexOnlineUsername", "PlexOnlineMail", "PlexOnlineHome",
-            "CertificateUUID", "PubSubServer", "PubSubServerRegion",
-        ):
+        for key in PLEX_REFERENCE_IDENTITY_ATTRIBUTES:
             if key in root.attrib:
                 removed.append(key)
             root.attrib.pop(key, None)
@@ -511,12 +541,9 @@ def _prepare_plex_reference_overlay(config_path: Path, workdir: Path, container_
         for item in sorted(source_databases.iterdir(), key=lambda value: value.name):
             if item.is_symlink():
                 continue
-            if item.is_file() and item.name.endswith(".db"):
+            if item.is_file() and _is_canonical_plex_database(item.name):
                 container_database = Path("/config") / item.relative_to(config_path)
                 snapshots.append(_plex_sqlite_hot_backup(container_name, container_database, item, target_databases / item.name) if container_name else _python_sqlite_hot_backup(item, target_databases / item.name))
-            elif item.is_file() and not item.name.endswith((".db-wal", ".db-shm")):
-                shutil.copy2(item, target_databases / item.name)
-                copied_auxiliary.append(item.name)
 
     engines = sorted({snapshot.get("engine", "unknown") for snapshot in snapshots})
     return overlay, {
@@ -527,43 +554,303 @@ def _prepare_plex_reference_overlay(config_path: Path, workdir: Path, container_
     }
 
 
-def _archive_plex_reference(config_path: Path, overlay: Path, archive: Path) -> dict:
-    plex_prefix = "Library/Application Support/Plex Media Server"
-    excluded_prefixes = {
-        f"{plex_prefix}/Cache",
-        f"{plex_prefix}/Logs",
-        f"{plex_prefix}/Crash Reports",
-        f"{plex_prefix}/Codecs",
-        f"{plex_prefix}/Metadata",
-        f"{plex_prefix}/Media",
-        f"{plex_prefix}/Plug-in Support/Databases",
-    }
-    replaced_paths = {
-        f"{plex_prefix}/Preferences.xml",
-    }
-    excluded_count = 0
+def _is_canonical_plex_database(name: str) -> bool:
+    lower = name.lower()
+    if not lower.endswith(".db"):
+        return False
+    stem = lower[:-3]
+    return not (
+        "backup" in stem
+        or stem.endswith(("-copy", "_copy"))
+        or re.search(r"(?:^|[-_.])20\d{2}[-_.]\d{2}[-_.]\d{2}(?:[-_.]\d{4,6})?$", stem)
+    )
+
+
+def _plex_archive_member_excluded(relative: Path) -> bool:
+    parts = [part.lower() for part in relative.parts]
+    if any(part in PLEX_REFERENCE_EXCLUDED_DIRECTORIES for part in parts[:-1]):
+        return True
+    name = relative.name.lower()
+    if name in PLEX_REFERENCE_EXCLUDED_DIRECTORIES:
+        return True
+    if name.endswith((".pid", ".db-wal", ".db-shm", ".tmp", ".temp", ".partial", ".part", ".swp", ".lock", "~")):
+        return True
+    if name.startswith((".transcode", "transcode-", "transcode_")):
+        return True
+    return False
+
+
+def _tar_tree(tar: tarfile.TarFile, source: Path, arcname: str) -> None:
+    if not source.exists():
+        return
 
     def archive_filter(info: tarfile.TarInfo):
-        nonlocal excluded_count
-        normalized = info.name.strip("./")
-        if normalized in replaced_paths:
-            excluded_count += 1
-            return None
-        if any(normalized == prefix or normalized.startswith(prefix + "/") for prefix in excluded_prefixes):
-            excluded_count += 1
-            return None
-        basename = Path(normalized).name
-        if basename.endswith(".pid") or basename.startswith(".transcode"):
-            excluded_count += 1
+        relative = _plex_archive_relative(info.name)
+        if relative is None or info.issym() or info.islnk() or _plex_archive_member_excluded(relative):
             return None
         return info
 
+    tar.add(source, arcname=arcname, recursive=True, filter=archive_filter)
+
+
+def _plex_archive_relative(member_name: str) -> Path | None:
+    member = PurePosixPath(member_name)
+    root = PurePosixPath(PLEX_REFERENCE_ROOT.as_posix())
+    if member.is_absolute() or ".." in member.parts:
+        return None
+    try:
+        relative = member.relative_to(root)
+    except ValueError:
+        return None
+    return Path(*relative.parts)
+
+
+def _inspect_plex_reference_archive(archive: Path) -> dict:
+    root = PLEX_REFERENCE_ROOT.as_posix()
+    required = {
+        "metadata": f"{root}/Metadata",
+        "media": f"{root}/Media",
+        "databases": f"{root}/Plug-in Support/Databases",
+    }
+    metrics = {key: {"size_bytes": 0, "file_count": 0} for key in required}
+    included_paths = []
+    excluded_violations = []
+    uncompressed_size = 0
+    database_names = []
+    with tarfile.open(archive, "r:gz") as tar:
+        members = tar.getmembers()
+        names = {member.name.rstrip("/") for member in members}
+        for label in PLEX_REFERENCE_INCLUDED_DIRECTORIES:
+            prefix = f"{root}/{label}"
+            if prefix in names or any(name.startswith(prefix + "/") for name in names):
+                included_paths.append(prefix + "/")
+        preferences = f"{root}/Preferences.xml"
+        if preferences in names:
+            included_paths.append(preferences)
+        for member in members:
+            normalized = member.name.rstrip("/")
+            relative = _plex_archive_relative(normalized)
+            if relative is None:
+                excluded_violations.append(normalized)
+                continue
+            if relative.parts and _plex_archive_member_excluded(relative):
+                excluded_violations.append(normalized)
+            if member.isfile():
+                uncompressed_size += member.size
+                for key, prefix in required.items():
+                    if normalized.startswith(prefix + "/"):
+                        metrics[key]["size_bytes"] += member.size
+                        metrics[key]["file_count"] += 1
+                if normalized.startswith(required["databases"] + "/"):
+                    database_names.append(Path(normalized).name)
+    if excluded_violations:
+        raise RuntimeError("L’archive Plex contient des chemins exclus : " + ", ".join(excluded_violations[:10]))
+    missing = [prefix for prefix in required.values() if not any(path.startswith(prefix) for path in included_paths)]
+    if preferences not in included_paths:
+        missing.append(preferences)
+    if missing:
+        raise RuntimeError("L’archive Plex ne contient pas les chemins requis : " + ", ".join(missing))
+    return {
+        "included_paths": included_paths,
+        "excluded_paths": [
+            f"{root}/{name}/" for name in ("Cache", "Logs", "Crash Reports", "Codecs", "Diagnostics", "Sessions", "Transcode")
+        ] + ["*.pid", "*.db-wal", "*.db-shm", "*.tmp", "*.temp", "*.partial", "*.part", "*.swp", "*.lock"],
+        "uncompressed_size_bytes": uncompressed_size,
+        "metadata": metrics["metadata"],
+        "media": metrics["media"],
+        "databases": {**metrics["databases"], "names": sorted(database_names)},
+    }
+
+
+def _archive_plex_reference(config_path: Path, overlay: Path, archive: Path) -> dict:
+    source_plex = config_path / PLEX_REFERENCE_ROOT
+    overlay_plex = overlay / PLEX_REFERENCE_ROOT
     with tarfile.open(archive, "w:gz", compresslevel=3, dereference=False) as tar:
-        for item in sorted(config_path.iterdir(), key=lambda value: value.name):
-            tar.add(item, arcname=item.name, recursive=True, filter=archive_filter)
-        for item in sorted(overlay.iterdir(), key=lambda value: value.name):
-            tar.add(item, arcname=item.name, recursive=True)
-    return {"excluded_archive_entries": excluded_count}
+        for directory in PLEX_REFERENCE_INCLUDED_DIRECTORIES:
+            source = overlay_plex / directory if directory == "Plug-in Support/Databases" else source_plex / directory
+            _tar_tree(tar, source, f"{PLEX_REFERENCE_ROOT.as_posix()}/{directory}")
+        preferences = overlay_plex / "Preferences.xml"
+        if preferences.exists():
+            tar.add(preferences, arcname=f"{PLEX_REFERENCE_ROOT.as_posix()}/Preferences.xml", recursive=False)
+    return _inspect_plex_reference_archive(archive)
+
+
+def _docker_container_state(container_name: str) -> str:
+    code, output, error = run(
+        ["docker", "inspect", "-f", "{{.State.Status}}", container_name],
+        timeout=30,
+    )
+    if code != 0:
+        raise RuntimeError(f"État Docker de {container_name} indisponible : {(error or output).strip()}")
+    state = output.strip().lower()
+    if not state:
+        raise RuntimeError(f"Docker n’a retourné aucun état pour {container_name}.")
+    return state
+
+
+def _wait_for_container_state(container_name: str, expected: str, timeout: int = 90) -> str:
+    deadline = time.monotonic() + timeout
+    last_state = "unknown"
+    while time.monotonic() < deadline:
+        last_state = _docker_container_state(container_name)
+        if last_state == expected:
+            return last_state
+        time.sleep(1)
+    raise RuntimeError(
+        f"Docker n’a pas confirmé l’état {expected} pour {container_name} "
+        f"dans le délai imparti (dernier état : {last_state})."
+    )
+
+
+def _plex_identity_host_urls(container_name: str) -> list[str]:
+    code, output, error = run([
+        "docker", "inspect", "-f",
+        "{{.HostConfig.NetworkMode}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+        container_name,
+    ], timeout=30)
+    if code != 0:
+        raise RuntimeError(f"Réseau Docker de {container_name} indisponible : {(error or output).strip()}")
+    network_mode, _, raw_addresses = output.strip().partition("|")
+    if network_mode.strip().lower() == "host":
+        return ["http://127.0.0.1:32400/identity"]
+    urls = []
+    for value in raw_addresses.split():
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        host = f"[{address}]" if address.version == 6 else str(address)
+        urls.append(f"http://{host}:32400/identity")
+    return urls
+
+
+def _parse_plex_identity(output: str, method: str) -> dict:
+    if "<MediaContainer" not in output:
+        raise RuntimeError("réponse sans MediaContainer")
+    start = output.find("<?xml") if "<?xml" in output else output.find("<MediaContainer")
+    identity = ET.fromstring(output[start:]).attrib
+    return {
+        "reachable": True,
+        "version": identity.get("version"),
+        "claimed": identity.get("claimed") == "1",
+        "method": method,
+    }
+
+
+def _wait_for_plex_identity(container_name: str, timeout: int = 120) -> dict:
+    deadline = time.monotonic() + timeout
+    last_error = "endpoint indisponible"
+    try:
+        host_urls = _plex_identity_host_urls(container_name)
+    except Exception as exc:
+        host_urls = []
+        last_error = str(exc)
+    while time.monotonic() < deadline:
+        for url in host_urls:
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": f"marinos-appbox-agent/{VERSION}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    output = response.read().decode("utf-8", errors="replace")
+                return _parse_plex_identity(output, f"host-http:{url}")
+            except Exception as exc:
+                last_error = f"{url}: {exc}"
+        code, output, error = run([
+            "docker", "exec", container_name, "sh", "-c",
+            "curl -fsS http://127.0.0.1:32400/identity || wget -qO- http://127.0.0.1:32400/identity",
+        ], timeout=15)
+        if code == 0:
+            try:
+                return _parse_plex_identity(output, "container-curl-or-wget")
+            except Exception as exc:
+                last_error = f"conteneur : {exc}"
+        else:
+            tool_error = (error or output or "curl/wget indisponible").strip()
+            last_error = f"{last_error}; conteneur : {tool_error}"
+        time.sleep(2)
+    raise RuntimeError(f"Plex /identity ne répond pas après le redémarrage : {last_error}")
+
+
+def _stop_plex_for_capture(container_name: str) -> dict:
+    code, output, error = run(["docker", "stop", "--time", "60", container_name], timeout=90)
+    if code != 0:
+        raise RuntimeError(f"Arrêt propre de Plex impossible : {(error or output).strip()}")
+    final_state = _wait_for_container_state(container_name, "exited")
+    return {"success": True, "output": output.strip(), "confirmed_state": final_state}
+
+
+def _restart_plex_after_capture(container_name: str) -> tuple[dict, dict]:
+    code, output, error = run(["docker", "start", container_name], timeout=90)
+    if code != 0:
+        raise RuntimeError(f"Redémarrage de Plex impossible : {(error or output).strip()}")
+    final_state = _wait_for_container_state(container_name, "running")
+    identity = _wait_for_plex_identity(container_name)
+    return ({"success": True, "output": output.strip(), "confirmed_state": final_state}, identity)
+
+
+def _capture_plex_reference(config_path: Path, workdir: Path, container_name: str) -> dict:
+    archive = workdir / "reference.tar.gz"
+    initial_state = _docker_container_state(container_name)
+    if initial_state not in {"running", "exited", "created"}:
+        raise RuntimeError(f"État initial Plex non pris en charge pour une capture sûre : {initial_state}.")
+    lifecycle = {
+        "initial_container_state": initial_state,
+        "builder_stopped_container": False,
+        "stop_result": {"attempted": False, "success": None},
+        "restart_attempted": False,
+        "restart_result": {"attempted": False, "success": None},
+        "final_container_state": initial_state,
+        "plex_identity_health_after_restart": {"checked": False, "reachable": None},
+    }
+    capture_error = None
+    restoration_error = None
+    sanitization = {}
+    archive_report = {}
+    checksum = ""
+    try:
+        if initial_state == "running":
+            lifecycle["stop_result"] = {"attempted": True, **_stop_plex_for_capture(container_name)}
+            lifecycle["builder_stopped_container"] = True
+        overlay, sanitization = _prepare_plex_reference_overlay(config_path, workdir)
+        archive_report = _archive_plex_reference(config_path, overlay, archive)
+        digest = hashlib.sha256()
+        with archive.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        checksum = digest.hexdigest()
+    except Exception as exc:
+        capture_error = exc
+    finally:
+        if initial_state == "running":
+            lifecycle["restart_attempted"] = True
+            lifecycle["restart_result"] = {"attempted": True, "success": False}
+            lifecycle["plex_identity_health_after_restart"] = {"checked": True, "reachable": False}
+            try:
+                restart_result, identity_health = _restart_plex_after_capture(container_name)
+                lifecycle["restart_result"] = {"attempted": True, **restart_result}
+                lifecycle["plex_identity_health_after_restart"] = {"checked": True, **identity_health}
+            except Exception as exc:
+                restoration_error = exc
+            try:
+                lifecycle["final_container_state"] = _docker_container_state(container_name)
+            except Exception as exc:
+                if restoration_error is None:
+                    restoration_error = exc
+                lifecycle["final_container_state"] = "unknown"
+        else:
+            lifecycle["final_container_state"] = _docker_container_state(container_name)
+
+    if restoration_error is not None:
+        capture_detail = f" Capture également échouée : {capture_error}" if capture_error else ""
+        raise RuntimeError(f"Restauration explicite du Plex source échouée : {restoration_error}.{capture_detail}") from restoration_error
+    if capture_error is not None:
+        raise capture_error
+    return {
+        "archive": archive,
+        "sha256": checksum,
+        "archive_report": archive_report,
+        "sanitization": sanitization,
+        **lifecycle,
+    }
 
 
 def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
@@ -578,22 +865,18 @@ def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
     if not upload_path.startswith("/api/agent/v1/"):
         raise RuntimeError("Destination de téléversement invalide.")
 
-    # The archive is built directly from the source plus a small sanitized overlay.
-    # This avoids duplicating a 35+ GiB Plex configuration on the source node.
+    # The allowlisted archive is streamed from a frozen /config tree plus a small
+    # sanitized overlay. Metadata and Media are Plex application data, not RDAD media.
     with tempfile.TemporaryDirectory(prefix="appbox-reference-build-") as tempdir:
         workdir = Path(tempdir)
         container_name = str((discovery.get("instance") or {}).get("container_name") or payload.get("source_instance") or "")
         if not container_name:
             raise RuntimeError("Nom du conteneur Plex source introuvable.")
-        overlay, sanitization = _prepare_plex_reference_overlay(config_path, workdir, container_name)
-        archive = workdir / "reference.tar.gz"
-        archive_report = _archive_plex_reference(config_path, overlay, archive)
-
-        digest = hashlib.sha256()
-        with archive.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        checksum = digest.hexdigest()
+        capture = _capture_plex_reference(config_path, workdir, container_name)
+        archive = capture.pop("archive")
+        checksum = capture.pop("sha256")
+        archive_report = capture.pop("archive_report")
+        sanitization = capture.pop("sanitization")
 
         target = urllib.parse.urlsplit(config["control_plane_url"].rstrip("/") + upload_path)
         connection_cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
@@ -617,20 +900,44 @@ def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
         finally:
             connection.close()
 
-        sanitization.update(archive_report)
         sanitization.update({
-            "excluded_directories": ["Cache", "Logs", "Crash Reports", "Codecs"],
             "source_unchanged": True,
-            "plex_was_stopped": False,
             "full_staging_copy_created": False,
         })
+        manifest = {
+            "archive_schema_version": PLEX_REFERENCE_ARCHIVE_SCHEMA,
+            "builder_version": PLEX_REFERENCE_BUILDER_VERSION,
+            "sha256": checksum,
+            "compressed_size_bytes": archive.stat().st_size,
+            **archive_report,
+            "database_validation_results": sanitization.get("sqlite_snapshots", []),
+            "removed_identity_attributes": sanitization.get("identity_attributes_removed", []),
+            "source_lifecycle": {
+                key: capture[key] for key in (
+                    "initial_container_state", "builder_stopped_container", "stop_result",
+                    "restart_attempted", "restart_result", "final_container_state",
+                    "plex_identity_health_after_restart",
+                )
+            },
+        }
         return {
             "archive_path": stored.get("archive_path"),
             "sha256": checksum,
             "compressed_size_bytes": archive.stat().st_size,
-            "uncompressed_size_bytes": int((preflight.get("estimated_payload_bytes") or 0)),
+            "uncompressed_size_bytes": archive_report["uncompressed_size_bytes"],
+            "included_paths": archive_report["included_paths"],
+            "excluded_paths": archive_report["excluded_paths"],
+            "metadata": archive_report["metadata"],
+            "media": archive_report["media"],
+            "databases": archive_report["databases"],
+            "database_validation_results": sanitization.get("sqlite_snapshots", []),
+            "removed_identity_attributes": sanitization.get("identity_attributes_removed", []),
+            "builder_version": PLEX_REFERENCE_BUILDER_VERSION,
+            "archive_schema_version": PLEX_REFERENCE_ARCHIVE_SCHEMA,
             "sanitization": sanitization,
             "discovery": discovery,
+            "manifest": manifest,
+            **capture,
         }
 
 
@@ -677,6 +984,8 @@ def heartbeat(config):
             "reference_builder_foundation": True,
             "reference_discovery": True,
             "reference_builders": ["plex"],
+            "reference_builder_versions": {"plex": PLEX_REFERENCE_BUILDER_VERSION},
+            "reference_archive_schemas": {"plex": PLEX_REFERENCE_ARCHIVE_SCHEMA},
             "reference_builder_intrusive_actions": False,
             "deployment_executor": True,
         },
