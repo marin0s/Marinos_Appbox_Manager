@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,7 +71,7 @@ class ReferenceDiscoveryTests(unittest.TestCase):
             "preflight": {"compatibility_score": 5, "can_build": True, "warnings": [], "blockers": []},
         }
         main.finalize_reference_discovery_command(command, "success", result, None)
-        with sqlite3.connect(main.DB_FILE) as con:
+        with closing(sqlite3.connect(main.DB_FILE)) as con, con:
             build = con.execute(
                 "SELECT status,current_stage,progress,source_report_json FROM reference_builds WHERE build_id=?",
                 (self.build_id,),
@@ -87,7 +88,7 @@ class ReferenceDiscoveryTests(unittest.TestCase):
     def test_failed_result_is_persisted(self):
         job_id, command = self._seed_command_and_job()
         main.finalize_reference_discovery_command(command, "failed", {}, "Instance Plex introuvable")
-        with sqlite3.connect(main.DB_FILE) as con:
+        with closing(sqlite3.connect(main.DB_FILE)) as con, con:
             build = con.execute("SELECT status,error_text FROM reference_builds WHERE build_id=?", (self.build_id,)).fetchone()
             job = con.execute("SELECT status,detail FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         self.assertEqual(build, ("discovery_failed", "Instance Plex introuvable"))

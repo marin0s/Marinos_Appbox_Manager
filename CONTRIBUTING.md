@@ -27,6 +27,10 @@ python3 -m compileall app agent
 python3 -m pytest -q
 ```
 
+Pour les tests locaux : installer `pytest` et `httpx` en plus de `requirements.txt` dans un venv. Sous Windows, utiliser `.venv\Scripts\python.exe`. Les tests utilisent des données synthétiques et simulent Docker/HTTP ; ils n’autorisent aucun test sur un nœud réel.
+
+Après toute modification de l’agent ou de `reference_contract.py`, reconstruire `python scripts/package_agent.py`, puis vérifier `python scripts/package_agent.py --check`. Les bytecodes et caches de test ne sont pas suivis. Ne pas commiter le venv ni les archives de données de test.
+
 Pour une modification du Control Plane :
 
 ```bash

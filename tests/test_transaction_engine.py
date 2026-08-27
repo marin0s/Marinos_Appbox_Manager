@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,7 +44,7 @@ class TransactionEngineTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.old_db = main.DB_FILE
         main.DB_FILE = Path(self.tmp.name) / "test.db"
-        with sqlite3.connect(main.DB_FILE) as con:
+        with closing(sqlite3.connect(main.DB_FILE)) as con, con:
             con.executescript(SCHEMA)
             con.execute("INSERT INTO appboxes(client_id) VALUES ('test141')")
             con.execute("INSERT INTO jobs VALUES ('job1','test141','artemis','delete','running',50,'',datetime('now'),datetime('now'),NULL,NULL)")
@@ -65,7 +66,7 @@ class TransactionEngineTests(unittest.TestCase):
 
     def test_test141_regression_detaches_history_and_deletes_inventory(self):
         self.assertTrue(main.finalize_appbox_deletion('test141', 'job1'))
-        with sqlite3.connect(main.DB_FILE) as con:
+        with closing(sqlite3.connect(main.DB_FILE)) as con, con:
             self.assertEqual(con.execute("SELECT COUNT(*) FROM appboxes").fetchone()[0], 0)
             self.assertIsNone(con.execute("SELECT client_id FROM jobs WHERE job_id='job1'").fetchone()[0])
             self.assertIsNone(con.execute("SELECT client_id FROM placement_decisions WHERE decision_id=1").fetchone()[0])
@@ -80,13 +81,13 @@ class TransactionEngineTests(unittest.TestCase):
         self.assertFalse(main.finalize_appbox_deletion('test141', 'job1'))
 
     def test_foreign_key_failure_rolls_back_everything(self):
-        with sqlite3.connect(main.DB_FILE) as con:
+        with closing(sqlite3.connect(main.DB_FILE)) as con, con:
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("CREATE TABLE unknown_child(client_id TEXT NOT NULL REFERENCES appboxes(client_id))")
             con.execute("INSERT INTO unknown_child VALUES ('test141')")
         with self.assertRaises(sqlite3.IntegrityError):
             main.finalize_appbox_deletion('test141', 'job1')
-        with sqlite3.connect(main.DB_FILE) as con:
+        with closing(sqlite3.connect(main.DB_FILE)) as con, con:
             self.assertEqual(con.execute("SELECT COUNT(*) FROM appboxes WHERE client_id='test141'").fetchone()[0], 1)
             self.assertEqual(con.execute("SELECT client_id FROM jobs WHERE job_id='job1'").fetchone()[0], 'test141')
             self.assertEqual(con.execute("SELECT client_id FROM placement_decisions WHERE decision_id=1").fetchone()[0], 'test141')
