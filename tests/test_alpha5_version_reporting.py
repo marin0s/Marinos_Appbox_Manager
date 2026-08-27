@@ -2,6 +2,8 @@ import importlib.util
 import unittest
 import zipfile
 import tempfile
+import subprocess
+import sys
 from pathlib import Path
 from scripts.package_agent import FILES, package_bytes
 
@@ -52,6 +54,15 @@ class Alpha5VersionReportingTests(unittest.TestCase):
             self.assertEqual(package_bytes(source), package_bytes(AGENT_PATH.parent))
             with zipfile.ZipFile(AGENT_ARCHIVE_PATH) as archive:
                 self.assertEqual(sorted(archive.namelist()), sorted(FILES))
+
+    def test_packaged_agent_imports_without_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with zipfile.ZipFile(AGENT_ARCHIVE_PATH) as archive:
+                archive.extractall(directory)
+            result=subprocess.run([sys.executable,'-I','-c',
+                'import sys,runpy; sys.path.insert(0,sys.argv[1]); runpy.run_path(sys.argv[1]+"/marinos-appbox-agent.py",run_name="package-test")',directory],
+                capture_output=True,text=True,cwd=directory)
+            self.assertEqual(result.returncode,0,result.stderr)
 
 
 if __name__ == "__main__":

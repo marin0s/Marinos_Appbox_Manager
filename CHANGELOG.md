@@ -15,6 +15,15 @@
 ### Corrections de finalisation
 - `/health` déclare les captures intrusives (arrêt temporaire Plex).
 - Packaging agent déterministe : contenu LF, ordre, permissions et horodatages fixes ; vérification complète de l’artefact et des checkouts LF/CRLF.
+- Contrat d’archive partagé entre Control Plane et agent ; refus des chemins absolus, traversées, liens, fichiers spéciaux, doublons et gzip tronqués. Module livré dans le ZIP et installé avec l’agent.
+- Upload en streaming, SHA-256 recalculé, validation avant publication atomique, verrou d’upload et refus de remplacement par un contenu différent. Les résultats répétés ne republient pas une version.
+- Conservation du manifeste détaillé et de la version réelle du builder, au lieu de la constante alpha.3.
+- Téléchargement vers un cache adressé par SHA-256 ; restauration dans un staging isolé avec validation SQLite, refus d’écraser une AppBox existante et mise à jour de `node_reference_cache` uniquement après confirmation distante.
+- Contrôle de l’état Docker et de l’identité HTTP Plex avant succès ; distinction restauration/attente du claim/association confirmée, sans marquer un échec comme running.
+- Claim distant : délais explicites, nettoyage des fichiers et recréation sans jeton même après échec, vérification de l’identité et de l’association après nettoyage, erreurs expurgées.
+- Assainissement des attributs de claim et secrets dans Preferences.xml tout en conservant les préférences applicatives ; tests de corruption SQLite et de nettoyage.
+- Nommage Plex corrigé pour les identifiants `ab-…`, refus des nouveaux identifiants à séparateurs dupliqués ; reconnaissance des anciens noms conservée dans l’inventaire.
+- Tests portables : fermeture explicite des connexions SQLite, lecture UTF-8 et synchronisation de répertoire conditionnelle sous Windows. Retrait du suivi des anciens bytecodes Python.
 
 ### Documentation et dépôt
 - Ajout des fondations du dépôt : `.gitignore`, guide de contribution, contexte agents, architecture, roadmap et templates GitHub.

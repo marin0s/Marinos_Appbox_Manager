@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,7 +26,7 @@ class ReferenceBuildFoundationTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_schema_and_plex_builder_are_installed(self):
-        with sqlite3.connect(main.DB_FILE) as con:
+        with closing(sqlite3.connect(main.DB_FILE)) as con, con:
             tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertIn("reference_builds", tables)
             self.assertIn("reference_build_logs", tables)
@@ -33,7 +34,7 @@ class ReferenceBuildFoundationTests(unittest.TestCase):
             builder = con.execute(
                 "SELECT application,intrusive_actions_enabled FROM reference_builder_registry WHERE builder_key='plex'"
             ).fetchone()
-            self.assertEqual(builder, ("plex", 0))
+            self.assertEqual(builder, ("plex", 1))
             self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_create_draft_is_non_intrusive_and_logged(self):
@@ -42,7 +43,7 @@ class ReferenceBuildFoundationTests(unittest.TestCase):
             display_name="Plex Production OURANOS",
             description="Référence officielle",
         )
-        with sqlite3.connect(main.DB_FILE) as con:
+        with closing(sqlite3.connect(main.DB_FILE)) as con, con:
             build = con.execute(
                 "SELECT status,current_stage,progress,job_id FROM reference_builds WHERE build_id=?",
                 (build_id,),

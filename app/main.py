@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
+from agent.reference_contract import validate_archive, sha256_file, sanitize_preferences, redact_result
 
 os.environ.setdefault("PSUTIL_PROCFS_PATH", os.getenv("APPBOX_PROCFS", "/host/proc"))
 import psutil
@@ -27,6 +28,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 
 PRODUCT_VERSION = "1.6.0-alpha.5"
 VERSION = f"{PRODUCT_VERSION}-dev"
@@ -1167,15 +1169,16 @@ def init_database() -> None:
             INSERT INTO reference_builder_registry(
                 builder_key,application,display_name,builder_version,enabled,
                 intrusive_actions_enabled,supported_manifest_schema,description,updated_at
-            ) VALUES('plex','plex','Plex Reference Builder','1.0',1,0,1,?,?)
+            ) VALUES('plex','plex','Plex Reference Builder','1.6.0-alpha.5-phase1',1,1,1,?,?)
             ON CONFLICT(builder_key) DO UPDATE SET
                 display_name=excluded.display_name,
                 builder_version=excluded.builder_version,
+                intrusive_actions_enabled=excluded.intrusive_actions_enabled,
                 enabled=excluded.enabled,
                 description=excluded.description,
                 updated_at=excluded.updated_at
         """, (
-            "Fondation du builder Plex. Analyse et capture distante activées dans les phases suivantes.",
+            "Capture Plex avec arrêt temporaire, restauration de la source et validation SQLite privée.",
             stamp,
         ))
 
@@ -1850,6 +1853,7 @@ def appbox_id_for_resource(name: str, labels: dict[str, Any] | None = None) -> s
         expected = {
             client_id,
             f"plex-appb-{short_id}",
+            f"plex-appb-{plex_short_id(client_id)}",
             f"tautulli-{client_id}",
             f"jellyfin-{client_id}",
         }
@@ -2634,6 +2638,10 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
     build_id = str(payload.get("build_id") or "")
     if not build_id:
         return
+    with db() as con:
+        existing = con.execute("SELECT status FROM reference_builds WHERE build_id=?", (build_id,)).fetchone()
+    if existing and existing["status"] == "published":
+        return
     stamp = now_iso()
     if status != "success":
         detail = error or "Échec de la capture Plex."
@@ -2645,15 +2653,20 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
         build = con.execute("SELECT * FROM reference_builds WHERE build_id=?", (build_id,)).fetchone()
     if not build:
         return
-    archive_path = Path(str(result.get("archive_path") or ""))
+    if build["status"] == "published":
+        return  # repeated result delivery must not republish
+    archive_path = _reference_build_storage(build_id) / "reference.tar.gz"
     checksum = str(result.get("sha256") or "").lower()
-    if not archive_path.exists() or not checksum:
-        detail = "Archive de référence absente après téléversement."
-        with db_lock, db() as con:
-            con.execute("UPDATE reference_builds SET status='build_failed',error_text=?,completed_at=?,updated_at=? WHERE build_id=?", (detail, stamp, stamp, build_id))
+    try:
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum) or sha256_file(archive_path) != checksum:
+            raise RuntimeError("Checksum de publication invalide.")
+        validated = validate_archive(archive_path, plex=True)
+    except Exception:
+        finalize_reference_build_command(command, "failed", {}, "Archive de référence invalide après téléversement.")
         return
+    result = {**result, "uncompressed_size_bytes": validated["uncompressed_size_bytes"]}
     image_id = slugify_identifier(f"plex-{build['display_name']}")
-    version_label = datetime.now().strftime("%Y.%m.%d-%H%M%S")
+    version_label = datetime.now().strftime("%Y.%m.%d-%H%M%S") + "-" + build_id[-8:]
     version_id = slugify_identifier(f"{image_id}-{version_label}")
     snapshot_id = slugify_identifier(f"{version_id}-snapshot")
     source_dir = _reference_build_storage(build_id) / "source"
@@ -2664,12 +2677,17 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
     discovery = json.loads(build["source_report_json"] or "{}")
     preflight = json.loads(build["preflight_report_json"] or "{}")
     manifest = {
+        **(result.get("manifest") or {}),
+        "validated_archive": validated,
         "schema_version": 1, "build_id": build_id, "image_id": image_id, "version_id": version_id,
         "application": "plex", "archive_format": "tar.gz", "archive_sha256": checksum,
         "archive_size_bytes": archive_path.stat().st_size, "created_at": stamp,
         "source_node_id": build["source_node_id"], "source_instance": build["source_instance"],
     }
     with db_lock, db() as con:
+        current = con.execute("SELECT status FROM reference_builds WHERE build_id=?", (build_id,)).fetchone()
+        if current and current["status"] == "published":
+            return
         con.execute("""INSERT INTO reference_images(image_id,name,media_type,description,status,current_version_id,created_at,updated_at,source_node_id)
                        VALUES(?,?, 'plex',?,'published',?,?,?,?)
                        ON CONFLICT(image_id) DO UPDATE SET name=excluded.name,description=excluded.description,status='published',current_version_id=excluded.current_version_id,updated_at=excluded.updated_at,source_node_id=excluded.source_node_id""",
@@ -2679,7 +2697,7 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
                     (snapshot_id, f"{build['display_name']} {version_label}", version_label, str(source_dir), checksum, int(result.get("uncompressed_size_bytes") or 0), json.dumps(["Library/Application Support/Plex Media Server"], ensure_ascii=False), "Generated automatically by Reference Builder", stamp, stamp))
         con.execute("""INSERT INTO reference_image_versions(version_id,image_id,version,snapshot_id,application_version,checksum,size_bytes,catalog_items,state,created_at,published_at,notes,archive_path,archive_format,manifest_json,source_report_json,sanitization_report_json,builder_version,compressed_size_bytes,metadata_size_bytes,compatibility_json)
                        VALUES(?,?,?,?,?,?,?,?, 'published',?,?,?,?, 'tar.gz',?,?,?,?,?,?,?)""",
-                    (version_id,image_id,version_label,snapshot_id,str((discovery.get('instance') or {}).get('plex_version') or ''),checksum,int(result.get('uncompressed_size_bytes') or 0),len(discovery.get('libraries') or []),stamp,stamp,'Generated automatically from reference build',str(archive_path),json.dumps(manifest,ensure_ascii=False),json.dumps(discovery,ensure_ascii=False),json.dumps(result.get('sanitization') or {},ensure_ascii=False),'1.6.0-alpha.3',archive_path.stat().st_size,int((discovery.get('sizes') or {}).get('metadata') or 0),json.dumps(preflight,ensure_ascii=False)))
+                    (version_id,image_id,version_label,snapshot_id,str((discovery.get('instance') or {}).get('plex_version') or ''),checksum,int(result.get('uncompressed_size_bytes') or 0),len(discovery.get('libraries') or []),stamp,stamp,'Generated automatically from reference build',str(archive_path),json.dumps(manifest,ensure_ascii=False),json.dumps(discovery,ensure_ascii=False),json.dumps(result.get('sanitization') or {},ensure_ascii=False),str(result.get('builder_version') or 'unknown'),archive_path.stat().st_size,int((discovery.get('sizes') or {}).get('metadata') or 0),json.dumps(preflight,ensure_ascii=False)))
         con.execute("UPDATE reference_builds SET image_id=?,version_id=?,status='published',current_stage='published',progress=100,result_json=?,error_text=NULL,completed_at=?,updated_at=? WHERE build_id=?",
                     (image_id,version_id,json.dumps({**result,'manifest':manifest},ensure_ascii=False),stamp,stamp,build_id))
         con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'published','success',?,?,?)",
@@ -2739,7 +2757,7 @@ def parse_deployment_image(value: str, media_type: str) -> tuple[str | None, str
 
 def reference_deployment_archive(version_id: str) -> tuple[Path, str]:
     reference = get_reference_version(version_id)
-    if not reference or not reference.get("source_available"):
+    if not reference or not reference.get("source_available") or reference.get("state") != "published":
         raise HTTPException(404, "Image de déploiement indisponible.")
     stored_archive = Path(str(reference.get("archive_path") or ""))
     if stored_archive.is_file():
@@ -2775,15 +2793,7 @@ def sanitize_plex_clone(config_dir: Path) -> None:
     preferences = config_dir / "Library" / "Application Support" / "Plex Media Server" / "Preferences.xml"
     if preferences.exists():
         try:
-            tree = ET.parse(preferences)
-            root = tree.getroot()
-            for key in (
-                "MachineIdentifier", "ProcessedMachineIdentifier", "AnonymousMachineIdentifier",
-                "PlexOnlineToken", "PlexOnlineUsername", "PlexOnlineMail", "PlexOnlineHome",
-                "CertificateUUID", "PubSubServer", "PubSubServerRegion",
-            ):
-                root.attrib.pop(key, None)
-            tree.write(preferences, encoding="utf-8", xml_declaration=True)
+            sanitize_preferences(preferences)
         except Exception as exc:
             raise RuntimeError(f"Impossible de personnaliser Preferences.xml : {exc}") from exc
     for relative in (
@@ -2840,6 +2850,10 @@ def reserve_port(candidates: range, reserved: set[int]) -> int:
     raise RuntimeError("Aucun port libre dans la plage configurée.")
 
 
+def plex_short_id(client_id: str) -> str:
+    return client_id.removeprefix("ab").lstrip("-") or client_id
+
+
 def compose_for(
     client_id: str,
     media_type: str,
@@ -2850,8 +2864,10 @@ def compose_for(
     target_node: str | None = None,
 ) -> str:
     safe_id = client_id.lower()
+    if not CLIENT_RE.fullmatch(safe_id) or "--" in safe_id or safe_id.endswith("-"):
+        raise ValueError("Identifiant AppBox invalide pour un nouveau Compose.")
     compose_node = target_node or HOSTNAME
-    short_id = safe_id.removeprefix("ab")
+    short_id = plex_short_id(safe_id)
     mount_lines = compose_mount_lines(mounts or [])
     if mount_lines:
         mount_lines = "\n" + mount_lines
@@ -3522,10 +3538,15 @@ def queued_jobs(limit: int = 50) -> list[dict[str, Any]]:
     return [job_dict(row) for row in rows]
 
 
-def wait_agent_command(command_id: str, timeout: int = 300) -> tuple[bool, dict[str, Any], str]:
+def wait_agent_command(command_id: str, timeout: int = 300, job_id: str | None = None) -> tuple[bool, dict[str, Any], str]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with db() as con:
+            if job_id:
+                job = con.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+                if not job or job["status"] != "running":
+                    return False, {}, "Workflow interrompu ; résultat tardif non appliqué."
+                con.execute("UPDATE jobs SET updated_at=? WHERE job_id=?", (now_iso(), job_id))
             row = con.execute(
                 "SELECT status,result_json,error_text FROM agent_commands WHERE command_id=?",
                 (command_id,),
@@ -3594,6 +3615,16 @@ def finalize_appbox_deletion(client_id: str, job_id: str, purge: bool = False) -
     return True
 
 
+def set_reference_distribution(node_id, version_id, status, cache=None):
+    cache = cache or {}
+    with db_lock, db() as con:
+        con.execute("""INSERT INTO node_reference_cache(node_id,version_id,local_path,checksum,status,size_bytes,last_checked_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(node_id,version_id) DO UPDATE SET
+            local_path=excluded.local_path,checksum=excluded.checksum,status=excluded.status,
+            size_bytes=excluded.size_bytes,last_checked_at=excluded.last_checked_at,updated_at=excluded.updated_at""",
+            (node_id, version_id, cache.get("local_path"), cache.get("checksum"), status, cache.get("size_bytes", 0), now_iso(), now_iso()))
+
+
 def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
     job_id, client_id, action = job["job_id"], job["client_id"], job["action"]
     job_options = json.loads(job.get("options_json") or "{}")
@@ -3631,7 +3662,7 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
     env_content = deployment_env_for(item) if action in {"deploy", "recreate"} else ""
     manifest = build_deployment_manifest(item, control_plane_compose, env_content) if action in {"deploy", "recreate"} else None
     reference_archive = None
-    if action in {"deploy", "recreate"} and item.get("reference_version_id"):
+    if action == "deploy" and item.get("reference_version_id"):
         archive, archive_checksum = reference_deployment_archive(item["reference_version_id"])
         reference_archive = {
             "version_id": item["reference_version_id"],
@@ -3651,6 +3682,8 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
         "deletion_mode": deletion_mode,
         "reference_archive": reference_archive,
     }
+    if reference_archive:
+        set_reference_distribution(node_id, item["reference_version_id"], "transferring")
     command_id = queue_agent_command(node_id, "appbox_action", payload)
     docker_step = {
         "deploy": "docker_deploy", "start": "docker_start", "restart": "docker_restart", "recreate": "docker_recreate",
@@ -3667,8 +3700,18 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
     elif action == "start":
         update_step(job_id, "validate_compose", "success", "Compose et conteneurs existants validés par l’agent distant.", 100, executor=f"agent-{node_id}")
     update_step(job_id, docker_step, "running", f"Commande {command_id[:8]} envoyée à {node_id}.", 20, executor=f"agent-{node_id}")
-    ok, result, error = wait_agent_command(command_id, timeout=360)
+    ok, result, error = wait_agent_command(command_id, timeout=7200 if reference_archive else 900, job_id=job_id)
     detail = result.get("output") or error or "Commande distante terminée."
+    if ok and reference_archive and not result.get("health_verified"):
+        ok, detail = False, "Agent sans confirmation de santé ; mettre à jour le package agent."
+    if reference_archive:
+        cache = result.get("reference_cache") or {}
+        if ok and (cache.get("status") != "ready" or cache.get("checksum") != reference_archive["sha256"] or cache.get("version_id") != item["reference_version_id"]):
+            ok, detail = False, "Distribution non confirmée par le nœud."
+        set_reference_distribution(node_id, item["reference_version_id"], "ready" if ok else "failed", cache if ok else {})
+        with db_lock, db() as con:
+            con.execute("UPDATE snapshot_deployments SET status=?,detail=? WHERE client_id=?", ("restored_unclaimed" if ok else "failed", detail, client_id))
+            con.execute("UPDATE control_plane_deployments SET status=?,current_step=?,detail=?,updated_at=? WHERE client_id=?", ("awaiting_claim" if ok else "failed", "health" if ok else "restore", detail, now_iso(), client_id))
     if not ok:
         update_step(job_id, docker_step, "failed", detail, 100, executor=f"agent-{node_id}", resources=result)
         fail_workflow(job_id, docker_step, detail)
@@ -4721,7 +4764,7 @@ def agent_poll_commands(node_id: str, request: Request):
 @app.post("/api/agent/v1/{node_id}/commands/{command_id}/result")
 async def agent_command_result(node_id: str, command_id: str, request: Request):
     authenticate_agent(request, node_id)
-    payload = await request.json()
+    payload = redact_result(await request.json())
     status = payload.get("status")
     if status not in {"success", "failed"}:
         raise HTTPException(400, "Statut de commande invalide.")
@@ -4744,7 +4787,7 @@ async def agent_command_result(node_id: str, command_id: str, request: Request):
             command_id,
         ))
     finalize_reference_discovery_command(command, status, payload.get("result") or {}, payload.get("error"))
-    finalize_reference_build_command(command, status, payload.get("result") or {}, payload.get("error"))
+    await run_in_threadpool(finalize_reference_build_command, command, status, payload.get("result") or {}, payload.get("error"))
     record_event(
         None,
         "agent_command_completed",
@@ -5266,8 +5309,15 @@ async def upload_reference_build_archive(node_id: str, build_id: str, request: R
         raise HTTPException(400, "Checksum SHA256 absent ou invalide.")
     storage = _reference_build_storage(build_id)
     final = storage / "reference.tar.gz"
-    temporary = storage / "reference.tar.gz.uploading"
-    temporary.unlink(missing_ok=True)
+    if build["status"] == "published":
+        raise HTTPException(409, "Version publiée immuable.")
+    temporary = storage / ("reference." + uuid.uuid4().hex + ".uploading")
+    upload_lock = storage / ".upload.lock"
+    try:
+        with upload_lock.open("x"):
+            pass
+    except FileExistsError:
+        raise HTTPException(409, "Téléversement déjà actif ; vérifier le verrou après une interruption.") from None
     digest = hashlib.sha256(); size = 0
     try:
         with temporary.open("wb") as handle:
@@ -5277,12 +5327,21 @@ async def upload_reference_build_archive(node_id: str, build_id: str, request: R
                 handle.write(chunk); digest.update(chunk); size += len(chunk)
                 if size > 500 * 1024 * 1024 * 1024:
                     raise HTTPException(413, "Archive de référence trop volumineuse.")
+            handle.flush()
+            os.fsync(handle.fileno())
         actual = digest.hexdigest()
         if not secrets.compare_digest(actual, expected):
             raise HTTPException(409, "Checksum de l’archive téléversée invalide.")
+        try:
+            await run_in_threadpool(validate_archive, temporary, plex=True)
+        except (RuntimeError, tarfile.TarError, EOFError, OSError, ET.ParseError, sqlite3.Error) as exc:
+            raise HTTPException(409, "Archive Plex invalide ou tronquée.") from exc
+        if final.exists() and await run_in_threadpool(sha256_file, final) != actual:
+            raise HTTPException(409, "Archive déjà stockée différente ; créer un nouveau build.")
         os.replace(temporary, final)
     finally:
         temporary.unlink(missing_ok=True)
+        upload_lock.unlink(missing_ok=True)
     return JSONResponse({"status":"stored","archive_path":str(final),"sha256":expected,"compressed_size_bytes":size})
 
 @app.get("/api/agent/v1/{node_id}/reference-deployments/{version_id}/archive")
@@ -5678,7 +5737,7 @@ def create_appbox(
     placement_mode = placement_mode.strip().lower()
     target_node_id = target_node_id.strip() or HOSTNAME
 
-    if not CLIENT_RE.fullmatch(client_id):
+    if not CLIENT_RE.fullmatch(client_id) or "--" in client_id or client_id.endswith("-"):
         raise HTTPException(400, "Identifiant invalide.")
     if media_type not in {"plex", "jellyfin"}:
         raise HTTPException(400, "Type d’AppBox invalide.")
@@ -5793,7 +5852,7 @@ def create_appbox(
             shutil.rmtree(appbox_dir, ignore_errors=True)
             raise
 
-        containers = [f"plex-appb-{client_id.removeprefix('ab')}" if media_type == "plex" else f"jellyfin-{client_id}"]
+        containers = [f"plex-appb-{plex_short_id(client_id)}" if media_type == "plex" else f"jellyfin-{client_id}"]
         if with_tautulli:
             containers.append(f"tautulli-{client_id}")
         stamp = now_iso()
@@ -6005,7 +6064,7 @@ def claim_appbox(client_id: str, claim_code: str = Form(...)):
         "containers": item.get("containers") or [],
     })
     try:
-        ok, result, error = wait_agent_command(command_id, timeout=360)
+        ok, result, error = wait_agent_command(command_id, timeout=900)
     finally:
         # Le claim est un secret à usage court : le supprimer de la file persistante.
         with db_lock, db() as con:
@@ -6013,10 +6072,16 @@ def claim_appbox(client_id: str, claim_code: str = Form(...)):
                 "UPDATE agent_commands SET payload_json=? WHERE command_id=?",
                 (json.dumps({"client_id": client_id, "action": "claim", "claim_code": "[REDACTED]"}), command_id),
             )
-    detail = result.get("output") or error or "Claim Plex terminé."
+    detail = redact_result(result.get("output") or error or "Claim Plex terminé.")
+    ok = ok and bool(result.get("claimed"))
     record_event(client_id, "claim", detail, "success" if ok else "error")
-    if not ok:
+    if not ok or not result.get("claimed"):
+        with db_lock, db() as con:
+            con.execute("UPDATE control_plane_deployments SET status='failed',current_step='claim',detail=?,updated_at=? WHERE client_id=?", (detail,now_iso(),client_id))
         raise HTTPException(500, detail)
+    with db_lock, db() as con:
+        con.execute("UPDATE control_plane_deployments SET status='success',current_step='claimed',progress=100,detail=?,updated_at=? WHERE client_id=?", (detail,now_iso(),client_id))
+        con.execute("UPDATE snapshot_deployments SET status='success',detail=? WHERE client_id=?", (detail,client_id))
     return RedirectResponse(f"/appboxes/{client_id}", status_code=303)
 
 

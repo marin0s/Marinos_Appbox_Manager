@@ -16,6 +16,16 @@ spec.loader.exec_module(agent)
 
 
 class PlexSourceCaptureTests(unittest.TestCase):
+    def test_claim_and_credentials_removed_but_template_preferences_preserved(self):
+        self.preferences.write_text('<Preferences MachineIdentifier="source" PLEX_CLAIM="claim-abcdefgh" ClaimToken="secret" CustomAuthToken="token" Language="fr" AcceptedEULA="1"/>',encoding='utf-8')
+        archive,_,_=self._build_archive()
+        with tarfile.open(archive,'r:gz') as tar:
+            prefs=tar.extractfile(agent.PLEX_REFERENCE_ROOT.as_posix()+'/Preferences.xml').read()
+        for secret in (b'source',b'claim-',b'secret',b'token'):
+            self.assertNotIn(secret,prefs)
+        self.assertIn(b'Language="fr"',prefs)
+        self.assertIn(b'AcceptedEULA="1"',prefs)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -112,7 +122,7 @@ class PlexSourceCaptureTests(unittest.TestCase):
             self.assertNotIn(attribute, preferences)
         self.assertIn('FriendlyName="Reference"', preferences)
         self.assertIn('Language="fr"', preferences)
-        self.assertEqual(set(sanitization["identity_attributes_removed"]), set(agent.PLEX_REFERENCE_IDENTITY_ATTRIBUTES))
+        self.assertTrue(set(sanitization["identity_attributes_removed"]) <= set(agent.PLEX_REFERENCE_IDENTITY_ATTRIBUTES))
         self.assertEqual(report["metadata"], {"size_bytes": len(b"poster"), "file_count": 1})
         self.assertEqual(report["media"], {"size_bytes": len(b"media-index"), "file_count": 1})
         self.assertEqual(report["databases"]["file_count"], 2)

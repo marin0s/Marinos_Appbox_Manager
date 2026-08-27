@@ -18,6 +18,16 @@ spec.loader.exec_module(agent)
 
 
 class PlexSQLiteDiagnosticsTests(unittest.TestCase):
+    def test_corrupt_database_fails_with_cleanup_and_no_source_mutation(self):
+        self.source.write_bytes(b'not sqlite')
+        destination=self.root/'output/library.db'
+        with self.assertRaises(agent.PlexSQLiteCaptureError) as error:
+            agent._python_sqlite_hot_backup(self.source,destination)
+        self.assertEqual(error.exception.diagnostics['failure']['stage'],'backup')
+        self.assertEqual(self.source.read_bytes(),b'not sqlite')
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(destination.parent.glob('sqlite-source-*')),[])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

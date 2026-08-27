@@ -4,7 +4,7 @@ import io
 from pathlib import Path
 import zipfile
 
-FILES = ("install-agent.sh", "marinos-appbox-agent.py", "marinos-appbox-agent.service")
+FILES = ("install-agent.sh", "marinos-appbox-agent.py", "marinos-appbox-agent.service", "reference_contract.py")
 
 
 def package_bytes(source: Path) -> bytes:
@@ -17,7 +17,7 @@ def package_bytes(source: Path) -> bytes:
                 raise ValueError(f"Unsupported bare CR in {name}")
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
-            info.external_attr = (0o100644 if name.endswith(".service") else 0o100755) << 16
+            info.external_attr = (0o100755 if name in ("install-agent.sh", "marinos-appbox-agent.py") else 0o100644) << 16
             archive.writestr(info, data)
     return output.getvalue()
 

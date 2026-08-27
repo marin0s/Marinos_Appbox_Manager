@@ -22,6 +22,10 @@ import http.client
 import sqlite3
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
+try:
+    from agent.reference_contract import IDENTITY_ATTRIBUTES, sanitize_preferences, validate_archive, extract_archive, sha256_file
+except ModuleNotFoundError:
+    from reference_contract import IDENTITY_ATTRIBUTES, sanitize_preferences, validate_archive, extract_archive, sha256_file
 
 PRODUCT_VERSION = "1.6.0-alpha.5"
 VERSION = f"{PRODUCT_VERSION}-dev"
@@ -42,12 +46,7 @@ PLEX_REFERENCE_EXCLUDED_DIRECTORIES = {
     "cache", "logs", "crash reports", "codecs", "diagnostics",
     "sessions", "session", "transcode", "transcodes", "tmp", "temp",
 }
-PLEX_REFERENCE_IDENTITY_ATTRIBUTES = (
-    "MachineIdentifier", "ProcessedMachineIdentifier",
-    "AnonymousMachineIdentifier", "PlexOnlineToken",
-    "PlexOnlineUsername", "PlexOnlineMail", "PlexOnlineHome",
-    "CertificateUUID", "PubSubServer", "PubSubServerRegion",
-)
+PLEX_REFERENCE_IDENTITY_ATTRIBUTES = IDENTITY_ATTRIBUTES
 CONFIG = Path("/etc/marinos-appbox-agent/agent.json")
 PLEX_SQLITE_EXECUTABLE = "/usr/lib/plexmediaserver/Plex SQLite"
 SQLITE_DIAGNOSTIC_TEXT_LIMIT = 4096
@@ -67,11 +66,11 @@ def _sanitize_diagnostic_text(value: str) -> str:
     substitutions = (
         (r"(?i)(authorization\s*:\s*)\S+(?:\s+\S+)?", r"\1[REDACTED]"),
         (
-            r"(?i)([\"']?(?:PlexOnlineToken|PLEX_CLAIM|access_token|refresh_token|password|api[_-]?key|secret|token)[\"']?\s*[:=]\s*)[\"']?[^\"',;\s}&]+[\"']?",
+            r"(?i)([\"']?(?:X-Plex-Token|PlexOnlineToken|PLEX_CLAIM|access_token|refresh_token|password|api[_-]?key|secret|token)[\"']?\s*[:=]\s*)[\"']?[^\"',;\s}&]+[\"']?",
             r"\1[REDACTED]",
         ),
         (r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@", r"\1[REDACTED]@"),
-        (r"(?i)([?&](?:access_token|refresh_token|token|password|api[_-]?key|secret)=)[^&#\s]+", r"\1[REDACTED]"),
+        (r"(?i)([?&](?:X-Plex-Token|access_token|refresh_token|token|password|api[_-]?key|secret)=)[^&#\s]+", r"\1[REDACTED]"),
         (r"(?i)\bclaim-[A-Za-z0-9_-]{8,}\b", "claim-[REDACTED]"),
     )
     for pattern, replacement in substitutions:
@@ -83,7 +82,7 @@ def _sanitize_diagnostic_text(value: str) -> str:
 
 def _sanitize_diagnostics(value):
     if isinstance(value, dict):
-        return {str(key): _sanitize_diagnostics(item) for key, item in value.items()}
+        return {str(key): "[REDACTED]" if re.search(r"(?i)token|password|secret|authorization|claim_code", str(key)) else _sanitize_diagnostics(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_sanitize_diagnostics(item) for item in value]
     if isinstance(value, str):
@@ -749,6 +748,17 @@ def _python_sqlite_hot_backup(source: Path, destination: Path) -> dict:
         except Exception as cleanup_exc:
             exc.add_diagnostics("destination_cleanup_error", f"{type(cleanup_exc).__name__}: {cleanup_exc}")
         raise
+    except Exception as exc:
+        staging_lifecycle["cleanup_completed"] = bool(staging_path) and not staging_path.exists()
+        diagnostics["source_staging_lifecycle"] = staging_lifecycle
+        try:
+            destination.unlink(missing_ok=True)
+        except Exception as cleanup_exc:
+            diagnostics["destination_cleanup_error"] = str(cleanup_exc)
+        raise _sqlite_capture_failure(
+            stage="source_staging_cleanup", role="destination", failed_path=destination,
+            source=source, destination=destination, diagnostics=diagnostics, error=exc,
+        ) from exc
     staging_lifecycle["cleanup_completed"] = bool(staging_path) and not staging_path.exists()
     diagnostics["source_staging_lifecycle"] = staging_lifecycle
 
@@ -899,13 +909,10 @@ def _prepare_plex_reference_overlay(config_path: Path, workdir: Path, container_
     target_preferences = overlay / plex_rel / "Preferences.xml"
     if source_preferences.exists():
         target_preferences.parent.mkdir(parents=True, exist_ok=True)
-        tree = ET.parse(source_preferences)
-        root = tree.getroot()
-        for key in PLEX_REFERENCE_IDENTITY_ATTRIBUTES:
-            if key in root.attrib:
-                removed.append(key)
-            root.attrib.pop(key, None)
-        tree.write(target_preferences, encoding="utf-8", xml_declaration=True)
+        if source_preferences.is_symlink():
+            raise RuntimeError("Preferences.xml ne doit pas être un lien.")
+        shutil.copyfile(source_preferences, target_preferences)
+        removed = sanitize_preferences(target_preferences)
 
     source_databases = source_plex / "Plug-in Support/Databases"
     target_databases = overlay / plex_rel / "Plug-in Support/Databases"
@@ -955,7 +962,7 @@ def _plex_archive_member_excluded(relative: Path) -> bool:
     name = relative.name.lower()
     if name in PLEX_REFERENCE_EXCLUDED_DIRECTORIES:
         return True
-    if name.endswith((".pid", ".db-wal", ".db-shm", ".tmp", ".temp", ".partial", ".part", ".swp", ".lock", "~")):
+    if name in {".env", "credentials.json"} or name.endswith((".pem", ".key", ".p12", ".pfx", ".log", ".dmp", "-journal", ".pid", "-wal", "-shm", ".tmp", ".temp", ".partial", ".part", ".swp", ".lock", "~")):
         return True
     if name.startswith((".transcode", "transcode-", "transcode_")):
         return True
@@ -968,7 +975,7 @@ def _tar_tree(tar: tarfile.TarFile, source: Path, arcname: str) -> None:
 
     def archive_filter(info: tarfile.TarInfo):
         relative = _plex_archive_relative(info.name)
-        if relative is None or info.issym() or info.islnk() or _plex_archive_member_excluded(relative):
+        if relative is None or not (info.isfile() or info.isdir()) or _plex_archive_member_excluded(relative):
             return None
         return info
 
@@ -1054,6 +1061,7 @@ def _archive_plex_reference(config_path: Path, overlay: Path, archive: Path) -> 
         preferences = overlay_plex / "Preferences.xml"
         if preferences.exists():
             tar.add(preferences, arcname=f"{PLEX_REFERENCE_ROOT.as_posix()}/Preferences.xml", recursive=False)
+    validate_archive(archive, plex=True)
     return _inspect_plex_reference_archive(archive)
 
 
@@ -1115,6 +1123,8 @@ def _parse_plex_identity(output: str, method: str) -> dict:
         "reachable": True,
         "version": identity.get("version"),
         "claimed": identity.get("claimed") == "1",
+        "identity_generated": bool(identity.get("machineIdentifier")),
+        "identity_fingerprint": hashlib.sha256(identity.get("machineIdentifier", "").encode()).hexdigest(),
         "method": method,
     }
 
@@ -1498,26 +1508,19 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
             os.fsync(handle.fileno())
         temporary.chmod(mode)
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 
 def safe_extract_tar(archive: Path, destination: Path):
-    destination = destination.resolve()
-    with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            target = (destination / member.name).resolve()
-            if destination != target and destination not in target.parents:
-                raise RuntimeError("Archive de référence invalide : chemin hors destination.")
-            if member.issym() or member.islnk():
-                raise RuntimeError("Archive de référence invalide : liens symboliques refusés.")
-        tar.extractall(destination)
+    extract_archive(archive, destination)
 
 
 def install_reference_archive(config: dict, descriptor: dict, app_dir: Path):
@@ -1525,60 +1528,55 @@ def install_reference_archive(config: dict, descriptor: dict, app_dir: Path):
     expected = str(descriptor.get("sha256") or "").lower()
     target_name = str(descriptor.get("target_directory") or "")
     if target_name not in {"plex-config", "jellyfin-config"}:
-        raise RuntimeError("Destination de l’image de déploiement invalide.")
-    if not path or not expected:
-        raise RuntimeError("Descripteur d’image de déploiement incomplet.")
-    request = urllib.request.Request(
-        config["control_plane_url"].rstrip("/") + path,
-        headers={
-            "Authorization": f"Bearer {config['token']}",
-            "User-Agent": f"marinos-appbox-agent/{VERSION}",
-        },
-    )
-    app_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(prefix="appbox-reference-", suffix=".tar.gz", delete=False) as temp:
-        temp_path = Path(temp.name)
-        digest = hashlib.sha256()
-        with urllib.request.urlopen(request, timeout=3600) as response:
-            while True:
-                block = response.read(1024 * 1024)
-                if not block:
-                    break
-                temp.write(block)
-                digest.update(block)
+        raise RuntimeError("Destination de référence invalide.")
+    if not path.startswith("/api/agent/v1/") or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise RuntimeError("Descripteur de référence invalide.")
+    target = app_dir / target_name
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
+        raise RuntimeError("Restore refusé : configuration existante, sauvegarde opérateur requise.")
+    cache = Path(config.get("reference_cache_dir", "/var/lib/marinos-appbox-agent/reference-cache"))
+    cache.mkdir(parents=True, exist_ok=True)
+    cached = cache / (expected + ".tar.gz")
+    temporary = cache / (expected + "." + uuid.uuid4().hex + ".partial")
+    staging = app_dir / ("." + target_name + ".staging-" + uuid.uuid4().hex)
     try:
-        if digest.hexdigest().lower() != expected:
-            raise RuntimeError("Checksum de l’image de déploiement invalide.")
-        target = app_dir / target_name
-        staging = app_dir / f".{target_name}.staging"
-        shutil.rmtree(staging, ignore_errors=True)
+        if not cached.is_file() or sha256_file(cached) != expected:
+            request = urllib.request.Request(
+                config["control_plane_url"].rstrip("/") + path,
+                headers={"Authorization": f"Bearer {config['token']}", "User-Agent": f"marinos-appbox-agent/{VERSION}"},
+            )
+            digest = hashlib.sha256()
+            with temporary.open("xb") as output, urllib.request.urlopen(request, timeout=3600) as response:
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    output.write(block)
+                    digest.update(block)
+                output.flush()
+                os.fsync(output.fileno())
+            if not secrets.compare_digest(digest.hexdigest(), expected):
+                raise RuntimeError("Checksum de l’image de déploiement invalide.")
+            validate_archive(temporary, plex=target_name == "plex-config")
+            os.replace(temporary, cached)
+        validate_archive(cached, plex=target_name == "plex-config")
         staging.mkdir(parents=True)
-        safe_extract_tar(temp_path, staging)
-        if target.exists():
-            shutil.rmtree(target)
-        os.replace(staging, target)
+        safe_extract_tar(cached, staging)
         if target_name == "plex-config":
-            preferences = target / "Library" / "Application Support" / "Plex Media Server" / "Preferences.xml"
-            if preferences.exists():
-                tree = ET.parse(preferences)
-                root = tree.getroot()
-                for key in (
-                    "MachineIdentifier", "ProcessedMachineIdentifier", "AnonymousMachineIdentifier",
-                    "PlexOnlineToken", "PlexOnlineUsername", "PlexOnlineMail", "PlexOnlineHome",
-                    "CertificateUUID", "PubSubServer", "PubSubServerRegion",
-                ):
-                    root.attrib.pop(key, None)
-                tree.write(preferences, encoding="utf-8", xml_declaration=True)
-            for relative in (
-                "Library/Application Support/Plex Media Server/Cache",
-                "Library/Application Support/Plex Media Server/Logs",
-                "Library/Application Support/Plex Media Server/Crash Reports",
-            ):
-                shutil.rmtree(target / relative, ignore_errors=True)
-            for pid in target.rglob("*.pid"):
-                pid.unlink(missing_ok=True)
+            sanitize_preferences(staging / PLEX_REFERENCE_ROOT / "Preferences.xml")
+            # Reuse private-copy SQLite validation; never modify cached/source DBs.
+            with tempfile.TemporaryDirectory(prefix="validate-sqlite-", dir=app_dir) as checks:
+                for database in (staging / PLEX_REFERENCE_ROOT / "Plug-in Support/Databases").glob("*.db"):
+                    _python_sqlite_hot_backup(database, Path(checks) / database.name)
+        if target.exists():
+            target.rmdir()  # only an empty directory can be replaced
+        os.replace(staging, target)
+        return {"status": "ready", "version_id": descriptor.get("version_id"),
+                "checksum": expected, "local_path": str(cached), "size_bytes": cached.stat().st_size}
     finally:
-        temp_path.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def verify_manifest(payload: dict, client_id: str, compose: str, env_content: str) -> dict:
@@ -1603,6 +1601,81 @@ def verify_manifest(payload: dict, client_id: str, compose: str, env_content: st
     if not supplied_checksum or not secrets.compare_digest(supplied_checksum, calculated):
         raise RuntimeError("Checksum du manifeste invalide.")
     return manifest
+
+
+def _wait_plex_ready(container, *, claimed=False, timeout=120):
+    _wait_for_container_state(container, "running", timeout=timeout)
+    deadline = time.monotonic() + timeout
+    last = "HTTP Plex indisponible"
+    while time.monotonic() < deadline:
+        try:
+            identity = _wait_for_plex_identity(container, timeout=max(1, int(deadline - time.monotonic())))
+        except Exception:
+            raise RuntimeError("Timeout : HTTP Plex /identity indisponible.") from None
+        if not identity.get("identity_generated"):
+            last = "identité Plex non générée"
+        elif not claimed or identity.get("claimed"):
+            return identity
+        else:
+            last = "claim refusé ou non confirmé par Plex"
+        time.sleep(2)
+    raise RuntimeError(f"Timeout : {last}.")
+
+
+def claim_plex(app_dir, client_id, containers, claim_code):
+    if not re.fullmatch(r"claim-[A-Za-z0-9_-]{8,128}", claim_code):
+        raise RuntimeError("Code Claim Plex absent ou invalide.")
+    container = next((name for name in containers if name.startswith("plex-")), None)
+    if not container:
+        raise RuntimeError("Conteneur Plex absent de l'inventaire.")
+    compose_path, env_path = app_dir / "compose.yml", app_dir / ".env"
+    if not compose_path.is_file():
+        raise RuntimeError("Compose absent pour le Claim Plex.")
+    before = _wait_plex_ready(container)
+    if before.get("claimed"):
+        return {"state": "running", "claimed": True, "output": "Plex déjà associé ; aucun jeton injecté."}
+    original = compose_path.read_text(encoding="utf-8")
+    clean_compose = "\n".join(line for line in original.splitlines() if not re.match(r"\s*PLEX_CLAIM\s*:", line)) + "\n"
+    marker = '      VERSION: docker\n'
+    if marker not in clean_compose:
+        raise RuntimeError("Variable VERSION du service Plex introuvable.")
+    claim_compose = clean_compose.replace(marker, marker + '      PLEX_CLAIM: "${PLEX_CLAIM:-}"\n', 1)
+    original_env = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    clean_env = "\n".join(line for line in original_env.splitlines() if not re.match(r"\s*(?:export\s+)?PLEX_CLAIM\s*=", line)).rstrip() + "\n"
+    command = ["docker", "compose", "-p", client_id, "-f", str(compose_path), "up", "-d", "--force-recreate", "plex"]
+    failure = None
+    try:
+        atomic_write(compose_path, claim_compose)
+        atomic_write(env_path, clean_env + f"PLEX_CLAIM={claim_code}\n")
+        code, _, _ = run(command, timeout=300)
+        if code:
+            raise RuntimeError("Échec de recréation Plex pendant le claim.")
+        after = _wait_plex_ready(container, claimed=True)
+        if after["identity_fingerprint"] != before["identity_fingerprint"]:
+            raise RuntimeError("Identité Plex modifiée pendant le claim.")
+    except Exception as exc:
+        failure = exc
+    finally:
+        # Both disk and Docker environment must be cleaned on every exit path.
+        cleanup_failed = False
+        for path, content in ((compose_path, clean_compose), (env_path, clean_env)):
+            try:
+                atomic_write(path, content)
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise RuntimeError("Nettoyage des fichiers de claim impossible ; intervention opérateur requise.") from None
+        code, _, _ = run(command, timeout=300)
+        if code:
+            raise RuntimeError("Nettoyage du conteneur après claim impossible ; intervention opérateur requise, ne pas relancer le claim.") from None
+    if failure:
+        raise RuntimeError(_sanitize_diagnostic_text(str(failure))) from None
+    final = _wait_plex_ready(container, claimed=True)
+    if final["identity_fingerprint"] != before["identity_fingerprint"]:
+        raise RuntimeError("Identité Plex modifiée après nettoyage.")
+    return {"output": "Claim confirmé après nettoyage et redémarrage.", "state": "running",
+            "claimed": True, "container": container, "secret_redacted": True,
+            "lifecycle": ["container_running", "http_available", "identity_generated", "claimed", "association_confirmed"]}
 
 
 def execute_command(config, command):
@@ -1639,21 +1712,34 @@ def execute_command(config, command):
         compose = str(payload.get("compose") or "")
         env_content = str(payload.get("env") or "")
         manifest = None
+        reference_result = None
         if action in {"deploy", "recreate"}:
             if not compose:
                 raise RuntimeError("Compose absent du manifeste de déploiement.")
             manifest = verify_manifest(payload, client_id, compose, env_content)
-            app_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write(compose_path, compose, 0o600)
-            atomic_write(env_path, env_content, 0o600)
-            atomic_write(
-                manifest_path,
-                json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                0o600,
-            )
             reference_archive = payload.get("reference_archive") or None
+            reference_result = None
             if reference_archive:
-                install_reference_archive(config, reference_archive, app_dir)
+                if app_dir.exists() and any(app_dir.iterdir()):
+                    raise RuntimeError("Restore refusé sur une AppBox existante. Utiliser une nouvelle AppBox de test.")
+                staging_app = base / (".restore-" + client_id + "-" + uuid.uuid4().hex)
+                staging_app.mkdir()
+                try:
+                    reference_result = install_reference_archive(config, reference_archive, staging_app)
+                    atomic_write(staging_app / "compose.yml", compose)
+                    atomic_write(staging_app / ".env", env_content)
+                    atomic_write(staging_app / "deployment-manifest.json", json.dumps(manifest))
+                    if app_dir.exists():
+                        app_dir.rmdir()
+                    os.replace(staging_app, app_dir)
+                finally:
+                    if staging_app.exists():
+                        shutil.rmtree(staging_app)
+            else:
+                app_dir.mkdir(parents=True, exist_ok=True)
+                atomic_write(compose_path, compose)
+                atomic_write(env_path, env_content)
+                atomic_write(manifest_path, json.dumps(manifest))
             for directory in payload.get("directories") or []:
                 if directory in {"plex-config", "jellyfin-config", "jellyfin-cache", "tautulli-config"}:
                     (app_dir / directory).mkdir(exist_ok=True)
@@ -1668,60 +1754,7 @@ def execute_command(config, command):
         )
 
         if action == "claim":
-            claim_code = str(payload.get("claim_code") or "").strip()
-            if not re.fullmatch(r"claim-[A-Za-z0-9_-]{8,128}", claim_code):
-                raise RuntimeError("Code Claim Plex invalide.")
-            if not compose_path.exists():
-                raise RuntimeError(f"Compose absent pour le Claim Plex : {compose_path}")
-            original_compose = compose_path.read_text(encoding="utf-8")
-            original_env = env_path.read_text(encoding="utf-8") if env_path.exists() else None
-            claim_compose = original_compose
-            if "PLEX_CLAIM:" not in claim_compose:
-                marker = '      VERSION: docker\n'
-                if marker not in claim_compose:
-                    raise RuntimeError("Impossible d’injecter PLEX_CLAIM : variable VERSION introuvable dans le service Plex.")
-                claim_compose = claim_compose.replace(marker, marker + '      PLEX_CLAIM: "${PLEX_CLAIM:-}"\n', 1)
-            cleaned_env = "\n".join(
-                line for line in (original_env or "").splitlines()
-                if not line.startswith("PLEX_CLAIM=")
-            ).rstrip("\n")
-            claim_env = (cleaned_env + "\n" if cleaned_env else "") + f"PLEX_CLAIM={claim_code}\n"
-            compose_cmd = ["docker", "compose", "-p", client_id, "-f", str(compose_path)]
-            try:
-                atomic_write(compose_path, claim_compose, 0o600)
-                atomic_write(env_path, claim_env, 0o600)
-                code, out, err = run(compose_cmd + ["up", "-d", "--force-recreate", "plex"], timeout=300)
-                if code != 0:
-                    raise RuntimeError((err or out or "Échec de la recréation Plex avec le Claim.")[-16000:])
-                container = containers[0] if containers else ""
-                deadline = time.monotonic() + 120
-                claimed = False
-                while container and time.monotonic() < deadline:
-                    c, identity, _ = run(["docker", "exec", container, "sh", "-c",
-                        "curl -fsS http://127.0.0.1:32400/identity || wget -qO- http://127.0.0.1:32400/identity"], timeout=15)
-                    if c == 0 and ('claimed=\"1\"' in identity or "claimed='1'" in identity):
-                        claimed = True
-                        break
-                    time.sleep(3)
-                if not claimed:
-                    raise RuntimeError("Plex n’a pas confirmé le Claim dans le délai imparti.")
-            finally:
-                atomic_write(compose_path, original_compose, 0o600)
-                if original_env is None:
-                    env_path.unlink(missing_ok=True)
-                else:
-                    atomic_write(env_path, original_env, 0o600)
-            code, clean_out, clean_err = run(compose_cmd + ["up", "-d", "--force-recreate", "plex"], timeout=300)
-            if code != 0:
-                raise RuntimeError((clean_err or clean_out or "Claim réussi mais nettoyage du token impossible.")[-16000:])
-            return {
-                "output": "Claim Plex confirmé et conteneur recréé sans jeton persistant.",
-                "state": "running",
-                "claimed": True,
-                "container": containers[0] if containers else None,
-                "executor": "docker-compose-agent",
-                "secret_redacted": True,
-            }
+            return claim_plex(app_dir, client_id, containers, str(payload.get("claim_code") or "").strip())
 
         def docker_direct(verb):
             if not containers:
@@ -1783,6 +1816,15 @@ def execute_command(config, command):
                 "executor": executor,
             }
 
+        if action in {"deploy", "start", "restart", "recreate"}:
+            if not containers:
+                raise RuntimeError("Aucun conteneur déclaré : validation running impossible.")
+            for container in containers:
+                _wait_for_container_state(container, "running", timeout=90)
+            plex = next((name for name in containers if name.startswith("plex-")), None)
+            if plex:
+                _wait_plex_ready(plex)
+
         if compose_path.exists():
             code, psout, pserr = run(
                 ["docker", "compose", "-p", client_id, "-f", str(compose_path), "ps"], timeout=30
@@ -1796,13 +1838,15 @@ def execute_command(config, command):
             state = psout or pserr
 
         return {
-            "output": output or state or "Commande exécutée.",
+            "output": _sanitize_diagnostic_text(output or state or "Commande exécutée."),
+            "health_verified": action in {"deploy", "start", "restart", "recreate"},
             "state": state,
             "path": str(app_dir),
             "containers": containers,
             "executor": executor,
             "compose_present": compose_path.exists(),
             "manifest_checksum": (manifest or {}).get("checksum"),
+            "reference_cache": reference_result,
             "files_written": ["compose.yml", ".env", "deployment-manifest.json"] if manifest else [],
         }
     raise RuntimeError(f"Commande non supportée : {command_type}")
@@ -1824,7 +1868,7 @@ def command_cycle(config):
                 result["inventory_sync"] = send_inventory(config)
             except Exception as inventory_exc:
                 result["inventory_warning"] = str(inventory_exc)
-        payload = {"status": "success", "result": result}
+        payload = {"status": "success", "result": _sanitize_diagnostics(result)}
     except Exception as exc:
         diagnostics = getattr(exc, "diagnostics", None)
         result = {"diagnostics": _sanitize_diagnostics(diagnostics)} if isinstance(diagnostics, dict) else {}
