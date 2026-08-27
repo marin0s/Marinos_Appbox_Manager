@@ -140,33 +140,73 @@ class PlexSourceCaptureTests(unittest.TestCase):
         self.assertEqual(sanitization["sqlite_engine_selection"]["reason"], "source-container-frozen")
         self.assertFalse(sanitization["sqlite_engine_selection"]["container_exec_attempted"])
 
-    def test_initially_running_plex_is_stopped_and_restarted(self):
-        docker_results = [
-            (0, "running\n", ""),
-            (0, "plex-source\n", ""),
-            (0, "exited\n", ""),
-            (0, "plex-source\n", ""),
-            (0, "running\n", ""),
-            (0, "host|\n", ""),
-            (0, "running\n", ""),
-        ]
-        response = MagicMock()
-        response.read.return_value = b'<MediaContainer claimed="0" version="1.0"/>'
-        response.__enter__.return_value = response
-        with patch.object(agent, "run", side_effect=docker_results) as docker, \
-             patch.object(agent.urllib.request, "urlopen", return_value=response):
-            result = agent._capture_plex_reference(self.config, self.root / "capture-running", "plex-source")
-        commands = [call.args[0] for call in docker.call_args_list]
-        self.assertIn(["docker", "stop", "--time", "60", "plex-source"], commands)
-        self.assertIn(["docker", "start", "plex-source"], commands)
-        self.assertFalse(any(command[:3] == ["docker", "exec", "plex-source"] for command in commands))
-        self.assertTrue(result["builder_stopped_container"])
-        self.assertTrue(result["restart_attempted"])
-        self.assertTrue(result["stop_result"]["success"])
-        self.assertTrue(result["restart_result"]["success"])
+    def test_initially_running_plex_is_captured_without_stop_or_restart(self):
+        workdir = self.root / "capture-running"
+        overlay = workdir / "overlay"
+        overlay.mkdir(parents=True, exist_ok=True)
+
+        sanitization = {
+            "sqlite_snapshots": [],
+            "sqlite_engine_selection": {
+                "selected_engine": "plex-sqlite-with-python-fallback",
+                "reason": "container-engine-requested",
+                "container_exec_attempted": True,
+            },
+        }
+
+        archive_report = {
+            "included_paths": [],
+            "excluded_paths": [],
+            "uncompressed_size_bytes": 7,
+            "metadata": {"size_bytes": 0, "file_count": 0},
+            "media": {"size_bytes": 0, "file_count": 0},
+            "databases": {"size_bytes": 0, "file_count": 0, "names": []},
+        }
+
+        def fake_archive(_config_path, _overlay, archive):
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_bytes(b"archive")
+            return archive_report
+
+        with patch.object(
+            agent,
+            "_docker_container_state",
+            side_effect=["running", "running"],
+        ), patch.object(
+            agent,
+            "_prepare_plex_reference_overlay",
+            return_value=(overlay, sanitization),
+        ) as prepare, patch.object(
+            agent,
+            "_archive_plex_reference",
+            side_effect=fake_archive,
+        ), patch.object(
+            agent,
+            "_stop_plex_for_capture",
+        ) as stop, patch.object(
+            agent,
+            "_restart_plex_after_capture",
+        ) as restart:
+            result = agent._capture_plex_reference(
+                self.config,
+                workdir,
+                "plex-source",
+            )
+
+        stop.assert_not_called()
+        restart.assert_not_called()
+
+        prepare.assert_called_once_with(
+            self.config,
+            workdir,
+            "plex-source",
+        )
+
+        self.assertFalse(result["builder_stopped_container"])
+        self.assertFalse(result["restart_attempted"])
+        self.assertFalse(result["stop_result"]["attempted"])
+        self.assertFalse(result["restart_result"]["attempted"])
         self.assertEqual(result["final_container_state"], "running")
-        self.assertTrue(result["plex_identity_health_after_restart"]["reachable"])
-        self.assertIn("host-http:http://127.0.0.1:32400/identity", result["plex_identity_health_after_restart"]["method"])
 
     def test_identity_uses_container_ip_before_container_tools(self):
         response = MagicMock()
@@ -227,22 +267,6 @@ class PlexSourceCaptureTests(unittest.TestCase):
         self.assertFalse(result["builder_stopped_container"])
         self.assertFalse(result["restart_attempted"])
         self.assertEqual(result["final_container_state"], "exited")
-
-    def test_archive_failure_still_restarts_initially_running_plex(self):
-        with patch.object(agent, "_docker_container_state", side_effect=["running", "running"]), \
-             patch.object(agent, "_stop_plex_for_capture", return_value={"success": True, "confirmed_state": "exited", "output": "plex"}), \
-             patch.object(agent, "_archive_plex_reference", side_effect=RuntimeError("archive failed")), \
-             patch.object(agent, "_restart_plex_after_capture", return_value=({"success": True, "confirmed_state": "running", "output": "plex"}, {"reachable": True})) as restart:
-            with self.assertRaisesRegex(RuntimeError, "archive failed"):
-                agent._capture_plex_reference(self.config, self.root / "capture-error", "plex-source")
-        restart.assert_called_once_with("plex-source")
-
-    def test_restart_failure_is_an_explicit_restoration_error(self):
-        with patch.object(agent, "_docker_container_state", side_effect=["running", "exited"]), \
-             patch.object(agent, "_stop_plex_for_capture", return_value={"success": True, "confirmed_state": "exited", "output": "plex"}), \
-             patch.object(agent, "_restart_plex_after_capture", side_effect=RuntimeError("docker start failed")):
-            with self.assertRaisesRegex(RuntimeError, "Restauration explicite.*docker start failed"):
-                agent._capture_plex_reference(self.config, self.root / "capture-restart-error", "plex-source")
 
 
 if __name__ == "__main__":

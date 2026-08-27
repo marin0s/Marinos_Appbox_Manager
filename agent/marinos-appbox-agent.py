@@ -1194,15 +1194,20 @@ def _capture_plex_reference(config_path: Path, workdir: Path, container_name: st
         "plex_identity_health_after_restart": {"checked": False, "reachable": None},
     }
     capture_error = None
-    restoration_error = None
     sanitization = {}
     archive_report = {}
     checksum = ""
     try:
-        if initial_state == "running":
-            lifecycle["stop_result"] = {"attempted": True, **_stop_plex_for_capture(container_name)}
-            lifecycle["builder_stopped_container"] = True
-        overlay, sanitization = _prepare_plex_reference_overlay(config_path, workdir)
+        # A running Plex stays online during reference capture. Its databases
+        # are snapshotted through Plex SQLite inside the live container.
+        # Stopped/created sources use the Python SQLite snapshot path because
+        # docker exec is not available in that state.
+        snapshot_container = container_name if initial_state == "running" else ""
+        overlay, sanitization = _prepare_plex_reference_overlay(
+            config_path,
+            workdir,
+            snapshot_container,
+        )
         archive_report = _archive_plex_reference(config_path, overlay, archive)
         digest = hashlib.sha256()
         with archive.open("rb") as stream:
@@ -1212,24 +1217,10 @@ def _capture_plex_reference(config_path: Path, workdir: Path, container_name: st
     except Exception as exc:
         capture_error = exc
     finally:
-        if initial_state == "running":
-            lifecycle["restart_attempted"] = True
-            lifecycle["restart_result"] = {"attempted": True, "success": False}
-            lifecycle["plex_identity_health_after_restart"] = {"checked": True, "reachable": False}
-            try:
-                restart_result, identity_health = _restart_plex_after_capture(container_name)
-                lifecycle["restart_result"] = {"attempted": True, **restart_result}
-                lifecycle["plex_identity_health_after_restart"] = {"checked": True, **identity_health}
-            except Exception as exc:
-                restoration_error = exc
-            try:
-                lifecycle["final_container_state"] = _docker_container_state(container_name)
-            except Exception as exc:
-                if restoration_error is None:
-                    restoration_error = exc
-                lifecycle["final_container_state"] = "unknown"
-        else:
+        try:
             lifecycle["final_container_state"] = _docker_container_state(container_name)
+        except Exception:
+            lifecycle["final_container_state"] = "unknown"
 
     capture_diagnostics = {
         "container_lifecycle": lifecycle,
@@ -1240,14 +1231,6 @@ def _capture_plex_reference(config_path: Path, workdir: Path, container_name: st
         for key, value in capture_diagnostics.items():
             capture_error.add_diagnostics(key, value)
 
-    if restoration_error is not None:
-        capture_detail = f" Capture également échouée : {capture_error}" if capture_error else ""
-        message = f"Restauration explicite du Plex source échouée : {restoration_error}.{capture_detail}"
-        if isinstance(capture_error, PlexSQLiteCaptureError):
-            error = PlexSQLiteCaptureError(message, capture_error.diagnostics)
-            error.add_diagnostics("restoration_error", f"{type(restoration_error).__name__}: {restoration_error}")
-            raise error from restoration_error
-        raise RuntimeError(message) from restoration_error
     if capture_error is not None:
         raise capture_error
     return {

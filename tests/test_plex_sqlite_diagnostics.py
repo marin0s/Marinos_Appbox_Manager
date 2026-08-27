@@ -238,21 +238,47 @@ class PlexSQLiteDiagnosticsTests(unittest.TestCase):
         self.assertFalse(diagnostics["container_snapshot_cleanup"]["success"])
         self.assertEqual(diagnostics["container_snapshot_cleanup"]["return_code"], 1)
 
-    def test_sqlite_failure_still_restarts_initially_running_plex(self):
-        diagnostic_error = agent.PlexSQLiteCaptureError("snapshot failed", {"engine": "python-sqlite3"})
-        with patch.object(agent, "_docker_container_state", side_effect=["running", "running"]), \
-             patch.object(agent, "_stop_plex_for_capture", return_value={"success": True, "confirmed_state": "exited"}), \
-             patch.object(agent, "_prepare_plex_reference_overlay", side_effect=diagnostic_error), \
-             patch.object(agent, "_restart_plex_after_capture", return_value=(
-                 {"success": True, "confirmed_state": "running"}, {"reachable": True},
-             )) as restart:
+    def test_sqlite_failure_keeps_initially_running_plex_online(self):
+        diagnostic_error = agent.PlexSQLiteCaptureError(
+            "snapshot failed",
+            {"engine": "plex-sqlite"},
+        )
+
+        with patch.object(
+            agent,
+            "_docker_container_state",
+            side_effect=["running", "running"],
+        ), patch.object(
+            agent,
+            "_prepare_plex_reference_overlay",
+            side_effect=diagnostic_error,
+        ) as prepare, patch.object(
+            agent,
+            "_stop_plex_for_capture",
+        ) as stop, patch.object(
+            agent,
+            "_restart_plex_after_capture",
+        ) as restart:
             with self.assertRaises(agent.PlexSQLiteCaptureError) as raised:
-                agent._capture_plex_reference(self.root, self.root / "work-running", "plex-ouranos")
-        restart.assert_called_once_with("plex-ouranos")
+                agent._capture_plex_reference(
+                    self.root,
+                    self.root / "work-running",
+                    "plex-ouranos",
+                )
+
+        stop.assert_not_called()
+        restart.assert_not_called()
+
+        prepare.assert_called_once_with(
+            self.root,
+            self.root / "work-running",
+            "plex-ouranos",
+        )
+
         lifecycle = raised.exception.diagnostics["container_lifecycle"]
         self.assertEqual(lifecycle["initial_container_state"], "running")
-        self.assertTrue(lifecycle["restart_attempted"])
-        self.assertTrue(lifecycle["restart_result"]["success"])
+        self.assertFalse(lifecycle["builder_stopped_container"])
+        self.assertFalse(lifecycle["restart_attempted"])
         self.assertEqual(lifecycle["final_container_state"], "running")
 
     def test_sqlite_failure_leaves_initially_stopped_plex_stopped(self):

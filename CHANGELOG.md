@@ -4,16 +4,17 @@
 
 ### Images de référence Plex — Phase 1
 - Définition d’un contrat d’archive Plex fondé sur une liste d’inclusion explicite, avec conservation de `Metadata`, `Media`, bases canoniques, plugins, scanners, profils, ressources et préférences assainies.
-- Capture cohérente après arrêt propre d’un Plex initialement actif, restauration garantie dans un bloc `finally` et contrôle de l’état Docker ainsi que de l’endpoint `/identity` après redémarrage.
+- Capture à chaud d’un Plex actif sans interruption du service ; les bases SQLite sont figées via `Plex SQLite` dans le conteneur, avec validation `quick_check` et fallback Python SQLite si nécessaire.
 - Exclusion des caches, logs, diagnostics, sessions, transcodes, fichiers temporaires, PID, WAL/SHM et sauvegardes de bases datées ou dupliquées.
-- Rapports de construction enrichis avec le cycle de vie du conteneur, les contenus réellement archivés, les tailles, les checksums et les validations SQLite.
-- Tests synthétiques sans accès à Docker couvrant le contenu de l’archive, l’assainissement, les états initialement actif ou arrêté et les erreurs de capture ou de restauration.
+- Rapports de construction enrichis avec le cycle de vie du conteneur, la confirmation qu’aucun arrêt/redémarrage n’a été effectué pendant une capture live, les contenus réellement archivés, les tailles, les checksums et les validations SQLite.
+- Tests synthétiques sans accès à Docker couvrant le contenu de l’archive, l’assainissement, les états initialement actif ou arrêté, les erreurs de capture et la garantie qu’un Plex actif n’est ni stoppé ni redémarré par le builder.
 - Harmonisation des versions de développement de l’agent et du builder Phase 1, contrôle `/identity` depuis l’hôte avec repli conteneur, et durcissement des chemins tar hors contrat.
 - Correction de l’import `uuid` manquant dans le chemin de snapshot SQLite Plex et alignement du footer, de `/health` et de l’agent embarqué sur la version de validation `1.6.0-alpha.5-dev`.
 - Capture SQLite Plex renforcée par une copie privée et inscriptible de la base figée et de ses sidecars, avec erreurs par étape et diagnostics de chemins, permissions, espace disque, moteur, sous-processus, cycle Docker et répertoires temporaires.
+- Capture live finalisée : lorsqu’un Plex est `running`, le builder transmet désormais le conteneur au moteur de snapshot, utilise `Plex SQLite` sans `docker stop/start` et conserve le service disponible pendant toute la création de l’archive.
 
 ### Corrections de finalisation
-- `/health` déclare les captures intrusives (arrêt temporaire Plex).
+- `/health` et les capacités agent déclarent les captures Plex comme non intrusives : un Plex actif reste en ligne pendant la construction de la Reference Image.
 - Packaging agent déterministe : contenu LF, ordre, permissions et horodatages fixes ; vérification complète de l’artefact et des checkouts LF/CRLF.
 - Contrat d’archive partagé entre Control Plane et agent ; refus des chemins absolus, traversées, liens, fichiers spéciaux, doublons et gzip tronqués. Module livré dans le ZIP et installé avec l’agent.
 - Upload en streaming, SHA-256 recalculé, validation avant publication atomique, verrou d’upload et refus de remplacement par un contenu différent. Les résultats répétés ne republient pas une version.
@@ -32,7 +33,7 @@
 ### Prévu pour cette version
 - Fiabilisation complète des images de référence Plex.
 - Conservation explicite des bibliothèques, `Metadata`, `Media` et bases cohérentes.
-- Arrêt temporaire sécurisé du Plex source lorsque nécessaire, avec redémarrage garanti.
+- Capture Plex active sans interruption, avec snapshot SQLite cohérent et conservation de l’état initial du conteneur.
 - Validation d'un déploiement from scratch, du claim distant et du nommage sans double tiret.
 
 ## 1.6.0-alpha.4 — Base de production importée
