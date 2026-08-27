@@ -6064,7 +6064,7 @@ def claim_appbox(client_id: str, claim_code: str = Form(...)):
         "containers": item.get("containers") or [],
     })
     try:
-        ok, result, error = wait_agent_command(command_id, timeout=900)
+        ok, result, error = wait_agent_command(command_id, timeout=1500)
     finally:
         # Le claim est un secret à usage court : le supprimer de la file persistante.
         with db_lock, db() as con:

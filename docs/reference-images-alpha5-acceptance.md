@@ -2,6 +2,8 @@
 
 La version est validée lorsque :
 
+Les tests automatisés ne remplacent pas ces critères terrain. Utiliser le [runbook E2E et rollback](reference-images-alpha5-e2e.md) ; aucun nœud n’est autorisé implicitement par ce document.
+
 - une référence Plex peut être construite depuis OURANOS ;
 - l'état initial du conteneur source est restauré même après une erreur ;
 - l'archive contient les bibliothèques, Metadata, Media et des bases cohérentes ;

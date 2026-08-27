@@ -100,6 +100,22 @@ class ReferenceBuildOrchestrationTests(unittest.TestCase):
         self.assertNotIn('sensitive',' '.join(row))
         self.assertNotIn('claim-abcdefgh',' '.join(row))
 
+    def test_control_plane_claim_erases_queued_token_on_success_and_failure(self):
+        item={'type':'plex','node_id':'ouranos','containers':['plex-appb-test']}
+        nodes=[{'node_id':'ouranos','agent_online':True,'capabilities':{'deployment_executor':True}}]
+        for ok,result,error in [(True,{'claimed':True},''),(True,{'claimed':False},'claim refused'),(False,{},'timeout')]:
+            with self.subTest(ok=ok,result=result), patch.object(main,'get_appbox',return_value=item), patch.object(main,'list_control_nodes',return_value=nodes), patch.object(main,'wait_agent_command',return_value=(ok,result,error)), patch.object(main,'record_event') as event:
+                if ok and result.get('claimed'):
+                    self.assertEqual(main.claim_appbox('abtest','claim-abcdefgh').status_code,303)
+                else:
+                    with self.assertRaises(HTTPException):
+                        main.claim_appbox('abtest','claim-abcdefgh')
+                    self.assertEqual(event.call_args.args[-1],'error')
+                with main.db() as con:
+                    commands=con.execute("SELECT payload_json FROM agent_commands WHERE command_type='appbox_action'").fetchall()
+                self.assertTrue(commands)
+                self.assertTrue(all('claim-abcdefgh' not in row[0] for row in commands))
+
     def test_cache_failure_clears_ready_metadata(self):
         self.test_success_creates_published_catalogue_entry()
         with main.db() as con:

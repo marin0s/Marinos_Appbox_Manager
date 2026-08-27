@@ -51,6 +51,7 @@ Les règles du projet sont détaillées dans [AGENTS.md](AGENTS.md) et [CONTRIBU
 
 - [Architecture](docs/architecture.md)
 - [Images de référence](docs/reference-images.md)
+- [Validation E2E et rollback alpha.5](docs/reference-images-alpha5-e2e.md)
 - [Processus de livraison](docs/release-process.md)
 - [Roadmap](ROADMAP.md)
 - [Historique des versions](CHANGELOG.md)

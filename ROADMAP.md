@@ -2,6 +2,8 @@
 
 ## 1.6.0-alpha.5 — Images de référence Plex
 
+Les correctifs de capture, transferts, restauration, nommage, claim et packaging sont couverts par des tests simulés. La validation terrain et le rollback restent à exécuter selon [le runbook alpha.5](docs/reference-images-alpha5-e2e.md). La version reste en développement, sans promotion de production.
+
 - fiabiliser la capture complète de la médiathèque ;
 - arrêter proprement le Plex source si nécessaire ;
 - garantir la restauration de son état initial ;

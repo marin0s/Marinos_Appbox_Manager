@@ -22,7 +22,7 @@ Le claim vérifie running, HTTP, identité générée, puis claimed, avec conser
 
 Les diagnostics conservent les chemins techniques nécessaires au dépannage et ne doivent pas être diffusés publiquement. Les attributs d’identité/claim/token/password/secret sont supprimés des préférences ; cela ne constitue pas un scanner universel de secrets contenus dans les plugins ou les données métier SQLite. Examiner le template choisi avant diffusion hors du périmètre de confiance.
 
-Le fallback SQLite `schema-readable-tokenizer-unavailable` reste une validation limitée quand les tokenizers Plex ne sont pas disponibles. La validation native et la lecture effective des bibliothèques restent obligatoires pendant l’E2E. Le timeout d’attente d’un restore est de deux heures ; un job déjà interrompu ne reprend pas succès à réception d’un résultat tardif.
+Le fallback SQLite `schema-readable-tokenizer-unavailable` reste une validation limitée quand les tokenizers Plex ne sont pas disponibles. La validation native et la lecture effective des bibliothèques restent obligatoires pendant l’E2E. Le timeout d’attente d’un restore est de deux heures ; le claim dispose de 25 minutes côté Control Plane pour englober les contrôles et les deux recréations Docker, elles-mêmes bornées. Un job déjà interrompu ne reprend pas succès à réception d’un résultat tardif. Les validations lourdes d’upload/publication sont exécutées hors de la boucle HTTP asynchrone pour ne pas bloquer les heartbeats.
 
 La référence doit préserver :
 
