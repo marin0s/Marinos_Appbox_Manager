@@ -6182,7 +6182,7 @@ def health():
         "reference_build_jobs": True,
         "reference_discovery": True,
         "reference_discovery_read_only": True,
-        "reference_build_intrusive_actions": False,
+        "reference_build_intrusive_actions": True,
         "advanced_appbox_options": True,
         "control_plane_foundation": True,
         "node_tags": True,

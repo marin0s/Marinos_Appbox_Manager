@@ -20,6 +20,13 @@ Pendant une capture complète, l'arrêt temporaire de Plex est autorisé lorsque
 
 ## Contrat d’archive Plex — Phase 1
 
+### Packaging de l’agent
+
+Exécuter `python scripts/package_agent.py`, puis `python scripts/package_agent.py --check`.
+Le ZIP contient exclusivement les fichiers listés dans le script, en LF avec métadonnées fixes et sans compression dépendante de zlib. Le test compare l’artefact complet, et reconstruit le même ZIP depuis un checkout CRLF. `.gitattributes` impose LF aux sources Python, shell et systemd. Pour revenir au package précédent, restaurer le ZIP et ses sources depuis le même commit, jamais séparément.
+
+`/health.reference_build_intrusive_actions` est vrai : la découverte reste en lecture seule, mais une capture peut arrêter Plex temporairement.
+
 La version produit reste `1.6.0-alpha.5` en développement. L’agent se déclare `1.6.0-alpha.5-dev` tant que cette version n’est pas livrée, tandis que les rapports et capacités du builder Plex identifient précisément l’implémentation `1.6.0-alpha.5-phase1` et le schéma d’archive `1`. Ces champs de capacité sont optionnels afin de rester compatibles avec le Control Plane existant.
 
 L’archive est construite depuis le montage `/config` d’un conteneur Plex arrêté. Elle contient uniquement les données applicatives suivantes sous `Library/Application Support/Plex Media Server/` :

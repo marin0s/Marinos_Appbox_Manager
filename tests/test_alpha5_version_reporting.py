@@ -1,7 +1,9 @@
 import importlib.util
 import unittest
 import zipfile
+import tempfile
 from pathlib import Path
+from scripts.package_agent import FILES, package_bytes
 
 from app import main
 
@@ -19,6 +21,7 @@ class Alpha5VersionReportingTests(unittest.TestCase):
         self.assertEqual(main.PRODUCT_VERSION, "1.6.0-alpha.5")
         self.assertEqual(main.VERSION, "1.6.0-alpha.5-dev")
         self.assertEqual(main.health()["version"], main.VERSION)
+        self.assertTrue(main.health()["reference_build_intrusive_actions"])
         footer = main.templates.env.get_template("base.html").render(active_page="")
         self.assertIn("v1.6.0-alpha.5-dev", footer)
 
@@ -30,13 +33,25 @@ class Alpha5VersionReportingTests(unittest.TestCase):
     def test_downloadable_agent_archive_contains_the_current_agent(self):
         with zipfile.ZipFile(AGENT_ARCHIVE_PATH) as archive:
             archived_bytes = archive.read("marinos-appbox-agent.py")
-        self.assertEqual(archived_bytes, AGENT_PATH.read_bytes())
+        self.assertEqual(AGENT_ARCHIVE_PATH.read_bytes(), package_bytes(AGENT_PATH.parent))
+        self.assertNotIn(b"\r", archived_bytes)
+        self.assertEqual(archived_bytes, AGENT_PATH.read_bytes().replace(b"\r\n", b"\n"))
         archived_source = archived_bytes.decode("utf-8")
         namespace = {"__name__": "downloadable_agent", "__file__": "marinos-appbox-agent.py"}
         exec(compile(archived_source, "marinos-appbox-agent.py", "exec"), namespace)
         self.assertEqual(namespace["VERSION"], "1.6.0-alpha.5-dev")
         self.assertEqual(namespace["PLEX_REFERENCE_BUILDER_VERSION"], "1.6.0-alpha.5-phase1")
         self.assertEqual(namespace["uuid"].__name__, "uuid")
+
+    def test_package_is_reproducible_across_checkout_line_endings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            for name in FILES:
+                data = (AGENT_PATH.parent / name).read_bytes().replace(b"\r\n", b"\n")
+                (source / name).write_bytes(data.replace(b"\n", b"\r\n"))
+            self.assertEqual(package_bytes(source), package_bytes(AGENT_PATH.parent))
+            with zipfile.ZipFile(AGENT_ARCHIVE_PATH) as archive:
+                self.assertEqual(sorted(archive.namelist()), sorted(FILES))
 
 
 if __name__ == "__main__":
