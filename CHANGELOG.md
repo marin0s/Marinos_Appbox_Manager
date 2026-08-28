@@ -2,6 +2,10 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Layout du détail node
+- Espacement vertical des rangées métriques et Système/Agent via la grille existante, sans modification des breakpoints ni du layout local.
+- Critères E2E du lot 2 documentés, dont extinction physique du node et rafraîchissement UI sans restart CP ; aucun changement de liveness.
+
 ### Suppression des images de référence
 - Confirmation UI/API avec nom, nombre de versions et dépendances explicites ; aucune suppression forcée.
 - Refus des liens AppBox, déploiement, profil, snapshot partagé, build/distribution actifs ; protection des écrivains tardifs sur les colonnes historiques sans FK.

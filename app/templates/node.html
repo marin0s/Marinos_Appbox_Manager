@@ -16,6 +16,7 @@
  <div class="card metric-card chart-card"><div class="metric-label">Réseau total</div><div class="metric-value" style="font-size:24px" data-node-field="rx">0 o/s</div><canvas class="node-chart large" data-node-chart="network" data-node="{{node.node_id}}"></canvas></div>
 </div>
 {% else %}
+<div class="grid" data-node-dashboard>
 <div class="grid metrics">
  <div class="card"><div class="metric-label">CPU</div><div class="metric-value" style="font-size:21px">{{node.cpu_model or 'Inconnu'}}</div><div class="metric-sub">{{node.cpu_count or 0}} thread(s) · charge {{'%.2f'|format(node.load_1 or 0)}}</div></div>
  <div class="card"><div class="metric-label">RAM utilisée</div><div class="metric-value">{{'%.1f'|format(node.metrics.ram_percent or 0)}} %</div></div>
@@ -35,6 +36,7 @@
   <div class="info-row"><span>Compose</span><strong>{{node.compose_version or 'Inconnu'}}</strong></div>
   <div class="info-row"><span>Métriques</span><strong data-node-freshness="{{node.node_id}}">{{node.metrics_collected_at or 'Jamais'}}{{' — expirées' if node.metrics_stale else ''}}</strong></div>
  </div></div>
+</div>
 </div>
 {% endif %}
 
