@@ -1,8 +1,9 @@
 [Unit]
-Description=Resume and supervise Marinos AppBox upgrades across agent exits and reboot
+Description=Boot recovery and active-only Marinos AppBox upgrade reconciliation
 
 [Timer]
 OnBootSec=15s
+OnActiveSec=5s
 OnUnitInactiveSec=5s
 AccuracySec=1s
 Unit=marinos-appbox-updater.service

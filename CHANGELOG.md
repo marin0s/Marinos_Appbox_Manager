@@ -2,6 +2,12 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Supervision agent sans polling permanent en idle
+- Réveil systemd sur la demande durable, timer rapide seulement pendant upgrade/reprise/notifications ; contrôle au boot puis retour idle, sans nouveau daemon.
+- Migration automatique du timer 5 s des nodes managed depuis une release confirmée : path/drop-in connus, écritures atomiques, sauvegarde et reprise/restauration durables, daemon-reload et activations asynchrones vérifiées.
+- Scheduling versionné épinglé indépendamment de current/controller/rescue ; lanceur et service de base fixes, agent.json, protocole/ABI 1, liste ZIP et rollback agent inchangés.
+- Tests idle/actif/reboot, acquittements terminaux, courses, contention, migration interrompue, chaîne managed et secours ; procédure de recette Linux dans `docs/agent-upgrades.md`.
+
 ### Correctif après bootstrap ARTEMIS
 - Un tick du lanceur dont le verrou est déjà détenu quitte silencieusement avec code 0, sans controller/rescue ; les autres erreurs et le secours restent inchangés.
 - `/health` et le registre Plex annoncent la capture sans interruption (`intrusive_actions=false`) ; documentation et tests réalignés sans changement du moteur, de l'ABI, du bootstrap ou du rollback.

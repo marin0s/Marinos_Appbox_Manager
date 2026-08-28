@@ -80,7 +80,7 @@ commande `agent_upgrade`. L'exécution métier reste séquentielle ; heartbeat e
 restent indépendants. Le heartbeat identifie le processus par nonce, PID, version,
 build et checksum de release, capturés une seule fois au démarrage.
 
-L'agent prépare sans changer son exécutable. Un timer systemd démarre un petit lanceur fixe
+L'agent prépare sans changer son exécutable. Un watcher systemd réveille un petit lanceur fixe
 hors du service agent, qui invoque le helper de la release controller. Ce helper revalide l'archive, journalise previous/candidate et
 les délais, arrête seulement le service agent, remplace atomiquement `current` puis
 redémarre. Il exige un nouveau heartbeat correspondant au processus MainPID actif.
@@ -98,8 +98,15 @@ conserve le rollback ; le contrôleur ne passe à N+1 qu'après heartbeat et pro
 helper. N+1 supervise ensuite N+2. Le lanceur peut appeler le contrôleur rescue si le
 dispatch échoue. Une enveloppe de récupération ABI 1 et les anciennes releases sont
 conservées. L'unité agent versionnée est installée atomiquement, rechargée par systemd
-et restaurée avec previous en cas d'échec. Seuls le lanceur minimal et son service/timer
-restent fixes, afin que la candidate ne puisse supprimer la voie de secours.
+et restaurée avec previous en cas d'échec. Seuls le lanceur minimal et l'unité de base de
+son service restent fixes, afin que la candidate ne puisse supprimer la voie de secours.
+Le timer et le scheduling sont migrés depuis chaque release confirmée avec sauvegarde,
+daemon-reload et reprise durable. Un drop-in ExecStopPost épinglé à cette release reste
+indépendant d'un controller/rescue plus ancien ou d'une candidate cassée. Le watcher
+PathChanged surveille la demande durable ; le timer rapide n'est actif que pendant le
+travail restant, y compris rollback, notifications non acquittées et migration d'unités.
+Enabled mais arrêté en idle, il assure aussi un contrôle au boot. Aucun daemon ajouté,
+ni changement de l'ABI 1 ou de la liste stricte des fichiers ZIP.
 
 La procédure manuelle de remplacement des deux fichiers du lot 2 ci-dessus ne doit
 plus être utilisée sur un agent managed : suivre [bootstrap, upgrade et rollback](agent-upgrades.md).

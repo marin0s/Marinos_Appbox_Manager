@@ -11,11 +11,11 @@ from pathlib import Path
 try:
     from agent.upgrade_contract import (HELPER_FILES, TERMINAL, atomic_json, canonical,
         digest, fsync_directory, prepare_release, source_version, validate_package, atomic_file, LAUNCHER_ABI)
-    from agent.upgrade_client import operation_path, request
+    from agent.upgrade_client import operation_path, request, install_scheduler, scheduler_units
 except ModuleNotFoundError:
     from upgrade_contract import (HELPER_FILES, TERMINAL, atomic_json, canonical,
         digest, fsync_directory, prepare_release, source_version, validate_package, atomic_file, LAUNCHER_ABI)
-    from upgrade_client import operation_path, request
+    from upgrade_client import operation_path, request, install_scheduler, scheduler_units
 
 ROOT = Path("/opt/marinos-appbox-agent")
 STATE = Path("/var/lib/marinos-appbox-updater")
@@ -320,6 +320,21 @@ class Supervisor:
 
     def tick(self):
         state = self.load()
+        if (state and state['phase'] == 'success' and state.get('reported')
+                and state.get('controller_handed_off')
+                and Path(state['candidate']) == self.controller
+                and (self.root / 'current').resolve() == self.controller):
+            try:
+                ready = install_scheduler(self.controller, self.root, self.state_dir, self.units, self.ctl)
+            except Exception:
+                # Unit recovery failure is not a broken controller: retain this
+                # confirmed release to replay migration on the next fast tick.
+                atomic_json(self.state_dir / 'scheduler-error.json', {'error_code':'scheduler_setup_failed'})
+                self.ctl('--no-block', 'start', 'marinos-appbox-updater.timer')
+                return
+            if not ready:
+                return  # finish/recover unit migration before accepting another candidate
+            (self.state_dir / 'scheduler-error.json').unlink(missing_ok=True)
         if state and (state["phase"] not in TERMINAL or not state.get("reported")):
             self.step(state)
             return
@@ -458,6 +473,7 @@ def main():
         for name, expected in manifest['files'].items():
             if digest((release / name).read_bytes()) != expected:
                 raise RuntimeError('Candidate file mismatch')
+        scheduler_units(release, release.parent.parent)
         print(json.dumps({'launcher_abi':LAUNCHER_ABI, 'helper_sha256':digest(Path(__file__).read_bytes())}))
         return
     if os.name != "posix" or os.geteuid() != 0:

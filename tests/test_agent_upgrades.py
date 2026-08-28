@@ -562,6 +562,8 @@ config={'node_id':'testnode'}
 if action=='stage':
     c.SPOOL=spool; c.request=transport
     c.stage_upgrade(config,{'operation_id':json.loads(cpfile.read_text())['operation']['operation_id']})
+elif action=='schedule':
+    c.reconcile_scheduler(root,state,spool,units,ctl)
 else:
     supervisor=h.Supervisor(config,root,state,spool,ctl,transport,lambda:1000.0,units=units)
     getattr(supervisor,action)()
@@ -651,11 +653,18 @@ def test_managed_chain_uses_new_helper_client_contract_without_bootstrap(chain):
         assert cp()['operation']['phase']=='success'
         assert Path(mapping()['controller'])==candidate
         assert previous.is_dir()
+        assert dispatch()  # confirmed controller adopts its versioned scheduler
+        run(candidate, 'schedule')
+        scheduler=json.loads((area/'state'/'scheduler.json').read_text())
+        assert scheduler['release']==str(candidate) and scheduler['phase']=='complete'
+        dropin=units/'marinos-appbox-updater.service.d'/'30-adaptive-scheduler.conf'
+        assert (candidate/'upgrade_client.py').as_posix() in dropin.read_text()
+        assert cp()['systemd'][-1]==['--no-block','stop','marinos-appbox-updater.timer']
         previous=candidate
     assert first.is_dir()
     assert (root/'upgrade_launcher.py').read_bytes()==fixed
-    for name in ('marinos-appbox-updater.service','marinos-appbox-updater.timer'):
-        assert (units/name).read_bytes()==(SOURCE/name).read_bytes()
+    assert (units/'marinos-appbox-updater.service').read_bytes()==(SOURCE/'marinos-appbox-updater.service').read_bytes()
+    assert (units/'marinos-appbox-updater.timer').read_bytes()==(SOURCE/'marinos-appbox-updater.timer').read_bytes().replace(b'\r\n',b'\n')
     assert (area/'agent.json').read_bytes()==b'{"token":"unchanged","node_id":"testnode"}'
     assert not (root/'helper').exists()
 
@@ -665,6 +674,9 @@ def test_broken_candidate_helper_rolls_back_complete_previous_release(chain):
     previous_unit=(units/helper.SERVICE).read_bytes()
     previous_files={p.name:p.read_bytes() for p in first.iterdir() if p.is_file()}
     request(package(1,broken='runtime'),1)
+    assert client.install_scheduler(first,root,area/'state',units,Mock(return_value='active'))
+    run(first,'schedule')
+    assert cp()['systemd'][-1]==['--no-block','start','marinos-appbox-updater.timer']
     dispatch()
     candidate=Path(mapping()['current'])
     announce(candidate,'11-new')  # agent is healthy; helper itself is broken
@@ -680,11 +692,14 @@ def test_broken_candidate_helper_rolls_back_complete_previous_release(chain):
     assert {p.name:p.read_bytes() for p in first.iterdir() if p.is_file()}==previous_files
     assert candidate.is_dir()  # retained for diagnosis; never used as rollback controller
     assert cp()['systemd'].count(['daemon-reload'])==2
+    run(first,'schedule')
+    assert cp()['systemd'][-1]==['--no-block','stop','marinos-appbox-updater.timer']
 
 
 def test_unimportable_candidate_cannot_disable_launcher_rescue(chain):
     area,root,units,first,package,request,announce,mapping,cp,run,dispatch,fixed=chain
     request(package(1,broken='runtime'),1)
+    assert client.install_scheduler(first,root,area/'state',units,Mock(return_value='active'))
     dispatch()
     candidate=Path(mapping()['current'])
     # Simulate a dispatcher/controller failure with the active capsule still armed.
@@ -701,6 +716,8 @@ def test_unimportable_candidate_cannot_disable_launcher_rescue(chain):
     announce(first,'12-restored')
     dispatch()
     assert cp()['operation']['phase']=='rolled_back'
+    run(first,'schedule')  # post hook still works despite broken candidate/controller
+    assert cp()['systemd'][-1]==['--no-block','stop','marinos-appbox-updater.timer']
 
 
 def test_package_includes_dispatcher_abi_and_managed_components(artifact):
@@ -804,3 +821,290 @@ def test_recovery_does_not_reset_rollback_deadline(supervisor):
     clock[0]+=50
     sup.recover()
     assert sup.load()['rollback_deadline']==deadline
+
+
+@pytest.fixture
+def scheduler(tmp_path, artifact):
+    root=tmp_path/'root'; state=tmp_path/'state'; spool=tmp_path/'spool'; units=tmp_path/'units'
+    for folder in (state,spool,units): folder.mkdir()
+    release,_=contract.prepare_release(root/'releases',artifact[0],contract.digest(artifact[0]))
+    timer=client.UPDATER+'.timer'; watcher=client.UPDATER+'.path'
+    old_timer=(SOURCE/timer).read_bytes().replace(b'OnActiveSec=5s\n',b'').replace(b'OnActiveSec=5s\r\n',b'')
+    (units/timer).write_bytes(old_timer)
+    (units/(client.UPDATER+'.service')).write_bytes((SOURCE/(client.UPDATER+'.service')).read_bytes())
+    config=tmp_path/'agent.json'; config.write_bytes(b'{"token":"unchanged"}')
+    systemd={'enabled':{timer}, 'active':{timer}, 'calls':[], 'ready':True}
+    def ctl(*args):
+        systemd['calls'].append(args)
+        command=list(args)
+        if command[0]=='--no-block': command.pop(0)
+        action,*names=command
+        if action=='is-enabled':
+            return 'enabled' if names[0] in systemd['enabled'] else 'disabled'
+        if action=='is-active':
+            if names[0] in systemd['active']: return 'active'
+            raise RuntimeError('inactive')
+        if action=='enable': systemd['enabled'].update(names)
+        if action=='disable':
+            names=[n for n in names if n!='--now']
+            systemd['enabled'].difference_update(names); systemd['active'].difference_update(names)
+        if action in {'start','restart'}:
+            systemd['active'].update(n for n in names if n!=watcher or systemd['ready'])
+        if action=='stop': systemd['active'].difference_update(names)
+        return ''
+    def install(): return client.install_scheduler(release,root,state,units,ctl)
+    def reconcile(): return client.reconcile_scheduler(root,state,spool,units,ctl)
+    return root,state,spool,units,release,systemd,ctl,install,reconcile,old_timer,config
+
+
+def test_scheduler_idle_boot_check_then_no_fast_timer(scheduler):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,old_timer,config=scheduler
+    assert install()
+    assert not reconcile()
+    assert systemd['active']=={client.UPDATER+'.path'}
+    assert client.UPDATER+'.timer' in systemd['enabled']  # boot recovery remains enabled
+    # Model systemd starting enabled units on reboot, then executing its boot tick.
+    systemd['active']=systemd['enabled'].copy()
+    assert client.UPDATER+'.timer' in systemd['active']
+    assert not reconcile()
+    assert systemd['active']=={client.UPDATER+'.path'}
+    assert config.read_bytes()==b'{"token":"unchanged"}'
+
+
+@pytest.mark.parametrize('phase', ['installing','restarting','awaiting_heartbeat','rolling_back'])
+def test_scheduler_active_and_reboot_keep_reconciliation_independent_of_agent(scheduler,phase):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    assert install()
+    contract.atomic_json(state/'state.json',{'phase':phase,'reported':True})
+    assert reconcile()
+    systemd['active']=systemd['enabled'].copy()  # no running agent required
+    assert reconcile()
+    assert client.UPDATER+'.timer' in systemd['active']
+    assert not any(helper.SERVICE in call for call in systemd['calls'])
+
+
+@pytest.mark.parametrize('phase', sorted(contract.TERMINAL))
+def test_scheduler_terminal_only_sleeps_after_durable_cp_ack(scheduler,monkeypatch,phase):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    assert install()
+    resolve=Path.resolve
+    monkeypatch.setattr(Path,'resolve',lambda self,*a,**kw: release if self==root/'controller' else resolve(self,*a,**kw))
+    capsule={'phase':phase,'reported':False,'candidate':str(release),'controller_handed_off':True}
+    contract.atomic_json(state/'state.json',capsule)
+    assert reconcile()
+    capsule.update(reported=True,events=[{'phase':phase}])
+    contract.atomic_json(state/'state.json',capsule)
+    assert reconcile()  # never discard a pending notification
+    capsule['events']=[]
+    contract.atomic_json(state/'state.json',capsule)
+    assert not reconcile()
+    assert client.UPDATER+'.timer' not in systemd['active']
+
+
+def test_scheduler_request_during_idle_transition_remains_recoverable(scheduler,monkeypatch):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    assert install()
+    pending=client.scheduler_pending
+    def raced(*args):
+        result=pending(*args)
+        contract.atomic_json(spool/'request.json',{'operation_id':'new-durable-request'})
+        return result
+    monkeypatch.setattr(client,'scheduler_pending',raced)
+    assert not reconcile()
+    monkeypatch.setattr(client,'scheduler_pending',pending)
+    # PathChanged records this write independently of timer state. Its next service
+    # activation re-reads durable state; Linux inotify/job ordering remains E2E.
+    assert reconcile()
+    assert client.UPDATER+'.timer' in systemd['active']
+    watcher=(units/(client.UPDATER+'.path')).read_text()
+    assert 'PathChanged=/var/lib/marinos-appbox-agent/upgrades/request.json' in watcher
+    assert 'PathExists=' not in watcher  # a still-present download must not busy-loop
+
+
+def test_scheduler_migrates_old_timer_and_preserves_fixed_service_and_config(scheduler):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,old_timer,config=scheduler
+    service=units/(client.UPDATER+'.service'); fixed=service.read_bytes()
+    assert b'OnActiveSec=' not in old_timer
+    assert install()
+    assert (units/(client.UPDATER+'.timer')).read_bytes()==(release/(client.UPDATER+'.timer')).read_bytes()
+    assert service.read_bytes()==fixed and config.read_bytes()==b'{"token":"unchanged"}'
+    assert ('daemon-reload',) in systemd['calls']
+    assert not reconcile()
+    before=list(systemd['calls'])
+    assert install() and systemd['calls']==before  # no repeated unit writes/reloads
+
+
+def test_scheduler_waits_for_async_watcher_activation(scheduler):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    systemd['ready']=False
+    assert not install()
+    record=json.loads((state/'scheduler.json').read_text())
+    assert record['phase']=='activating' and record['error_code'] is None
+    assert reconcile()  # remains fast until watcher ready, no premature idle
+    assert systemd['calls'].count(('daemon-reload',))==1
+    systemd['ready']=True
+    assert not reconcile()
+    assert json.loads((state/'scheduler.json').read_text())['phase']=='complete'
+
+
+@pytest.mark.parametrize('failure', ['daemon-reload','enable','watcher_timeout'])
+def test_scheduler_migration_failure_restores_units_and_retries(scheduler,monkeypatch,failure):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,old_timer,_=scheduler
+    if failure=='watcher_timeout':
+        systemd['ready']=False
+        assert not install()
+        deadline=json.loads((state/'scheduler.json').read_text())['activation_deadline']
+        monkeypatch.setattr(client.time,'time',lambda:deadline)
+        assert not install()
+    else:
+        failed=False
+        def failing(*args):
+            nonlocal failed
+            if args[0]==failure and not failed:
+                failed=True
+                raise RuntimeError('injected systemd error')
+            return ctl(*args)
+        assert not client.install_scheduler(release,root,state,units,failing)
+    assert (units/(client.UPDATER+'.timer')).read_bytes()==old_timer
+    assert not (units/(client.UPDATER+'.path')).exists()
+    assert not (units/(client.UPDATER+'.service.d')/'30-adaptive-scheduler.conf').exists()
+    assert client.UPDATER+'.timer' in systemd['active']
+    assert json.loads((state/'scheduler.json').read_text())['phase']=='retry'
+    systemd['ready']=True
+    assert install() and not reconcile()
+
+
+def test_scheduler_migration_replays_after_interrupted_reload(scheduler):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    def power_loss(*args):
+        if args==('daemon-reload',): raise SystemExit('simulated power loss')
+        return ctl(*args)
+    with pytest.raises(SystemExit):
+        client.install_scheduler(release,root,state,units,power_loss)
+    assert json.loads((state/'scheduler.json').read_text())['phase']=='prepared'
+    systemd['active']=systemd['enabled'].copy()
+    assert not reconcile()  # replay transaction and return idle
+    assert json.loads((state/'scheduler.json').read_text())['phase']=='complete'
+    assert ('daemon-reload',) in systemd['calls']
+
+
+def test_scheduler_failed_replacement_restores_previous_dropin(scheduler):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    assert install()
+    previous={name:(units/name).read_bytes() for name in client.scheduler_units(release,root)}
+    record=json.loads((state/'scheduler.json').read_text())
+    record['release']='previous-scheduler-release'  # model a later managed migration
+    contract.atomic_json(state/'scheduler.json',record)
+    failed=False
+    def failing(*args):
+        nonlocal failed
+        if args[0]=='enable' and not failed:
+            failed=True
+            raise RuntimeError('enable failure')
+        return ctl(*args)
+    assert not client.install_scheduler(release,root,state,units,failing)
+    assert {name:(units/name).read_bytes() for name in previous}==previous
+    assert client.UPDATER+'.path' in systemd['active']
+    assert client.UPDATER+'.timer' in systemd['active']
+    assert install()
+
+
+def test_scheduler_replays_interrupted_unit_rollback(scheduler,monkeypatch):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,old_timer,_=scheduler
+    atomic=client.atomic_file
+    crashed=False
+    def interrupted(path,data):
+        nonlocal crashed
+        if data==old_timer and not crashed:
+            crashed=True
+            raise SystemExit('power loss during rollback')
+        return atomic(path,data)
+    monkeypatch.setattr(client,'atomic_file',interrupted)
+    def failing(*args):
+        if args[0]=='enable': raise RuntimeError('enable failed')
+        return ctl(*args)
+    with pytest.raises(SystemExit):
+        client.install_scheduler(release,root,state,units,failing)
+    assert json.loads((state/'scheduler.json').read_text())['phase']=='rollback_pending'
+    assert not install()
+    assert (units/(client.UPDATER+'.timer')).read_bytes()==old_timer
+    assert json.loads((state/'scheduler.json').read_text())['phase']=='retry'
+    assert install() and not reconcile()
+
+
+def test_scheduler_corrupt_state_keeps_recovery_timer(scheduler):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    assert install()
+    (state/'state.json').write_text('{damaged')
+    assert reconcile()
+    assert client.UPDATER+'.timer' in systemd['active']
+
+
+def test_scheduler_old_rescue_terminal_does_not_require_candidate_code(scheduler,monkeypatch):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    assert install()
+    # The service post hook is pinned to a confirmed release, not current/controller.
+    contract.atomic_json(state/'state.json',{'phase':'rolled_back','reported':True})
+    assert not reconcile()
+    hook=(units/(client.UPDATER+'.service.d')/'30-adaptive-scheduler.conf').read_text()
+    assert (release/'upgrade_client.py').as_posix() in hook
+    assert '/current/' not in hook and '/controller/' not in hook
+
+
+@pytest.mark.parametrize('mode', ['free','busy'])
+def test_scheduler_lock_serializes_with_launcher_without_traceback(tmp_path,mode):
+    code=r'''
+import errno, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0,sys.argv[1])
+import upgrade_client as c
+c.UPDATER_STATE=Path(sys.argv[2])
+c.os=SimpleNamespace(name='posix',geteuid=lambda:0)
+def flock(lock,flags):
+    assert flags==6
+    if sys.argv[3]=='busy': raise BlockingIOError(errno.EAGAIN,'busy')
+sys.modules['fcntl']=SimpleNamespace(LOCK_EX=2,LOCK_NB=4,flock=flock)
+c.reconcile_scheduler=lambda:print('reconcile')
+c.scheduler_systemctl=lambda *args:None
+c.scheduler_main()
+'''
+    result=subprocess.run([sys.executable,'-I','-B','-c',code,str(SOURCE),str(tmp_path),mode],
+                          capture_output=True,text=True,timeout=15)
+    assert result.returncode==0 and result.stderr==''
+    assert result.stdout==('reconcile\n' if mode=='free' else '')
+
+
+def test_scheduler_rejects_unvalidated_or_arbitrary_units(scheduler):
+    root,state,spool,units,release,systemd,ctl,install,reconcile,_,_=scheduler
+    timer=release/(client.UPDATER+'.timer')
+    timer.write_bytes(timer.read_bytes()+b'\n[Service]\nExecStart=/bin/sh bad\n')
+    with pytest.raises(ValueError,match='checksum'): install()
+    manifest=json.loads((release/'agent-manifest.json').read_text())
+    manifest['files'][timer.name]=contract.digest(timer.read_bytes())
+    contract.atomic_json(release/'agent-manifest.json',manifest)
+    with pytest.raises(ValueError,match='Unsupported adaptive timer'): install()
+    assert not (state/'scheduler.json').exists()
+    assert systemd['calls']==[]
+
+
+def test_scheduler_setup_failure_does_not_discard_confirmed_controller(chain,monkeypatch):
+    area,root,units,first,package,request,announce,mapping,cp,run,dispatch,fixed=chain
+    request(package(1),1)
+    dispatch()
+    candidate=Path(mapping()['current'])
+    announce(candidate,'11-new')
+    dispatch()
+    assert cp()['operation']['phase']=='success'
+    ctl=Mock(return_value='active')
+    sup=helper.Supervisor({'node_id':'testnode'},root,area/'state',area/'spool',ctl,
+                          units=units,controller=candidate)
+    monkeypatch.setattr(helper,'install_scheduler',Mock(side_effect=OSError('unit recovery I/O failure')))
+    sup.tick()
+    assert Path(mapping()['controller'])==candidate
+    assert ctl.call_args_list==[(('--no-block','start','marinos-appbox-updater.timer'),)]
+    error=area/'state/scheduler-error.json'
+    assert json.loads(error.read_text())=={'error_code':'scheduler_setup_failed'}
+    monkeypatch.setattr(helper,'install_scheduler',Mock(return_value=True))
+    sup.tick()
+    assert not error.exists()

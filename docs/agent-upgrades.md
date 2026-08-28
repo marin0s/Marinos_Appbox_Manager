@@ -27,13 +27,15 @@ par checksum au démarrage de l'opération. L'agent et le helper vérifient chac
 la liste exacte des fichiers, leur type régulier, les doublons, le manifeste, les hashes
 et la syntaxe Python. Taille archive et contenu décompressé limités à 8 Mio. Ni traversal,
 ni liens, ni fichiers spéciaux, ni script supplémentaire. Aucun `extractall`, aucune
-exécution de `install-agent.sh` ou d'un hook fourni par le ZIP lors de l'upgrade.
-Seul le point d'entrée agent fixe est démarré par systemd après validation.
+exécution de `install-agent.sh` ou d'un hook arbitraire fourni par le ZIP lors de l'upgrade.
+Les entrées agent, lanceur et réconciliation systemd sont définies par le code validé.
 
 La logique d'upgrade est désormais versionnée : `upgrade_helper.py`, `upgrade_client.py`
 et `upgrade_contract.py` évoluent avec chaque release. La comparaison octet pour octet
 avec trois modules installés hors releases a été supprimée. Seuls le petit
-`upgrade_launcher.py` et son service/timer restent fixes après bootstrap.
+`upgrade_launcher.py` et l'unité de base de son service restent fixes après bootstrap.
+Le timer, le réveil événementiel et le drop-in de réconciliation évoluent depuis une
+release confirmée, selon la procédure décrite ci-dessous.
 
 ### Dispatch et récupération indépendants
 
@@ -88,11 +90,25 @@ une mise à jour déjà confirmée. Cela évite un rollback tardif destructeur p
   essentielles restent obligatoires. Pas d'ExecStartPre/ExecStopPost, de shell ou
   d'EnvironmentFile fourni par le ZIP. Une extension du contrat peut être livrée dans
   une release intermédiaire compatible avant d'utiliser de nouvelles directives.
-- `marinos-appbox-updater.service` et `.timer` restent fixes : ils invoquent uniquement le
-  lanceur, conservent ses répertoires writable et bornent les enfants à 150 s chacun (330 s
-  pour le oneshot, secours compris). Le timer continue même si l'agent ou le helper candidat
-  est cassé. La candidate ne peut donc pas désactiver la voie de secours en remplaçant ces
-  unités. Les copies présentes dans le ZIP servent au bootstrap, pas aux upgrades suivants.
+- L'unité de base `marinos-appbox-updater.service` reste fixe : ExecStart appelle seulement
+  le lanceur, avec ses répertoires writable et une limite de 150 s par enfant (330 s pour
+  le oneshot, secours compris). Le lanceur fixe n'est pas remplacé à distance.
+- Le timer `.timer`, une unité `.path` et le seul drop-in géré
+  `marinos-appbox-updater.service.d/30-adaptive-scheduler.conf` sont installés atomiquement
+  fichier par fichier **après** confirmation du nouvel agent, probe du helper et transfert
+  de controller. Les octets précédents sont sauvegardés dans `scheduler.json`, avant toute
+  écriture. Un échec restaure ces octets, recharge systemd et conserve la cadence de reprise.
+  Une transaction interrompue reprend depuis ce journal au tick/boot suivant.
+- Le drop-in ajoute uniquement `ExecStopPost` vers `upgrade_client.py schedule` d'une
+  **release confirmée précise**, conservée sur disque, et un TimeoutStopSec de 90 s.
+  Il ne suit ni current ni controller : un ancien rescue peut terminer son travail et
+  revenir en idle sans importer une candidate cassée. L'ExecStart du secours est intact.
+  Les directives du timer sont validées dans le probe avant confirmation ; les unités
+  path/drop-in sont générées par le code connu, jamais extraites d'un script arbitraire.
+- `daemon-reload` accompagne installation/restauration. Les start/stop/restart du timer
+  et du watcher utilisent `--no-block` : leurs dépendances d'ordre envers le oneshot
+  empêchent d'attendre synchroniquement leur activation depuis ce même oneshot.
+  Le timer rapide ne s'arrête qu'après vérification de l'activation du watcher.
 - Les drop-ins locaux sont conservés. Un ExecStart personnalisé doit être résolu pendant
   le bootstrap initial, puisqu'il masquerait l'unité versionnée. Les overrides ajoutés
   ultérieurement par un opérateur restent de sa responsabilité et sont à auditer en E2E.
@@ -114,14 +130,75 @@ une mise à jour déjà confirmée. Cela évite un rollback tardif destructeur p
 | `/var/lib/marinos-appbox-agent/upgrades/` | Demande durable, téléchargement et candidate préparée |
 | `/var/lib/marinos-appbox-updater/state.json` | Previous/candidate, délais, phase, confirmation et notifications non acquittées |
 | `/var/lib/marinos-appbox-updater/bootstrap.json` | Reprise du bootstrap avec le même artefact et node |
+| `/var/lib/marinos-appbox-updater/scheduler.json` | Release de scheduling, sauvegardes des unités et progression de leur migration |
+| `/var/lib/marinos-appbox-updater/scheduler-error.json` | Code générique si la préparation/reprise des unités échoue ; effacé après réparation |
 | `/etc/systemd/system/marinos-appbox-agent.service` | Copie atomique de managed-agent.service de la release active |
 | `/var/lib/marinos-appbox-updater/legacy-agent.service` | Unité historique sauvegardée au bootstrap |
 
-Le timer `marinos-appbox-updater.timer` démarre 15 s après boot puis 5 s après chaque
-exécution du service oneshot. Le lanceur détient flock et le contrôleur est root, sans PartOf/Requires
+Le lanceur détient flock et le contrôleur est root, sans PartOf/Requires
 sur l'agent. Le service agent reste root avec ses restrictions de filesystem existantes.
 Seul le helper peut écrire dans `/opt` depuis son service ; le service agent prépare
 dans son répertoire writable habituel. Le helper ne stoppe aucun conteneur Docker.
+
+### Idle, événements et reprise au boot
+
+L'ancien `OnUnitInactiveSec=5s` réarmait le timer après **chaque** oneshot, y compris
+un tick sans opération : il expliquait les lancements Python et les logs permanents.
+La nouvelle politique conserve cette cadence uniquement lorsqu'il reste du travail.
+
+| Situation | Réveil/réconciliation |
+| --- | --- |
+| Idle | `.path` actif, `.timer` **inactive mais enabled**, aucun Python de supervision lancé périodiquement |
+| Nouvelle demande | `PathChanged` sur `/var/lib/marinos-appbox-agent/upgrades/request.json` lance le oneshot |
+| Téléchargement, activation, confirmation, rollback | Timer actif, nouvelle réconciliation environ 5 s après fin du oneshot, indépendamment du service agent |
+| Résultat terminal non acquitté / notifications en attente | Cadence rapide conservée ; aucune notification abandonnée |
+| Résultat terminal acquitté et handoff/migration achevés | ExecStopPost arrête le timer ; watcher toujours actif |
+| Boot | Unités enabled redémarrées ; un premier tick relit l'état durable, continue si nécessaire, sinon arrête le timer |
+
+Le timer conserve `OnBootSec=15s`, ajoute `OnActiveSec=5s` pour amorcer une activation,
+et conserve `OnUnitInactiveSec=5s` et `AccuracySec=1s`. Au boot, OnActiveSec peut donc
+déclencher le premier contrôle avant les 15 s. Il ne s'agit pas d'un polling idle ralenti.
+Aucun daemon supplémentaire, ni appel systemctl dans les boucles de l'agent.
+
+La demande est déjà écrite atomiquement et synchronisée **avant** téléchargement ; le CP
+reste l'autorité sur son état. Le watcher utilise `PathChanged`, pas `PathExists` : une
+demande qui reste présente pendant un téléchargement n'entraîne pas de boucle immédiate.
+Une écriture concurrente à la transition idle est conservée par le watcher et par le
+fichier durable ; systemd réévalue les événements après la fin du service. La suppression
+de la demande peut occasionner un dernier tick sans travail, puis le système dort.
+Ce comportement repose sur les sémantiques [systemd.path](https://raw.githubusercontent.com/systemd/systemd/v252/man/systemd.path.xml)
+et [ExecStopPost](https://raw.githubusercontent.com/systemd/systemd/v252/man/systemd.service.xml).
+Le spool doit être sur un filesystem **local**, pas un partage NFS modifié à distance.
+
+Le post-traitement prend le même flock que le lanceur/bootstrap. Une contention conserve
+la possibilité de reprise et quitte sans traceback ; il ne lance aucun controller/rescue.
+Un état illisible conserve le timer rapide pour permettre diagnostic/récupération. Un
+défaut de migration ne déclenche pas un rollback tardif de l'agent déjà confirmé et ne
+remplace pas son contrôleur par rescue : la migration reste à reprendre.
+
+### Migration automatique depuis les nodes au timer 5 s
+
+1. Le contrôleur déjà installé active ce package par le protocole existant ; la liste
+   stricte des fichiers ZIP, `protocol=1` et `launcher_abi=1` sont inchangés. `.path` et
+   drop-in sont générés depuis le module client livré, sans ajouter d'entrée ZIP que
+   l'ancien validateur refuserait.
+2. Après heartbeat confirmé, probe et acquittement CP, controller passe à la nouvelle
+   release. Le prochain tick de l'ancien timer exécute ce nouveau helper.
+3. Il journalise les unités précédentes, remplace les fichiers, fait daemon-reload,
+   active path/timer et vérifie le watcher. La vérification peut nécessiter un tick
+   supplémentaire, les activations étant asynchrones. L'état local passe de `prepared`
+   à `activating`, puis `complete`. Une activation non confirmée sous 60 s restaure les
+   unités et passe par `rollback_pending` puis `retry`, en gardant un timer de reprise.
+4. Le post-traitement revient en idle. Aux versions suivantes, la même transaction
+   remplace le scheduling par celui de la nouvelle release confirmée. Aucune intervention
+   SSH, bootstrap, modification de agent.json ni migration SQLite pour ce correctif.
+
+`phase=success` au CP confirme l'agent ; elle peut précéder de quelques ticks la fin
+de cette migration locale. Vérifier `scheduler.json.phase=complete` et les unités pour
+valider le passage en idle. Une migration encore en erreur garde volontairement les
+réveils rapides et diffère l'activation de la prochaine candidate jusqu'à sa résolution.
+Un bootstrap legacy qui échoue avant toute release confirmée conserve l'ancien mode
+de supervision ; il ne doit pas installer du scheduling depuis une candidate non validée.
 
 ## Phases et délais
 
@@ -232,7 +309,9 @@ il contient les délais et la cible de rollback. Une panne réseau peut laisser 
 agent restauré mais non confirmé : `rollback_failed` ne signifie pas forcément que son
 processus est arrêté. Vérifier systemd et le heartbeat avant toute nouvelle tentative.
 
-En dernier recours opérateur, arrêter le timer **et** son oneshot, puis le service agent,
+En dernier recours opérateur, neutraliser temporairement **path et timer** (masque runtime),
+puis arrêter le oneshot et le service agent. Le masque évite qu'ExecStopPost ou une demande
+réactive le timer pendant l'intervention. Ensuite,
 et restaurer current vers le chemin previous vérifié, via symlink temporaire + rename
 sur le même filesystem. Restaurer aussi atomiquement l'unité précédente sauvegardée en
 base64 dans `state.json.previous_unit`, puis exécuter `systemctl daemon-reload` avant de
@@ -242,6 +321,10 @@ au legacy restaure atomiquement l’unité sauvegardée dans `legacy-agent.servi
 effectue daemon-reload et restart agent, après vérification des fichiers legacy. Ne pas supprimer les autres drop-ins,
 les releases ni la configuration. Le rollback du CP vers une version antérieure requiert
 également l'ancien agent ou une validation explicite de compatibilité du protocole.
+Après réparation, enlever les masques runtime du watcher/timer et les redémarrer ;
+laisser le superviseur relire les journaux. Ne pas supprimer scheduler.json pour masquer
+une migration incomplète. Le rollback automatique d'une candidate ne touche pas au
+scheduler de la précédente release confirmée.
 
 ## Validation N → N+1 sur infrastructure, ultérieure et autorisée
 
@@ -267,6 +350,64 @@ les releases ni la configuration. Le rollback du CP vers une version antérieure
 Les tests Python locaux couvrent le contrat, le CP, l'agent préparateur, les états du
 helper, les refus et la reprise. Sous Windows, systemd et les symlinks sont simulés
 (création de symlink non autorisée) ; ces tests ne prouvent pas l'intégration Linux.
+
+### Recette ARTEMIS du scheduling adaptatif
+
+Le test managed avec le ZIP `a1f37e34f427a4278fc20367aa443f6226e7ba32eb03a4f82d487e85e5766662`
+est rapporté réussi sur ARTEMIS par l'opérateur. Le correctif suivant reste à valider
+sur Linux ; aucune connexion ni recette terrain n'a été réalisée pour son développement.
+
+1. Avant livraison autorisée du CP/package, relever le hash de agent.json (sans afficher
+   son contenu), current/previous/controller/rescue, MainPID et l'état de Plex :
+
+   ```sh
+   sha256sum /etc/marinos-appbox-agent/agent.json
+   readlink -f /opt/marinos-appbox-agent/current
+   readlink -f /opt/marinos-appbox-agent/previous
+   readlink -f /opt/marinos-appbox-agent/controller
+   readlink -f /opt/marinos-appbox-agent/rescue
+   systemctl show marinos-appbox-agent.service -p MainPID
+   docker inspect --format '{{.State.Status}} {{.RestartCount}} {{.State.StartedAt}}' plex-e2eref01
+   ```
+
+   Adapter uniquement le nom du conteneur à celui effectivement présent.
+2. Livrer le CP/package de recette après autorisation ; vérifier le nouveau SHA/build
+   proposé dans l'UI puis déclencher **une seule** mise à jour manuelle. Aucun bootstrap
+   et aucune commande systemctl de migration à effectuer sur le node.
+3. Attendre `success`, puis quelques ticks. Contrôler :
+
+   ```sh
+   cat /var/lib/marinos-appbox-updater/scheduler.json
+   systemctl cat marinos-appbox-updater.service marinos-appbox-updater.timer marinos-appbox-updater.path
+   systemctl show marinos-appbox-updater.timer marinos-appbox-updater.path -p Id -p ActiveState -p UnitFileState
+   systemctl show marinos-appbox-updater.service -p Result -p ExecMainStartTimestampMonotonic
+   ```
+
+   Attendus : migration complete, drop-in épinglé à la release confirmée, timer
+   enabled/inactive, path enabled/active, service oneshot inactif avec dernier résultat
+   success. Nouveau PID, agent.json inchangé, Plex toujours running, RestartCount=0 et
+   StartedAt inchangé, previous conservé. Ne pas publier les sauvegardes locales d'unités
+   si un opérateur y a ajouté des informations privées.
+4. Attendre **10 minutes** sans upgrade. La valeur ExecMainStartTimestampMonotonic
+   ne doit pas avancer ; vérifier les journaux depuis le début de cette période :
+   `journalctl -u marinos-appbox-updater.service --since '<date de début>' --no-pager`.
+   Aucun retour de lancements toutes les 5 s.
+5. Publier ensuite un autre artefact managed distinct : le watcher doit réveiller le
+   superviseur, la cadence rapide doit revenir pendant l'opération, puis disparaître
+   après success. Aucun SSH de migration entre ces deux releases.
+6. En fenêtre de maintenance autorisée : reboot en idle (contrôle unique puis idle),
+   puis reboot en préparation/attente de heartbeat/rollback sur une recette sacrifiable.
+   Vérifier les deadlines non réinitialisées, la reprise sans agent disponible, puis le
+   retour idle après acquittement terminal. Tester également une coupure CP : les
+   notifications non acquittées doivent conserver la reprise rapide.
+7. Sur recette sacrifiable : candidate sans confirmation, helper cassé et migration
+   d'unité interrompue. Vérifier previous/rescue, restauration des unités, absence de
+   changement Plex/config, et scheduling encore utilisable. Contrôler la course entre
+   écriture de request.json et arrêt du timer, ainsi que les éventuels overrides locaux.
+
+Les étapes avec reboot/échec injecté sont distinctes du test non destructif ARTEMIS.
+Un problème de filesystem, de droits systemd, un watcher en échec ou un journal corrompu
+peut conserver la cadence rapide : examiner scheduler.json/error, ne pas forcer l'idle.
 
 ## Limites de sécurité séparées
 
