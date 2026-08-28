@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume and supervise Marinos AppBox upgrades across agent exits and reboot
+
+[Timer]
+OnBootSec=15s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=marinos-appbox-updater.service
+
+[Install]
+WantedBy=timers.target

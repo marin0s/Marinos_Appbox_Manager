@@ -398,3 +398,43 @@ async function pollAvailability(id){
  }finally{setTimeout(()=>pollAvailability(id),5000);}
 }
 for(const id of new Set([...$$('[data-node-liveness]'),...$$('[data-node-placement]')].map(el=>el.dataset.nodeLiveness||el.dataset.nodePlacement)))pollAvailability(id);
+
+
+// Upgrade progress never overrides heartbeat liveness or metrics freshness.
+(() => {
+ const panels = [...document.querySelectorAll('[data-agent-upgrade]')];
+ const phases = {queued:'en attente',downloading:'téléchargement',verifying:'vérification',
+  prepared:'candidate préparée',installing:'installation',restarting:'redémarrage',
+  awaiting_heartbeat:'attente heartbeat',success:'terminé',rolling_back:'rollback en cours',
+  rolled_back:'échec — ancienne release restaurée',upgrade_failed:'échec',rollback_failed:'retour ancien agent non confirmé'};
+ async function refresh(panel) {
+  try {
+   const response = await fetch(`/api/nodes/${encodeURIComponent(panel.dataset.agentUpgrade)}/agent-upgrade`);
+   if (!response.ok) throw new Error('État upgrade indisponible');
+   const state = await response.json();
+   panel.querySelector('[data-upgrade-installed]').textContent = state.installed_version || 'Inconnu';
+   panel.querySelector('[data-upgrade-available]').textContent = state.available_version || 'Package indisponible';
+   panel.querySelector('[data-upgrade-status]').textContent = `${state.status} — ${phases[state.phase] || '—'}${state.error_code ? ' : '+state.error_code : ''}${state.restart_expected ? ' (restart attendu, heartbeat surveillé)' : ''}`;
+   panel.querySelector('[data-upgrade-bootstrap]').hidden = !state.bootstrap_required;
+   panel.querySelector('button').disabled = !state.can_upgrade;
+  } catch (error) { panel.querySelector('[data-upgrade-error]').textContent = error.message; }
+ }
+ for (const panel of panels) {
+  panel.querySelector('form').addEventListener('submit', async event => {
+   event.preventDefault();
+   if (!confirm('Mettre à jour cet agent ? Les opérations AppBox seront suspendues pendant la mise à jour.')) return;
+   panel.querySelector('button').disabled = true;
+   panel.querySelector('[data-upgrade-error]').textContent = '';
+   try {
+    const response = await fetch(event.currentTarget.action, {method:'POST'});
+    if (!response.ok) {
+     const payload = await response.json();
+     throw new Error(payload.detail || 'Upgrade refusé');
+    }
+   } catch (error) { panel.querySelector('[data-upgrade-error]').textContent = error.message; }
+   await refresh(panel);
+  });
+  refresh(panel);
+ }
+ if (panels.length) setInterval(() => panels.forEach(refresh), 5000);
+})();

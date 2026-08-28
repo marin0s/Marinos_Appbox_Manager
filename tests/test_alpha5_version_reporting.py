@@ -5,7 +5,7 @@ import tempfile
 import subprocess
 import sys
 from pathlib import Path
-from scripts.package_agent import FILES, package_bytes
+from scripts.package_agent import FILES, MANIFEST, package_bytes
 
 from app import main
 
@@ -53,7 +53,7 @@ class Alpha5VersionReportingTests(unittest.TestCase):
                 (source / name).write_bytes(data.replace(b"\n", b"\r\n"))
             self.assertEqual(package_bytes(source), package_bytes(AGENT_PATH.parent))
             with zipfile.ZipFile(AGENT_ARCHIVE_PATH) as archive:
-                self.assertEqual(sorted(archive.namelist()), sorted(FILES))
+                self.assertEqual(sorted(archive.namelist()), sorted((*FILES, MANIFEST)))
 
     def test_packaged_agent_imports_without_repository(self):
         with tempfile.TemporaryDirectory() as directory:

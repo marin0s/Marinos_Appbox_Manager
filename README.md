@@ -50,6 +50,7 @@ Les règles du projet sont détaillées dans [AGENTS.md](AGENTS.md) et [CONTRIBU
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Agents : upgrades sûrs, bootstrap et rollback](docs/agent-upgrades.md)
 - [Images de référence](docs/reference-images.md)
 - [Validation E2E et rollback alpha.5](docs/reference-images-alpha5-e2e.md)
 - [Processus de livraison](docs/release-process.md)

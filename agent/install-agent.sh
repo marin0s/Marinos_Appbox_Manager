@@ -21,6 +21,8 @@ install -d -m 755 /var/lib/marinos-appbox-agent
 install -d -m 755 /srv/appboxes
 install -m 755 "$SOURCE/marinos-appbox-agent.py" /usr/local/sbin/marinos-appbox-agent.py
 install -m 644 "$SOURCE/reference_contract.py" /usr/local/sbin/reference_contract.py
+install -m 644 "$SOURCE/upgrade_contract.py" /usr/local/sbin/upgrade_contract.py
+install -m 644 "$SOURCE/upgrade_client.py" /usr/local/sbin/upgrade_client.py
 install -m 644 "$SOURCE/marinos-appbox-agent.service" /etc/systemd/system/marinos-appbox-agent.service
 
 python3 - "$NODE_ID" "$CONTROL_PLANE_URL" "$TOKEN" <<'PY'

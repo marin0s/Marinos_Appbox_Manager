@@ -1,0 +1,23 @@
+[Unit]
+Description=Marinos AppBox managed node agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/marinos-appbox-agent/current/marinos-appbox-agent.py
+Restart=always
+RestartSec=10
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/marinos-appbox-agent /run /srv/appboxes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

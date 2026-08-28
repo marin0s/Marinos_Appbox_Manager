@@ -1,0 +1,15 @@
+[Unit]
+Description=Marinos AppBox independent upgrade supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/marinos-appbox-agent/upgrade_launcher.py
+User=root
+TimeoutStartSec=330
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/marinos-appbox-agent /var/lib/marinos-appbox-updater /var/lib/marinos-appbox-agent/upgrades /run /etc/systemd/system

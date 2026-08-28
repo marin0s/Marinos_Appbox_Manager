@@ -28,6 +28,14 @@ try:
 except ModuleNotFoundError:
     from reference_contract import IDENTITY_ATTRIBUTES, sanitize_preferences, validate_archive, extract_archive, sha256_file, plex_runtime_preferences, apply_plex_runtime_preferences
 
+try:
+    from agent.upgrade_client import runtime_identity, stage_upgrade
+except ModuleNotFoundError:
+    from upgrade_client import runtime_identity, stage_upgrade
+
+# Capture once: resolving current again after activation would misidentify this process.
+RUNTIME_IDENTITY = runtime_identity(__file__)
+
 PRODUCT_VERSION = "1.6.0-alpha.5"
 VERSION = f"{PRODUCT_VERSION}-dev"
 
@@ -1443,6 +1451,7 @@ def heartbeat(config, metrics=None):
     payload = {
         "agent_id": config.get("agent_id", f"agent-{config['node_id']}"),
         "agent_version": VERSION,
+        "runtime": RUNTIME_IDENTITY,
         "endpoint": config.get("endpoint", ""),
         "capabilities": {
             "docker": bool(metrics.get("docker_ok")),
@@ -1460,6 +1469,7 @@ def heartbeat(config, metrics=None):
             "deployment_executor": True,
             "plex_runtime_preferences": True,
             "independent_heartbeat": True,
+            "remote_upgrade": RUNTIME_IDENTITY["managed"],
         },
     }
     return api(
@@ -1665,6 +1675,10 @@ def claim_plex(app_dir, client_id, containers, claim_code):
 
 def execute_command(config, command):
     command_type = command["command_type"]
+    if command_type == "agent_upgrade":
+        if not RUNTIME_IDENTITY["managed"]:
+            raise RuntimeError("Operator bootstrap required")
+        return stage_upgrade(config, command.get("payload") or {})
     if command_type == "ping":
         return {"pong": True, "hostname": socket.gethostname(), "agent_version": VERSION}
     if command_type == "inventory":

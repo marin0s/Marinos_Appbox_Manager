@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
+from app import agent_upgrades
 from agent.reference_contract import validate_archive, sha256_file, sanitize_preferences, redact_result, plex_runtime_preferences, apply_plex_runtime_preferences
 
 os.environ.setdefault("PSUTIL_PROCFS_PATH", os.getenv("APPBOX_PROCFS", "/host/proc"))
@@ -358,6 +359,7 @@ WORKFLOW_DEFINITIONS = {
 }
 
 app = FastAPI(title="Marinos AppBox Manager", version=VERSION)
+agent_upgrades.install_routes(app)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 templates.env.globals["app_version"] = VERSION
@@ -443,6 +445,7 @@ def immediate_transaction():
 
 def init_database() -> None:
     with db_lock, db() as con:
+        agent_upgrades.init_schema(con)
         con.executescript("""
         CREATE TABLE IF NOT EXISTS nodes (
             node_id TEXT PRIMARY KEY,
@@ -1537,6 +1540,8 @@ def execution_block_reason(node: dict[str, Any], action: str) -> str | None:
         return 'Control Plane : exécution AppBox interdite.'
     if not node.get('agent_online'):
         return f"Node {node.get('status', 'unknown')} : heartbeat récent requis."
+    if node.get('upgrade_in_progress'):
+        return 'Mise à jour agent en cours : exécution suspendue.'
     # Preserve maintenance cleanup: stop/delete remain available to an online agent.
     if (node.get('maintenance') or node.get('status') == 'maintenance') and action not in {'stop', 'delete'}:
         return 'Node en maintenance.'
@@ -1582,6 +1587,7 @@ def queue_agent_command(
 ) -> str:
     command_id = str(uuid.uuid4())
     with db_lock, db() as con:
+        agent_upgrades.require_idle(con, node_id)
         con.execute("""
             INSERT INTO agent_commands(
                 command_id,node_id,command_type,payload_json,status,created_at
@@ -1680,6 +1686,14 @@ def list_control_nodes() -> list[dict[str, Any]]:
                                         if node['metrics_stale'] else None)
         node['automatic_placement_block_reason'] = provisioning_block_reason(node, automatic=True)
         node['automatic_placement_allowed'] = node['automatic_placement_block_reason'] is None
+    agent_upgrades.decorate_nodes(nodes)
+    for node in nodes:
+        if node['upgrade_in_progress']:
+            node['actionable'] = False
+            node['provisioning_block_reason'] = provisioning_block_reason(node)
+            node['automatic_placement_block_reason'] = provisioning_block_reason(node, automatic=True)
+            node['provisioning_allowed'] = False
+            node['automatic_placement_allowed'] = False
     return nodes
 
 
@@ -3354,6 +3368,7 @@ def create_job(client_id: str, action: str, title: str, detail: str = "", node_i
     stamp = now_iso()
     steps = workflow_definition(action)
     with db_lock, db() as con:
+        agent_upgrades.require_idle(con, node_id or HOSTNAME)
         con.execute("""
             INSERT INTO jobs(
                 job_id,client_id,node_id,action,title,status,progress,
@@ -4360,9 +4375,7 @@ def appboxes_page(request: Request):
 
 @app.get("/downloads/appbox-agent-latest.zip")
 def download_agent_archive():
-    archive = AGENT_ASSET_DIR / "appbox-agent-latest.zip"
-    if not archive.is_file():
-        raise HTTPException(503, "Archive agent indisponible.")
+    archive = agent_upgrades.official_artifact(pin=True)["path"]
     return FileResponse(
         archive,
         media_type="application/zip",
@@ -4487,6 +4500,7 @@ def delete_node(node_id: str):
             "Le node local du Control Plane ne peut pas être supprimé.",
         )
     with db_lock, db() as con:
+        agent_upgrades.require_idle(con, node_id)
         node = con.execute(
             "SELECT * FROM nodes WHERE node_id=?",
             (node_id,),
@@ -4758,6 +4772,7 @@ async def agent_heartbeat(node_id: str, request: Request):
             stamp,
         ))
         con.execute('UPDATE nodes SET last_seen=?,agent_version=? WHERE node_id=?', (stamp, agent_version, node_id))
+        agent_upgrades.observe_heartbeat(con, node_id, payload, stamp)
         # Old agents may still send metrics with a heartbeat. Lightweight heartbeats
         # must leave the previous sample and its timestamp completely unchanged.
         if metrics:
@@ -4844,6 +4859,12 @@ def agent_poll_commands(node_id: str, request: Request):
         """, (node_id,)).fetchone()
         if not row:
             return JSONResponse({"command": None})
+        upgrade = agent_upgrades.active(con, node_id)
+        if upgrade and (row['command_type'] != 'agent_upgrade' or row['command_id'] != upgrade['operation_id']):
+            return JSONResponse({'command': None, 'reason': 'agent_upgrading'})
+        if row['command_type'] == 'agent_upgrade':
+            if not upgrade or upgrade['phase'] != 'queued' or not node or node['status'] != 'online':
+                return JSONResponse({'command': None, 'reason': 'upgrade_not_ready'})
         queued_payload = json.loads(row['payload_json'] or '{}')
         if row['command_type'] == 'appbox_action':
             if not node or execution_block_reason(node, queued_payload.get('action', '')):
@@ -4875,6 +4896,10 @@ async def agent_command_result(node_id: str, command_id: str, request: Request):
         """, (command_id, node_id)).fetchone()
         if not command:
             raise HTTPException(404, "Commande introuvable.")
+        if command['command_type'] == 'agent_upgrade':
+            # The serial worker only acknowledges preparation. Only helper events
+            # can confirm activation/rollback; a late result must not override it.
+            return JSONResponse({'status': 'ok', 'confirmation': 'helper_required'})
         con.execute("""
             UPDATE agent_commands
             SET status=?,completed_at=?,result_json=?,error_text=?
@@ -5126,6 +5151,7 @@ def launch_reference_discovery(build_id: str, source_instance: str = "") -> tupl
     stamp = now_iso()
     steps = workflow_definition("reference_discovery")
     with db_lock, db() as con:
+        agent_upgrades.require_idle(con, build["source_node_id"])
         con.execute("""INSERT INTO jobs(job_id,client_id,node_id,action,title,status,progress,detail,created_at,updated_at,started_at,options_json)
                        VALUES(?,NULL,?,'reference_discovery',?,'running',5,?,?,?,?,'{}')""",
                     (job_id, build["source_node_id"], f"Analyse Plex — {build['display_name']}", "Commande de découverte en préparation.", stamp, stamp, stamp))

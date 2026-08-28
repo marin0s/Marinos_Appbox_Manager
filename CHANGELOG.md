@@ -2,6 +2,14 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Upgrades distants des agents
+- Déclenchement manuel dans Agents/Nodes ; versions installée/disponible, build, SHA-256, taille et phases observables, distinctes de la liveness.
+- Package officiel déterministe avec manifeste ; copies immuables par SHA-256 et téléchargement authentifié par node. Validation stricte avant préparation puis activation ; aucun script d'installation du ZIP exécuté.
+- Lanceur systemd minimal indépendant ; helper/client/contrat versionnés, contrôleur sortant conservé pendant activation et rollback, puis relais à la nouvelle release. Unité agent versionnée remplacée atomiquement avec daemon-reload et restauration en cas d’échec. Bascule atomique de current/previous. Confirmation du nouveau processus par heartbeat/version/build/PID et service actif ; rollback automatique vérifié, état et journal de phases durables.
+- Bootstrap opérateur unique depuis l'installation legacy, sans réenrôlement ni modification de agent.json. Conservation des fichiers legacy et de la release précédente.
+- Verrou d'exclusion avec les commandes/jobs AppBox et Reference Images ; trois boucles agent inchangées. Expiration de la préparation, délais de confirmation/rollback et procédure de reprise documentés.
+- Tests locaux avec systemd/symlinks simulés sous Windows ; validation Linux/ARTEMIS et durcissement TLS/authentification opérateur/CSRF restent distincts de cette livraison.
+
 ### Disponibilité des nœuds
 - Liveness centralisée : heartbeat récent online, expiré offline, absent/invalide unknown ; maintenance prioritaire, timeout configurable de 180 secondes par défaut.
 - UI/API et contrôles de placement, provisioning, exécution et remise des commandes utilisent les états dérivés ; CRONOS reste exclu des AppBox.

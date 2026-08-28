@@ -70,3 +70,36 @@ son service, sans réexécuter l'enrôlement et sans remplacer agent.json. Rollb
 CP et ces deux fichiers depuis le même commit précédent, redémarrer le seul service agent.
 Les historiques/archives/AppBox ne sont pas modifiés. L'ancien agent bloque à nouveau son
 heartbeat pendant une commande longue : cette limite réapparaît en cas de rollback.
+
+
+## Upgrades agent — alpha.5
+
+Le Control Plane possède le package officiel et les tables additives `agent_upgrades`
+et `agent_upgrade_runtime`. Il réserve le node, fige une copie par SHA-256 et émet une
+commande `agent_upgrade`. L'exécution métier reste séquentielle ; heartbeat et télémétrie
+restent indépendants. Le heartbeat identifie le processus par nonce, PID, version,
+build et checksum de release, capturés une seule fois au démarrage.
+
+L'agent prépare sans changer son exécutable. Un timer systemd démarre un petit lanceur fixe
+hors du service agent, qui invoque le helper de la release controller. Ce helper revalide l'archive, journalise previous/candidate et
+les délais, arrête seulement le service agent, remplace atomiquement `current` puis
+redémarre. Il exige un nouveau heartbeat correspondant au processus MainPID actif.
+L'absence de confirmation déclenche le retour à previous et la vérification de l'ancien
+agent. Le journal local et sa file de notifications survivent aux redémarrages.
+
+Le statut upgrade ne remplace jamais la liveness. Une opération expirée ne masque pas
+un heartbeat expiré. Le verrou reste conservateur si la phase d'activation n'a pas de
+résultat terminal ; ne jamais le supprimer aveuglément pour débloquer le placement.
+CRONOS reste exclusivement Control Plane. Aucun changement au moteur de capture Plex,
+aux données AppBox, au claim ou à la règle métriques stale du lot 2.
+
+Les modules helper/client/contrat sont intégralement versionnés. N supervise N+1 et
+conserve le rollback ; le contrôleur ne passe à N+1 qu'après heartbeat et probe de son
+helper. N+1 supervise ensuite N+2. Le lanceur peut appeler le contrôleur rescue si le
+dispatch échoue. Une enveloppe de récupération ABI 1 et les anciennes releases sont
+conservées. L'unité agent versionnée est installée atomiquement, rechargée par systemd
+et restaurée avec previous en cas d'échec. Seuls le lanceur minimal et son service/timer
+restent fixes, afin que la candidate ne puisse supprimer la voie de secours.
+
+La procédure manuelle de remplacement des deux fichiers du lot 2 ci-dessus ne doit
+plus être utilisée sur un agent managed : suivre [bootstrap, upgrade et rollback](agent-upgrades.md).

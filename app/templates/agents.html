@@ -4,6 +4,7 @@
 {% block content %}
 <section class="hero">
  <div><div class="eyebrow">Control Plane Agent V1</div><h1>Agents des nodes</h1><p>Supervision des agents, inventaire matériel et commandes de diagnostic. L’installation se fait uniquement depuis la page Nodes.</p></div>
+<button type="button" class="secondary" disabled title="Non disponible dans alpha.5">Mettre à jour tous les agents (à venir)</button>
 </section>
 
 <div class="agent-grid">
@@ -37,6 +38,7 @@
  {% else %}
  <p class="metric-sub">Agent embarqué local au Control Plane.</p>
  {% endif %}
+{% include "agent_upgrade.html" %}
 </article>
 {% endfor %}
 </div>

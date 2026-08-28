@@ -5,6 +5,7 @@
 <section class="hero">
  <div><div class="eyebrow">Control Plane</div><h1>Registre des nodes</h1><p>Les tags déterminent le rôle métier et l’éligibilité au provisioning automatique.</p></div>
  <button type="button" data-open-dialog="node-create">Ajouter un node</button>
+<button type="button" class="secondary" disabled title="Non disponible dans alpha.5">Mettre à jour tous les agents (à venir)</button>
 </section>
 
 <div class="node-policy-banner">
@@ -33,6 +34,7 @@
   <button type="button" class="primary-agent-action" data-token-node="{{node.node_id}}" data-token-name="{{node.name}}">{{'Réinstaller l’agent' if node.agent_online else 'Installer l’agent'}}</button>
   {% endif %}
  </div>
+{% include "agent_upgrade.html" %}
 </article>
 {% endfor %}
 </div>

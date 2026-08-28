@@ -1,0 +1,12 @@
+{% if node.upgrade is defined and not node.is_local %}
+<section data-agent-upgrade="{{node.node_id}}" class="info-list">
+ <div class="info-row"><span>Agent installé</span><strong data-upgrade-installed>{{node.upgrade.installed_version or 'Inconnu'}}</strong></div>
+ <div class="info-row"><span>Version disponible</span><strong data-upgrade-available>{{node.upgrade.available_version or 'Package indisponible'}}</strong></div>
+ <p class="metric-sub" data-upgrade-status>{{node.upgrade.status}} — {{node.upgrade.phase or '—'}} {{node.upgrade.error_code or ''}}</p>
+ <p class="metric-sub" data-upgrade-bootstrap {{'hidden' if not node.upgrade.bootstrap_required else ''}}>Bootstrap opérateur requis, sans réenrôlement. Voir docs/agent-upgrades.md.</p>
+ <form method="post" action="/nodes/{{node.node_id}}/upgrade-agent" data-upgrade-form>
+  <button type="submit" {{'disabled' if not node.upgrade.can_upgrade else ''}}>Mettre à jour l’agent</button>
+ </form>
+ <p class="metric-sub" data-upgrade-error role="alert"></p>
+</section>
+{% endif %}
