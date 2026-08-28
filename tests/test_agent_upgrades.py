@@ -296,13 +296,18 @@ def test_atomic_pointer_uses_replace(tmp_path, monkeypatch):
     with pytest.raises(ValueError): helper.switch_current(tmp_path,tmp_path)
 
 
-def test_legacy_bootstrap_preserves_config_and_can_resume(tmp_path, monkeypatch, artifact):
+@pytest.mark.parametrize('modules', [(), ('reference_contract.py',),
+    ('reference_contract.py', 'upgrade_client.py', 'upgrade_contract.py')])
+def test_legacy_bootstrap_preserves_config_and_can_resume(tmp_path, monkeypatch, artifact, modules):
     data, _, _ = artifact
     legacy, root, state, spool, units = (tmp_path/name for name in ('legacy','root','state','spool','units'))
     legacy.mkdir(); units.mkdir()
     (units/helper.SERVICE).write_bytes((SOURCE/helper.SERVICE).read_bytes())
-    for name in ('marinos-appbox-agent.py','reference_contract.py'):
+    for name in ('marinos-appbox-agent.py', *modules):
         (legacy/name).write_bytes((SOURCE/name).read_bytes().replace(b'alpha.5',b'alpha.4'))
+    if not modules:
+        (legacy/'marinos-appbox-agent.py').write_bytes(b'VERSION = "1.6.0-alpha.4"\nprint(VERSION)\n')
+    original_files = {path.name: path.read_bytes() for path in legacy.iterdir()}
     config_file = tmp_path/'agent.json'
     original = b'{"node_id":"testnode","token":"DO-NOT-CHANGE","control_plane_url":"http://cp"}'
     config_file.write_bytes(original)
@@ -321,7 +326,10 @@ def test_legacy_bootstrap_preserves_config_and_can_resume(tmp_path, monkeypatch,
     assert helper.bootstrap(*args,ctl=ctl,transport=transport)==opid
     assert config_file.read_bytes()==original
     assert json.loads((spool/'request.json').read_text())['operation_id']==opid
-    assert list((root/'releases').glob('legacy-*'))
+    snapshots = list((root/'releases').glob('legacy-*'))
+    assert len(snapshots) == 1
+    assert {path.name: path.read_bytes() for path in snapshots[0].glob('*.py')} == original_files
+    assert {path.name: path.read_bytes() for path in legacy.iterdir()} == original_files
     assert not any(call.args[0] in {'stop','start','restart'} for call in ctl.call_args_list)
     assert '/current/marinos-appbox-agent.py' in (units/helper.SERVICE).read_text()
     # A first migration rolled back to legacy must remain retryable without
@@ -338,6 +346,187 @@ def test_legacy_bootstrap_preserves_config_and_can_resume(tmp_path, monkeypatch,
     assert helper.bootstrap(*args,ctl=ctl,transport=retry_transport).endswith('004')
     assert len(attempts)==1 and config_file.read_bytes()==original
 
+
+@pytest.mark.parametrize('modules', [(), ('reference_contract.py',), ('upgrade_client.py',),
+    ('upgrade_contract.py',), ('upgrade_client.py', 'upgrade_contract.py'),
+    ('reference_contract.py', 'upgrade_client.py', 'upgrade_contract.py')])
+def test_legacy_snapshot_identity_uses_only_installed_files(tmp_path, modules):
+    legacy = tmp_path/'legacy'; legacy.mkdir()
+    original = {'marinos-appbox-agent.py': b'VERSION = "1.6.0-alpha.4"\r\nprint(VERSION)\r\n',
+                **{name: b'# original legacy module\n' for name in modules}}
+    for name, data in original.items():
+        (legacy/name).write_bytes(data)
+    first = helper.snapshot_legacy(tmp_path/'root', legacy)
+    expected = 'legacy-' + contract.digest(contract.canonical(
+        {name: contract.digest(data) for name, data in original.items()}))
+    assert first.name == expected
+    assert json.loads((first/'release-receipt.json').read_text()) == {
+        'version':'1.6.0-alpha.4', 'build_id':expected, 'sha256':None}
+    assert {p.name: p.read_bytes() for p in first.glob('*.py')} == original
+    assert helper.snapshot_legacy(tmp_path/'root', legacy) == first
+    # Neither an unrelated source file nor the destination location affects identity.
+    (legacy/'unrelated.py').write_text('not part of the agent')
+    assert helper.snapshot_legacy(tmp_path/'other-root', legacy).name == expected
+    if modules:
+        (legacy/modules[0]).write_bytes(b'# changed installed module\n')
+        assert helper.snapshot_legacy(tmp_path/'root', legacy).name != expected
+        assert {p.name: p.read_bytes() for p in first.glob('*.py')} == original
+    else:
+        # Refuse an artificially populated backup instead of accepting a mixed release.
+        (first/'reference_contract.py').write_bytes(b'# not a legacy file\n')
+        with pytest.raises(ValueError, match='Unexpected legacy backup file'):
+            helper.snapshot_legacy(tmp_path/'root', legacy)
+
+
+@pytest.mark.parametrize('name', ['marinos-appbox-agent.py', 'reference_contract.py',
+                                 'upgrade_client.py', 'upgrade_contract.py'])
+@pytest.mark.parametrize('failure', ['permission', 'syntax', 'directory', 'symlink'])
+def test_legacy_bootstrap_rejects_invalid_present_files_before_changes(tmp_path, monkeypatch, artifact, name, failure):
+    data, _, _ = artifact
+    legacy = tmp_path/'legacy'; legacy.mkdir()
+    (legacy/'marinos-appbox-agent.py').write_bytes(b'VERSION = "1.6.0-alpha.4"\n')
+    bad = legacy/name
+    if name != 'marinos-appbox-agent.py':
+        bad.write_bytes(b'# installed module\n')
+    expected = ValueError
+    if failure == 'permission':
+        original_read = Path.read_bytes
+        def read(path):
+            if path == bad:
+                raise PermissionError('unreadable installed legacy file')
+            return original_read(path)
+        monkeypatch.setattr(Path, 'read_bytes', read)
+        expected = PermissionError
+    elif failure == 'syntax':
+        bad.write_bytes(b'def broken(\n')
+        expected = SyntaxError
+    elif failure == 'directory':
+        bad.unlink(); bad.mkdir()
+    else:
+        original_stat = Path.lstat
+        monkeypatch.setattr(Path, 'lstat', lambda path: Mock(st_mode=stat.S_IFLNK)
+                            if path == bad else original_stat(path))
+    archive = tmp_path/'agent.zip'; archive.write_bytes(data)
+    root, state, spool, units = (tmp_path/n for n in ('root','state','spool','units'))
+    config_file = tmp_path/'agent.json'; config_file.write_bytes(b'{"node_id":"testnode","token":"unchanged"}')
+    ctl, transport = Mock(), Mock()
+    with pytest.raises(expected):
+        helper.bootstrap(archive, contract.digest(data), json.loads(config_file.read_text()),
+                         root, state, spool, legacy, units, ctl, transport)
+    ctl.assert_not_called(); transport.assert_not_called()
+    assert not any(p.exists() for p in (root, state, spool, units))
+    assert config_file.read_bytes() == b'{"node_id":"testnode","token":"unchanged"}'
+
+
+@pytest.mark.parametrize('source,error', [(None, FileNotFoundError),
+    (b'VERSION = "invalid"\n', ValueError),
+    (b'VERSION = str("1.6.0-alpha.4")\n', ValueError)])
+def test_legacy_bootstrap_requires_main_agent_and_static_version(tmp_path, artifact, source, error):
+    data, _, _ = artifact
+    legacy = tmp_path/'legacy'; legacy.mkdir()
+    (legacy/'reference_contract.py').write_bytes(b'# cannot replace the main agent\n')
+    if source is not None:
+        (legacy/'marinos-appbox-agent.py').write_bytes(source)
+    archive = tmp_path/'agent.zip'; archive.write_bytes(data)
+    root, state = tmp_path/'root', tmp_path/'state'
+    ctl, transport = Mock(), Mock()
+    with pytest.raises(error):
+        helper.bootstrap(archive, contract.digest(data), {'node_id':'testnode'},
+                         root, state, tmp_path/'spool', legacy, tmp_path/'units', ctl, transport)
+    ctl.assert_not_called(); transport.assert_not_called()
+    assert not root.exists() and not state.exists()
+
+
+def test_monolithic_bootstrap_retry_after_old_preflight_with_existing_free_lock(tmp_path, monkeypatch, artifact):
+    from types import SimpleNamespace
+    data, _, _ = artifact
+    legacy, root, state, spool, units = (tmp_path/n for n in ('legacy','root','state','spool','units'))
+    legacy.mkdir(); state.mkdir(); units.mkdir()
+    source = b'VERSION = "1.6.0-alpha.4"\nprint(VERSION)\n'
+    (legacy/'marinos-appbox-agent.py').write_bytes(source)
+    (units/helper.SERVICE).write_bytes((SOURCE/helper.SERVICE).read_bytes())
+    (state/'supervisor.lock').touch()
+    # Reproduce the old preflight: only the lock exists, no operation or managed root.
+    with pytest.raises(FileNotFoundError):
+        for name in ('marinos-appbox-agent.py', 'reference_contract.py'):
+            (legacy/name).read_bytes()
+    archive = tmp_path/'agent.zip'; archive.write_bytes(data)
+    config_file = tmp_path/'agent.json'; config_file.write_bytes(b'{"node_id":"testnode","token":"unchanged"}')
+    original = config_file.read_bytes()
+    opid = '00000000-0000-0000-0000-000000000002'
+    remote = {'operation_id':opid, 'phase':'queued'}
+    def transport(config, path, payload=None):
+        if path.endswith('/events'):
+            remote['phase'] = payload['phase']
+        return {'operation':remote.copy()}
+    ctl, locks = Mock(), []
+    def flock(lock, flags):
+        assert flags == 6 and not lock.closed and Path(lock.name).stat().st_size == 0
+        locks.append(lock)
+    monkeypatch.setitem(sys.modules, 'fcntl', SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=flock))
+    # Simulate only the Linux primitives; execute real main(), preflight and bootstrap.
+    monkeypatch.setattr(helper, 'os', SimpleNamespace(name='posix', geteuid=lambda:0, fsync=helper.os.fsync))
+    monkeypatch.setattr(helper, 'STATE', state)
+    monkeypatch.setattr(helper, 'CONFIG', config_file)
+    monkeypatch.setattr(helper, 'switch_pointer', Mock())
+    bootstrap = helper.bootstrap
+    monkeypatch.setattr(helper, 'bootstrap', lambda archive, checksum, config: bootstrap(
+        archive, checksum, config, root, state, spool, legacy, units, ctl, transport))
+    monkeypatch.setattr(sys, 'argv', ['upgrade_helper.py', 'bootstrap', '--archive', str(archive),
+                                    '--sha256', contract.digest(data)])
+    helper.main()
+    assert len(locks) == 1 and locks[0].closed
+    assert config_file.read_bytes() == original
+    assert not any(call.args[0] in {'stop','start','restart'} for call in ctl.call_args_list)
+    assert remote['phase'] == 'prepared' and (state/'bootstrap.json').is_file()
+    assert json.loads((spool/'request.json').read_text())['operation_id'] == opid
+    assert {p.name: p.read_bytes() for p in legacy.iterdir()} == {'marinos-appbox-agent.py':source}
+    snapshot = next((root/'releases').glob('legacy-*'))
+    assert not (snapshot/'reference_contract.py').exists()
+
+
+def test_rollback_restarts_exact_monolithic_snapshot(supervisor, tmp_path):
+    sup, archive, pointer, clock, runtime, events, calls, _, _ = supervisor
+    legacy = tmp_path/'legacy'; legacy.mkdir()
+    source = b'VERSION = "1.6.0-alpha.4"\nprint(VERSION)\n'
+    (legacy/'marinos-appbox-agent.py').write_bytes(source)
+    snapshot = helper.snapshot_legacy(sup.root, legacy)
+    receipt = json.loads((snapshot/'release-receipt.json').read_text())
+    pointer.update(current=snapshot, target=snapshot, previous=snapshot)
+    legacy_unit = (SOURCE/helper.SERVICE).read_bytes().replace(
+        b'ExecStart=/usr/local/sbin/marinos-appbox-agent.py',
+        b'ExecStart=/usr/bin/python3 /opt/marinos-appbox-agent/current/marinos-appbox-agent.py')
+    (sup.units/helper.SERVICE).write_bytes(legacy_unit)
+    state = sup.begin('00000000-0000-0000-0000-000000000001', archive)
+    assert state['previous_version'] == '1.6.0-alpha.4'
+    assert state['previous_build'] == receipt['build_id']
+    sup.step(state)
+    assert state['phase'] == 'awaiting_heartbeat'
+    clock[0] = state['deadline'] + 1
+    sup.step(state)
+    assert state['phase'] == 'rolling_back'
+    original_ctl, processes = sup.ctl, []
+    def ctl(*args):
+        if args == ('start', helper.SERVICE):
+            assert pointer['current'] == snapshot
+            assert (sup.units/helper.SERVICE).read_bytes() == legacy_unit
+            # Real isolated Python execution proves no candidate module is required.
+            result = subprocess.run([sys.executable, '-I', '-B', str(snapshot/'marinos-appbox-agent.py')],
+                                    capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0 and result.stderr == ''
+            processes.append(result)
+            runtime.clear()
+            runtime.update(version=result.stdout.strip(), received_at='03')
+        return original_ctl(*args)
+    sup.ctl = ctl
+    sup.step(state)
+    assert sup.load()['phase'] == 'rolled_back' and len(processes) == 1
+    assert pointer['current'] == pointer['previous'] == snapshot
+    assert pointer['controller'] == pointer['rescue'] == sup.controller
+    assert {p.name: p.read_bytes() for p in snapshot.glob('*.py')} == {'marinos-appbox-agent.py':source}
+    assert (sup.root/'releases'/state['package_sha256']).is_dir()
+    assert calls.count(('start', helper.SERVICE)) == 2  # candidate, then monolithic rollback
+    assert events[-2:] == ['rolling_back', 'rolled_back']
 
 
 @pytest.fixture

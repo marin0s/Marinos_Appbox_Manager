@@ -251,7 +251,44 @@ Les endpoints agent réutilisent le bearer existant et vérifient le node propri
 Les pages Agents/Nodes rafraîchissent l'avancement toutes les 5 s et affichent les refus
 API. Les statuts synthétiques sont up_to_date/update_available/upgrading/upgrade_failed/unknown.
 
-## Bootstrap initial sur ARTEMIS
+## Générations legacy supportées
+
+Le bootstrap accepte les installations historiques suivantes dans `/usr/local/sbin` :
+
+| Génération | Fichiers runtime du snapshot |
+| --- | --- |
+| alpha.4 monolithique, notamment ORION | `marinos-appbox-agent.py` seul |
+| Legacy modulaire, notamment les premiers alpha.5 | Agent + `reference_contract.py` présent |
+| Legacy avec modules d'upgrade | Les précédents + `upgrade_client.py` et/ou `upgrade_contract.py`, seulement s'ils sont présents |
+
+L'agent principal est toujours obligatoire. Chacun des trois modules optionnels est
+détecté indépendamment : seule son absence est acceptée. Un fichier présent doit être
+régulier, sans symlink, lisible et syntaxiquement valide. Les erreurs de permission,
+d'E/S, les répertoires et les liens cassés restent des erreurs avant réservation de
+l'opération initiale. Aucun code legacy n'est exécuté pendant ce préflight.
+
+Le snapshot contient les **octets originaux des seuls fichiers runtime présents**.
+Il n'est jamais complété par le nouveau `reference_contract.py` ou un autre module du
+package. Les fichiers étrangers au runtime dans `/usr/local/sbin` ne sont pas copiés.
+Seuls le reçu de release et l'unité de démarrage adaptée sont ajoutés au snapshot.
+Un snapshot préexistant contenant un module supplémentaire est refusé, pas réutilisé.
+
+Le build `legacy-<hash>` est le SHA-256 du dictionnaire canonique nom → SHA-256 des
+fichiers runtime réellement présents, sans dépendre du chemin, de la date ou de la
+candidate. Leurs fins de ligne sont conservées. La version provient soit de la
+déclaration historique littérale `VERSION = "1.6.0-alpha.4"`, soit du format
+`PRODUCT_VERSION` / `VERSION = f"{PRODUCT_VERSION}-dev"`. La lecture est statique,
+sans import ni exécution, et conserve la version exacte (aucun `-dev` ajouté à alpha.4).
+Les déclarations dynamiques ou inconnues et les dépendances locales personnalisées
+ne font pas partie des générations prises en charge.
+
+Le rollback conserve le mécanisme existant : unité précédente restaurée,
+`current` vers le snapshot, redémarrage de l'agent puis confirmation du heartbeat
+legacy. Un monolithe repart seul, sans importer les modules de la candidate ;
+controller/rescue restent disponibles dans leur release managed. Aucun changement
+de `agent.json`, d'enrôlement, du protocole, de l'ABI, du scheduler ou du contrat ZIP.
+
+## Bootstrap initial sur ARTEMIS ou ORION
 
 L'agent legacy ne connaît pas `agent_upgrade` et son service a `/opt` en lecture seule.
 Il ne peut donc pas installer lui-même ce système sans lui ajouter une exécution root
@@ -293,6 +330,48 @@ Après un échec initial ou un rollback confirmé vers legacy, la même commande
 réserver une nouvelle tentative (éventuellement avec un nouvel artefact officiel),
 à condition que le helper ait acquitté son résultat terminal. Cela ne nécessite pas
 que l'ancien agent comprenne `agent_upgrade`. Un agent déjà managed utilise le bouton CP.
+
+### Recette ORION après l'échec de préflight alpha.4
+
+Cette recette nécessite une intervention opérateur autorisée ; elle n'est pas exécutée
+par les tests locaux. Utiliser ORION, pas DEMETER. Aucune fabrication de module legacy.
+
+1. Livrer le CP avec le nouveau ZIP officiel et transférer le checkout **corrigé et
+   vérifié** par le canal opérateur. Mettre à jour uniquement le ZIP ne suffit pas si
+   la commande de bootstrap exécute encore l'ancien `upgrade_helper.py`.
+2. Confirmer ORION online/hors maintenance, sans travail incompatible. Sauvegarder
+   configuration et unités dans un emplacement root protégé. Relever localement le
+   hash d'`agent.json`, MainPID, version, conteneurs/AppBox et RestartCount de référence.
+3. Confirmer l'agent principal présent, `reference_contract.py` absent et aucune
+   installation managed (`current`, `bootstrap.json`, unités updater). Si ces états
+   ne correspondent plus à l'échec de préflight décrit, inspecter les journaux avant
+   relance. Ne pas supprimer un journal ou forcer une migration déjà active.
+4. Exécuter le bloc de bootstrap ci-dessus sur ORION avec le **nouveau SHA officiel**.
+   Le fichier vide `supervisor.lock` laissé par l'échec ne gêne pas : seul le flock
+   détenu compte. Ne pas supprimer/recréer ce lock ; un détenteur actif exige d'attendre.
+   Sans `bootstrap.json` ni `current`, le bootstrap repart normalement avec ce nouveau
+   package. Si un journal existe, les règles de reprise avec le même artefact restent
+   applicables.
+5. Attendre la phase CP `success`, `bootstrap_required=false`, un nouveau PID et le
+   heartbeat portant version/build/checksum attendus. Vérifier `current` vers le SHA
+   neuf, `previous` vers `legacy-<hash>` et controller/rescue vers des releases valides.
+   Vérifier le passage du scheduler en idle une fois l'opération acquittée.
+6. Comparer l'agent dans `previous` à `/usr/local/sbin/marinos-appbox-agent.py` octet pour
+   octet ; aucun `reference_contract.py` ne doit exister dans ce snapshot monolithique
+   ni avoir été créé dans `/usr/local/sbin`. Vérifier le reçu : version alpha.4 exacte,
+   build basé uniquement sur le fichier présent. Comparer le hash d'`agent.json` et les
+   AppBox/RestartCount : aucune modification attendue.
+7. Sur une recette sacrifiable, tester l'absence de confirmation candidate : attendre
+   `rolling_back`, puis `rolled_back`, le retour de `current` au monolithe, la restauration
+   de son unité, un PID actif et un heartbeat alpha.4 neuf. Ne pas provoquer cet échec
+   sur un node chargé sans fenêtre et autorisation. Tester ensuite un upgrade managed
+   N → N+1 depuis le CP ; aucun bootstrap supplémentaire ne doit être requis.
+
+Les tests locaux simulent systemd/flock/symlinks et exécutent un programme monolithique
+autonome dans un vrai processus Python lors du rollback. Les permissions Linux, le
+flock réel, l'unité historique ORION et le retour de son véritable heartbeat restent
+à valider sur infrastructure. Aucun retour success n'est fabriqué pour contourner
+une confirmation manquante. Les procédures de récupération ci-dessous restent valides.
 
 ## Rollback et récupération
 

@@ -2,6 +2,11 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Compatibilité du bootstrap legacy monolithique
+- Bootstrap des agents alpha.4 monolithiques sans `reference_contract.py`, ainsi que des installations modulaires : agent principal obligatoire, contrats/client optionnels uniquement s'ils sont absents. Fichiers présents invalides ou illisibles refusés avant réservation/activation.
+- Snapshot des seuls fichiers runtime réellement installés, sans copie de modules de la candidate ; identité déterministe calculée sur leurs octets. Lecture statique de la déclaration historique `VERSION`, sans changer le contrat des packages managed.
+- Rollback vers le snapshot monolithique, retry après préflight échoué avec lock libre existant ; configuration, identité, launcher ABI, scheduler et hotfix suppression/file inchangés. Générations supportées et recette ORION documentées dans `docs/agent-upgrades.md`.
+
 ### Hotfix suppression AppBox et file multi-node
 - Delete/purge idempotents lorsque dossier, Compose ou conteneurs sont déjà absents ; archive conserve les données. Vérification Docker réelle avant nettoyage, erreurs disque/daemon conservées, chemin et propriété des conteneurs contrôlés.
 - Exécuteur de suppression partagé par agent et mode embedded, sans nouveau composant ZIP ; suppression locale réelle interdite en mode mock. Réparation des AppBox legacy error/deleted/missing jusqu'à l'inventaire, l'audit et la notification.

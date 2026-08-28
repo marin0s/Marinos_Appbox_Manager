@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Release-owned upgrade supervisor. The previous controller owns activation and recovery."""
 import argparse
+import ast
 import base64
 import sys
 import json
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
 try:
     from agent.upgrade_contract import (HELPER_FILES, TERMINAL, atomic_json, canonical,
-        digest, fsync_directory, prepare_release, source_version, validate_package, atomic_file, LAUNCHER_ABI)
+        digest, fsync_directory, prepare_release, source_version, version_key, validate_package, atomic_file, LAUNCHER_ABI)
     from agent.upgrade_client import operation_path, request, install_scheduler, scheduler_units
 except ModuleNotFoundError:
     from upgrade_contract import (HELPER_FILES, TERMINAL, atomic_json, canonical,
-        digest, fsync_directory, prepare_release, source_version, validate_package, atomic_file, LAUNCHER_ABI)
+        digest, fsync_directory, prepare_release, source_version, version_key, validate_package, atomic_file, LAUNCHER_ABI)
     from upgrade_client import operation_path, request, install_scheduler, scheduler_units
 
 ROOT = Path("/opt/marinos-appbox-agent")
@@ -71,14 +73,51 @@ def switch_current(root, target):
     switch_pointer(root, "current", target)
 
 
+def read_legacy(legacy):
+    """Read only installed runtime files; missing optional modules are not synthesized."""
+    legacy = Path(legacy)
+    contents = {}
+    for name in ("marinos-appbox-agent.py", "reference_contract.py", "upgrade_client.py", "upgrade_contract.py"):
+        path = legacy / name
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if name == "marinos-appbox-agent.py":
+                raise
+            continue
+        if not stat.S_ISREG(info.st_mode) or path.resolve().parent != legacy.resolve():
+            raise ValueError("Invalid legacy file: " + name)
+        data = path.read_bytes()  # permission/I/O errors, including disappearance, are real failures
+        compile(data, name, "exec")  # syntax validation only; never import legacy code
+        contents[name] = data
+    source = contents["marinos-appbox-agent.py"]
+    try:
+        version = source_version(source)
+    except ValueError:
+        # alpha.4 monolithic agents used a literal VERSION, without PRODUCT_VERSION.
+        declarations = [node.value for node in ast.parse(source).body
+                        if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == 'VERSION'
+                                for target in node.targets)]
+        if (len(declarations) != 1 or not isinstance(declarations[0], ast.Constant)
+                or not isinstance(declarations[0].value, str)
+                or version_key(declarations[0].value) is None):
+            raise ValueError("Unsupported legacy agent version declaration") from None
+        version = declarations[0].value
+    return contents, version
+
+
 def snapshot_legacy(root, legacy):
-    root, legacy = Path(root), Path(legacy)
-    names = ("marinos-appbox-agent.py", "reference_contract.py") + tuple(
-        name for name in ("upgrade_client.py", "upgrade_contract.py") if (legacy / name).is_file())
-    contents = {name: (legacy / name).read_bytes() for name in names}
+    root = Path(root)
+    contents, version = read_legacy(legacy)
     key = digest(canonical({name: digest(data) for name, data in contents.items()}))
     target = root / "releases" / ("legacy-" + key)
+    if target.is_symlink():
+        raise ValueError("Invalid legacy backup directory")
     target.mkdir(parents=True, exist_ok=True)
+    if any(path.name not in {*contents, "release-receipt.json", "managed-agent.service"}
+           or path.is_symlink() or not path.is_file() for path in target.iterdir()):
+        raise ValueError("Unexpected legacy backup file")
     for name, data in contents.items():
         if (target / name).exists() and (target / name).read_bytes() != data:
             raise ValueError("Legacy backup mismatch")
@@ -87,7 +126,6 @@ def snapshot_legacy(root, legacy):
             stream.flush()
             os.fsync(stream.fileno())
         (target / name).chmod(0o755 if name.endswith("agent.py") else 0o644)
-    version = source_version(contents[names[0]])
     atomic_json(target / "release-receipt.json", {"version":version, "build_id":"legacy-" + key, "sha256":None})
     fsync_directory(target)
     return target
@@ -396,8 +434,7 @@ def bootstrap(archive, checksum, config, root=ROOT, state=STATE, spool=SPOOL,
         if (root / "current").exists() or (root / "current").is_symlink() or override.exists():
             raise RuntimeError("Managed installation exists; inspect before migration")
         # Preflight before any change to the service or installation.
-        for name in ("marinos-appbox-agent.py", "reference_contract.py"):
-            (Path(legacy) / name).read_bytes()
+        read_legacy(legacy)
         op = transport(config, f"/api/agent/v1/{config['node_id']}/upgrades/bootstrap",
                        {"package_sha256":checksum})["operation"]
         operation_id = op["operation_id"]
