@@ -2,6 +2,12 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Suppression des images de référence
+- Confirmation UI/API avec nom, nombre de versions et dépendances explicites ; aucune suppression forcée.
+- Refus des liens AppBox, déploiement, profil, snapshot partagé, build/distribution actifs ; protection des écrivains tardifs sur les colonnes historiques sans FK.
+- Suppression atomique du catalogue avec journal durable de nettoyage des archives centrales ; reprise idempotente après erreur disque ou interruption, chemins confinés et fichiers remplacés refusés.
+- Historiques de builds/snapshots conservés, caches distants consignés comme orphelins sans action sur les nodes. Documentation : `docs/reference-image-deletion.md`.
+
 ### Upgrades distants des agents
 - Déclenchement manuel dans Agents/Nodes ; versions installée/disponible, build, SHA-256, taille et phases observables, distinctes de la liveness.
 - Package officiel déterministe avec manifeste ; copies immuables par SHA-256 et téléchargement authentifié par node. Validation stricte avant préparation puis activation ; aucun script d'installation du ZIP exécuté.

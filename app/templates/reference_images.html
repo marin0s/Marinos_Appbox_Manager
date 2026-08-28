@@ -18,6 +18,9 @@
 </div>
 
 <section class="resource-panel active" data-panel="library">
+ {% for deletion in pending_deletions %}
+ <div class="reference-blocked"><strong>Nettoyage en attente : {{deletion.name}}</strong><a class="button secondary" href="/reference-images/{{deletion.image_id}}/delete">Voir et reprendre</a></div>
+ {% endfor %}
  <div class="section-head"><div><h2>Bibliothèque</h2><p>Références disponibles pour les futurs déploiements.</p></div></div>
  <div class="reference-grid">
  {% for image in images %}
@@ -33,6 +36,7 @@
     <div><span>Taille</span><strong>{{'%.2f Go'|format((image.size_bytes or 0) / 1073741824)}}</strong></div>
     <div><span>Créée</span><strong>{{image.created_at[:10] if image.created_at else '—'}}</strong></div>
    </div>
+   <div class="actions"><a class="button danger" href="/reference-images/{{image.image_id}}/delete">Supprimer</a></div>
   </article>
  {% else %}
   <div class="card empty reference-empty"><strong>Aucune référence disponible</strong><span>Commencez par analyser une instance Plex existante depuis l’onglet « Depuis un serveur ».</span><button type="button" data-open-dialog="reference-create-server">Ajouter une référence</button></div>

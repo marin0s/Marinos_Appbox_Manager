@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Supprimer une référence — Marinos AppBox{% endblock %}
+{% block page_title %}Suppression de Reference Image{% endblock %}
+{% block content %}
+<section class="hero"><div><div class="eyebrow">Images de référence</div><h1>{{deletion.name}}</h1><p>{{deletion.version_count}} version(s) concernée(s).</p></div></section>
+<div class="card grid">
+ {% if error %}<div class="reference-blocked" role="alert">{{error}}</div>{% endif %}
+ {% if deletion.state == 'deleted' %}
+ <h2>Suppression terminée</h2><p>Image et versions supprimées du catalogue, artefacts centraux nettoyés. Les historiques sont conservés.</p>
+ {% elif deletion.blockers %}
+ <h2>Suppression impossible</h2><p>Les dépendances suivantes doivent rester valides :</p>
+ <ul data-deletion-blockers>{% for blocker in deletion.blockers %}<li>{{blocker}}</li>{% endfor %}</ul>
+ {% else %}
+ <h2>{{'Nettoyage en attente' if deletion.state == 'cleanup_pending' else 'Confirmer la suppression définitive'}}</h2>
+ <p>Cette action supprime toutes les versions et leurs archives centrales. Elle est irréversible : vérifiez vos sauvegardes. Les sources externes et les caches des nodes ne sont pas supprimés.</p>
+ {% if deletion.errors %}<ul role="alert">{% for error in deletion.errors %}<li>{{error}}</li>{% endfor %}</ul>{% endif %}
+ <form method="post" action="/reference-images/{{deletion.image_id}}/delete">
+  <input type="hidden" name="confirmation" value="{{deletion.confirmation}}">
+  <button class="danger" type="submit">{{'Reprendre le nettoyage' if deletion.state == 'cleanup_pending' else 'Supprimer définitivement'}} : {{deletion.name}} ({{deletion.version_count}} version(s))</button>
+ </form>
+ {% endif %}
+ <div class="actions"><a class="button secondary" href="/reference-images">Retour aux références</a></div>
+</div>
+{% endblock %}

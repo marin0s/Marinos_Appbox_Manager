@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
-from app import agent_upgrades
+from app import agent_upgrades, reference_deletion
 from agent.reference_contract import validate_archive, sha256_file, sanitize_preferences, redact_result, plex_runtime_preferences, apply_plex_runtime_preferences
 
 os.environ.setdefault("PSUTIL_PROCFS_PATH", os.getenv("APPBOX_PROCFS", "/host/proc"))
@@ -360,6 +360,7 @@ WORKFLOW_DEFINITIONS = {
 
 app = FastAPI(title="Marinos AppBox Manager", version=VERSION)
 agent_upgrades.install_routes(app)
+reference_deletion.install_routes(app)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 templates.env.globals["app_version"] = VERSION
@@ -1366,6 +1367,8 @@ def init_database() -> None:
             INSERT OR IGNORE INTO mount_group_members(group_id,mount_id,position)
             VALUES('rdad-standard',?,?)
         """, [("rdad-media", 10), ("nas-athena", 20), ("nas-nemesis", 30)])
+
+        reference_deletion.init_schema(con)
 
         default_profiles = [
             ("plex-blank", "Plex vierge", "plex", None, "rdad-standard", "independent", 1),
@@ -2829,6 +2832,12 @@ def parse_deployment_image(value: str, media_type: str) -> tuple[str | None, str
 
 
 def reference_deployment_archive(version_id: str) -> tuple[Path, str]:
+    # Serialize local archive creation against catalogue deletion/cleanup.
+    with db_lock:
+        return _reference_deployment_archive(version_id)
+
+
+def _reference_deployment_archive(version_id: str) -> tuple[Path, str]:
     reference = get_reference_version(version_id)
     if not reference or not reference.get("source_available") or reference.get("state") != "published":
         raise HTTPException(404, "Image de déploiement indisponible.")
@@ -5278,6 +5287,7 @@ def reference_images_page(request: Request):
         "mode": APPBOX_MODE,
         "hostname": HOSTNAME,
         "images": list_reference_images(),
+        "pending_deletions": reference_deletion.pending(),
         "versions": list_reference_versions(),
         "builders": reference_builders(),
         "capable_nodes": reference_capable_nodes("plex"),
