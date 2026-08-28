@@ -1472,7 +1472,7 @@ def get_appbox(client_id: str) -> dict[str, Any] | None:
 
 
 
-AGENT_ONLINE_SECONDS = 180
+AGENT_ONLINE_SECONDS = max(30, int(os.getenv("APPBOX_AGENT_ONLINE_SECONDS", "180")))
 
 
 def token_hash(token: str) -> str:
@@ -1505,15 +1505,56 @@ def authenticate_agent(request: Request, node_id: str) -> dict[str, Any]:
     return dict(token)
 
 
-def agent_is_online(last_heartbeat: str | None) -> bool:
-    if not last_heartbeat:
-        return False
+def heartbeat_liveness(last_heartbeat: str | None, *, maintenance: bool = False,
+                       now: datetime | None = None) -> dict[str, Any]:
+    """Receive-time based availability; persisted node.status is never consulted."""
+    current = now or datetime.now(timezone.utc)
+    age = None
     try:
-        heartbeat = datetime.fromisoformat(last_heartbeat)
-        current = datetime.now(timezone.utc)
-        return (current - heartbeat).total_seconds() <= AGENT_ONLINE_SECONDS
-    except Exception:
-        return False
+        stamp = datetime.fromisoformat(last_heartbeat) if last_heartbeat else None
+        if stamp is not None and stamp.tzinfo is not None:
+            elapsed = (current - stamp).total_seconds()
+            if elapsed >= 0:
+                age = elapsed
+    except (ValueError, TypeError, OverflowError):
+        pass
+    online = age is not None and age <= AGENT_ONLINE_SECONDS
+    state = 'online' if online else ('offline' if age is not None else 'unknown')
+    return {'status': 'maintenance' if maintenance else state,
+            'agent_online': online, 'heartbeat_age_seconds': age,
+            'liveness_reason': 'maintenance' if maintenance else (
+                'heartbeat_recent' if online else ('heartbeat_expired' if age is not None else 'heartbeat_missing_or_invalid')),
+            'heartbeat_timeout_seconds': AGENT_ONLINE_SECONDS}
+
+
+def agent_is_online(last_heartbeat: str | None) -> bool:
+    return heartbeat_liveness(last_heartbeat)['agent_online']
+
+
+def execution_block_reason(node: dict[str, Any], action: str) -> str | None:
+    """Execution depends on heartbeat/capability/policy, never telemetry freshness."""
+    if node.get('is_local') or node.get('node_id', '').lower() == 'cronos':
+        return 'Control Plane : exécution AppBox interdite.'
+    if not node.get('agent_online'):
+        return f"Node {node.get('status', 'unknown')} : heartbeat récent requis."
+    # Preserve maintenance cleanup: stop/delete remain available to an online agent.
+    if (node.get('maintenance') or node.get('status') == 'maintenance') and action not in {'stop', 'delete'}:
+        return 'Node en maintenance.'
+    if not node.get('capabilities', {}).get('deployment_executor'):
+        return 'Agent sans capacité de déploiement.'
+    return None
+
+
+def provisioning_block_reason(node: dict[str, Any], *, automatic: bool = False) -> str | None:
+    reason = execution_block_reason(node, 'deploy')
+    if reason:
+        return reason
+    if automatic:
+        if node.get('metrics_stale'):
+            return 'metrics stale : capacité non fiable pour le placement automatique.'
+        if not node.get('rdad_ok'):
+            return 'RDAD indisponible pour le placement automatique.'
+    return None
 
 
 def create_agent_token(node_id: str, label: str = "enrollment") -> tuple[str, str]:
@@ -1606,28 +1647,39 @@ def list_control_nodes() -> list[dict[str, Any]]:
                 GROUP BY node_id
             """).fetchall()
         }
+    current = datetime.now(timezone.utc)
     for node in nodes:
         node["tags"] = tags.get(node["node_id"], [])
         node["tag_ids"] = [tag["tag_id"] for tag in node["tags"]]
         node["appbox_count"] = appbox_counts.get(node["node_id"], 0)
         node["capabilities"] = json.loads(node.pop("capabilities_json") or "{}")
         node["is_local"] = node["node_id"] == HOSTNAME
-        heartbeat_online = agent_is_online(node.get("last_heartbeat"))
-        if node["is_local"]:
-            node["agent_status"] = "embedded"
-            node["agent_online"] = True
-        else:
-            node["agent_online"] = heartbeat_online
-            node["agent_status"] = "online" if heartbeat_online else (
-                node.get("agent_status") or "not_installed"
-            )
-        node["actionable"] = bool(
-            node["is_local"]
-            or (
-                node["agent_online"]
-                and node["capabilities"].get("deployment_executor", False)
-            )
-        )
+        node['persisted_status'] = node['status']
+        node['agent_installation_status'] = node.get('agent_status') or 'not_installed'
+        maintenance = bool(node['maintenance'] or 'maintenance' in node['tag_ids'])
+        node['maintenance'] = maintenance
+        node.update(heartbeat_liveness(node.get('last_heartbeat'), maintenance=maintenance, now=current))
+        node['agent_status'] = node['status']
+        if node['is_local']:
+            # This process answers the request; it is not a Docker execution agent.
+            node.update(status='maintenance' if maintenance else 'online',
+                        agent_status='embedded', agent_online=False,
+                        liveness_reason='local_control_plane', heartbeat_age_seconds=None)
+            node['metrics_collected_at'] = node.get('last_seen')
+        metric_liveness = heartbeat_liveness(node.get('metrics_collected_at'), now=current)
+        node['metrics_age_seconds'] = metric_liveness['heartbeat_age_seconds']
+        node['metrics_stale'] = not metric_liveness['agent_online']
+        node['metrics_fresh'] = not node['metrics_stale']
+        node['execution_capable'] = bool(node['capabilities'].get('deployment_executor'))
+        node['actionable'] = bool(node['status'] == 'online' and node['agent_online']
+                                  and not node['is_local'] and node['node_id'].lower() != 'cronos'
+                                  and node['capabilities'].get('deployment_executor', False))
+        node['provisioning_block_reason'] = provisioning_block_reason(node)
+        node['provisioning_allowed'] = node['provisioning_block_reason'] is None
+        node['provisioning_warning'] = ('metrics stale : capacité non fiable ; validation technique sur le nœud cible.'
+                                        if node['metrics_stale'] else None)
+        node['automatic_placement_block_reason'] = provisioning_block_reason(node, automatic=True)
+        node['automatic_placement_allowed'] = node['automatic_placement_block_reason'] is None
     return nodes
 
 
@@ -1664,8 +1716,9 @@ def evaluate_placement(
         node = by_id.get(requested_node_id or "")
         if not node:
             raise HTTPException(400, "Node cible introuvable.")
-        if node["maintenance"]:
-            raise HTTPException(409, "Le node cible est en maintenance.")
+        reason = provisioning_block_reason(node)
+        if reason:
+            raise HTTPException(409, reason)
         if "bare-metal" in node["tag_ids"] and not allow_bare_metal_override:
             raise HTTPException(
                 409,
@@ -1687,6 +1740,10 @@ def evaluate_placement(
     required_tag = config["automatic_required_tag"]
     excluded_tag = config["automatic_excluded_tag"]
     for node in nodes:
+        reason = provisioning_block_reason(node, automatic=True)
+        if reason:
+            reject(node, reason)
+            continue
         if required_tag not in node["tag_ids"]:
             reject(node, f"Tag requis {required_tag} absent")
             continue
@@ -1710,7 +1767,7 @@ def evaluate_placement(
     if not eligible:
         raise HTTPException(
             409,
-            "Aucun AppBox-Node éligible au placement automatique.",
+            "Aucun AppBox-Node éligible au placement automatique. " + "; ".join(f"{n['node_id']}: {n['reason']}" for n in rejected),
         )
 
     # Transparent, deterministic foundation score:
@@ -3641,14 +3698,9 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
 
     nodes = {node["node_id"]: node for node in list_control_nodes()}
     node = nodes.get(node_id)
-    if not node or not node.get("agent_online"):
-        fail_workflow(job_id, "validate_node", f"Agent du node {node_id} hors ligne.")
-        return
-    if not node.get("capabilities", {}).get("deployment_executor"):
-        fail_workflow(job_id, "validate_node", f"Agent {node_id} sans capacité deployment_executor.")
-        return
-    if node.get("maintenance") and action in {"deploy", "start", "restart", "recreate"}:
-        fail_workflow(job_id, "validate_node", f"Node {node_id} en maintenance.")
+    reason = execution_block_reason(node, action) if node else 'Node inconnu.'
+    if reason:
+        fail_workflow(job_id, 'validate_appbox' if action in {'stop', 'delete'} else 'validate_node', reason)
         return
 
     first_validation = "validate_appbox" if action in {"stop", "delete"} else "validate_node"
@@ -3780,14 +3832,20 @@ def execute_job(job: dict[str, Any]) -> None:
         execute_remote_job(job, item)
         return
 
+    if HOSTNAME.lower() == 'cronos':
+        fail_workflow(job_id, workflow_definition(action)[0][0], 'CRONOS est réservé au Control Plane.')
+        return
+    local_node = next((n for n in list_control_nodes() if n['node_id'] == HOSTNAME), None)
+    if not local_node or local_node['status'] != 'online':
+        fail_workflow(job_id, workflow_definition(action)[0][0], 'Node local indisponible ou en maintenance.')
+        return
     appbox_dir = Path(item["path"])
     output_parts: list[str] = []
 
     def validate_node() -> tuple[bool, str]:
         if not Path("/var/run/docker.sock").exists():
             return False, "Socket Docker indisponible."
-        with db() as con:
-            node = con.execute("SELECT maintenance,status FROM nodes WHERE node_id=?", (HOSTNAME,)).fetchone()
+        node = next((n for n in list_control_nodes() if n['node_id'] == HOSTNAME), None)
         if not node or node["status"] != "online":
             return False, "Node local indisponible."
         if node["maintenance"] and action in {"deploy", "start", "recreate"}:
@@ -4204,7 +4262,7 @@ def node_payload() -> dict[str, Any]:
         ).fetchone()[0]
         queued = con.execute("SELECT COUNT(*) FROM jobs WHERE node_id=? AND status='queued'", (HOSTNAME,)).fetchone()[0]
         running_jobs = con.execute("SELECT COUNT(*) FROM jobs WHERE node_id=? AND status='running'", (HOSTNAME,)).fetchone()[0]
-    result = dict(node) if node else {}
+    result = next((n for n in list_control_nodes() if n['node_id'] == HOSTNAME), {})
     result["metrics"] = latest_node_metric()
     result["appbox_count"] = appbox_count
     result["queued_jobs"] = queued
@@ -4378,7 +4436,7 @@ def register_node(
 def edit_node(
     node_id: str,
     name: str = Form(...),
-    status: str = Form(...),
+    status: str = Form("planned"),
     tag_ids: list[str] = Form([]),
     maintenance: bool = Form(False),
 ):
@@ -4393,11 +4451,10 @@ def edit_node(
     with db_lock, db() as con:
         con.execute("""
             UPDATE nodes
-            SET name=?,status=?,maintenance=?,updated_at=?
+            SET name=?,maintenance=?,updated_at=?
             WHERE node_id=?
         """, (
             name.strip() or node_id.upper(),
-            status,
             int(maintenance),
             stamp,
             node_id,
@@ -4551,6 +4608,116 @@ def create_agent_command(
     return RedirectResponse("/agents", status_code=303)
 
 
+def store_agent_metrics(con, node_id, metrics, agent_version, stamp):
+    sample = heartbeat_liveness(stamp)
+    if sample['heartbeat_age_seconds'] is None:
+        raise HTTPException(400, 'Horodatage de métriques invalide.')
+    previous = con.execute('SELECT collected_at FROM agent_node_metrics WHERE node_id=?', (node_id,)).fetchone()
+    if previous and previous['collected_at']:
+        try:
+            if datetime.fromisoformat(previous['collected_at']) >= datetime.fromisoformat(stamp):
+                return
+        except (TypeError, ValueError):
+            pass
+    con.execute("""
+        INSERT INTO agent_node_metrics(
+            node_id,hostname,os_name,kernel_version,docker_version,
+            compose_version,cpu_model,cpu_count,load_1,
+            memory_total_bytes,memory_available_bytes,
+            disk_total_bytes,disk_free_bytes,temperature_c,
+            gpu_present,rdad_present,docker_ok,collected_at,payload_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(node_id) DO UPDATE SET
+            hostname=excluded.hostname,
+            os_name=excluded.os_name,
+            kernel_version=excluded.kernel_version,
+            docker_version=excluded.docker_version,
+            compose_version=excluded.compose_version,
+            cpu_model=excluded.cpu_model,
+            cpu_count=excluded.cpu_count,
+            load_1=excluded.load_1,
+            memory_total_bytes=excluded.memory_total_bytes,
+            memory_available_bytes=excluded.memory_available_bytes,
+            disk_total_bytes=excluded.disk_total_bytes,
+            disk_free_bytes=excluded.disk_free_bytes,
+            temperature_c=excluded.temperature_c,
+            gpu_present=excluded.gpu_present,
+            rdad_present=excluded.rdad_present,
+            docker_ok=excluded.docker_ok,
+            collected_at=excluded.collected_at,
+            payload_json=excluded.payload_json
+    """, (
+        node_id,
+        metrics.get("hostname"),
+        metrics.get("os_name"),
+        metrics.get("kernel_version"),
+        metrics.get("docker_version"),
+        metrics.get("compose_version"),
+        metrics.get("cpu_model"),
+        metrics.get("cpu_count"),
+        metrics.get("load_1"),
+        metrics.get("memory_total_bytes"),
+        metrics.get("memory_available_bytes"),
+        metrics.get("disk_total_bytes"),
+        metrics.get("disk_free_bytes"),
+        metrics.get("temperature_c"),
+        int(bool(metrics.get("gpu_present"))),
+        int(bool(metrics.get("rdad_present"))),
+        int(bool(metrics.get("docker_ok"))),
+        stamp,
+        json.dumps(metrics, ensure_ascii=False),
+    ))
+    memory_total = int(metrics.get("memory_total_bytes") or 0)
+    memory_available = int(metrics.get("memory_available_bytes") or 0)
+    disk_total = int(metrics.get("disk_total_bytes") or 0)
+    disk_free = int(metrics.get("disk_free_bytes") or 0)
+    con.execute("""
+        INSERT INTO node_metrics(
+            node_id,collected_at,cpu_percent,load_1,ram_percent,ram_used,ram_total,
+            disk_percent,disk_free,disk_read_bps,disk_write_bps,net_rx_bps,net_tx_bps,
+            docker_containers,running_containers
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        node_id,stamp,float(metrics.get("cpu_percent") or 0),float(metrics.get("load_1") or 0),
+        ((memory_total-memory_available)/memory_total*100) if memory_total else 0,
+        max(0,memory_total-memory_available),memory_total,
+        ((disk_total-disk_free)/disk_total*100) if disk_total else 0,disk_free,
+        float(metrics.get("disk_read_bps") or 0),float(metrics.get("disk_write_bps") or 0),
+        float(metrics.get("net_rx_bps") or 0),float(metrics.get("net_tx_bps") or 0),
+        int(metrics.get("docker_containers") or 0),int(metrics.get("running_containers") or 0),
+    ))
+    con.execute("""
+        UPDATE nodes
+        SET docker_version=?,
+            agent_version=?,
+            rdad_ok=?,
+            gpu_ok=?,
+            updated_at=?
+        WHERE node_id=?
+    """, (
+        metrics.get("docker_version"),
+        agent_version,
+        int(bool(metrics.get("rdad_present"))),
+        int(bool(metrics.get("gpu_present"))),
+        stamp,
+        node_id,
+    ))
+
+
+@app.post('/api/agent/v1/{node_id}/metrics')
+async def agent_metrics(node_id: str, request: Request):
+    authenticate_agent(request, node_id)
+    payload = await request.json()
+    metrics = payload.get('metrics')
+    if not isinstance(metrics, dict) or not metrics or not payload.get('collected_at'):
+        raise HTTPException(400, 'Échantillon de métriques absent.')
+    with db_lock, db() as con:
+        if not con.execute('SELECT 1 FROM nodes WHERE node_id=?', (node_id,)).fetchone():
+            raise HTTPException(404, 'Node non enregistré.')
+        store_agent_metrics(con, node_id, metrics, str(payload.get('agent_version') or 'unknown'), payload['collected_at'])
+    return JSONResponse({'status': 'ok'})
+
+
 @app.post("/api/agent/v1/{node_id}/heartbeat")
 async def agent_heartbeat(node_id: str, request: Request):
     authenticate_agent(request, node_id)
@@ -4590,96 +4757,16 @@ async def agent_heartbeat(node_id: str, request: Request):
             stamp,
             stamp,
         ))
-        con.execute("""
-            INSERT INTO agent_node_metrics(
-                node_id,hostname,os_name,kernel_version,docker_version,
-                compose_version,cpu_model,cpu_count,load_1,
-                memory_total_bytes,memory_available_bytes,
-                disk_total_bytes,disk_free_bytes,temperature_c,
-                gpu_present,rdad_present,docker_ok,collected_at,payload_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(node_id) DO UPDATE SET
-                hostname=excluded.hostname,
-                os_name=excluded.os_name,
-                kernel_version=excluded.kernel_version,
-                docker_version=excluded.docker_version,
-                compose_version=excluded.compose_version,
-                cpu_model=excluded.cpu_model,
-                cpu_count=excluded.cpu_count,
-                load_1=excluded.load_1,
-                memory_total_bytes=excluded.memory_total_bytes,
-                memory_available_bytes=excluded.memory_available_bytes,
-                disk_total_bytes=excluded.disk_total_bytes,
-                disk_free_bytes=excluded.disk_free_bytes,
-                temperature_c=excluded.temperature_c,
-                gpu_present=excluded.gpu_present,
-                rdad_present=excluded.rdad_present,
-                docker_ok=excluded.docker_ok,
-                collected_at=excluded.collected_at,
-                payload_json=excluded.payload_json
-        """, (
-            node_id,
-            metrics.get("hostname"),
-            metrics.get("os_name"),
-            metrics.get("kernel_version"),
-            metrics.get("docker_version"),
-            metrics.get("compose_version"),
-            metrics.get("cpu_model"),
-            metrics.get("cpu_count"),
-            metrics.get("load_1"),
-            metrics.get("memory_total_bytes"),
-            metrics.get("memory_available_bytes"),
-            metrics.get("disk_total_bytes"),
-            metrics.get("disk_free_bytes"),
-            metrics.get("temperature_c"),
-            int(bool(metrics.get("gpu_present"))),
-            int(bool(metrics.get("rdad_present"))),
-            int(bool(metrics.get("docker_ok"))),
-            stamp,
-            json.dumps(metrics, ensure_ascii=False),
-        ))
-        memory_total = int(metrics.get("memory_total_bytes") or 0)
-        memory_available = int(metrics.get("memory_available_bytes") or 0)
-        disk_total = int(metrics.get("disk_total_bytes") or 0)
-        disk_free = int(metrics.get("disk_free_bytes") or 0)
-        con.execute("""
-            INSERT INTO node_metrics(
-                node_id,collected_at,cpu_percent,load_1,ram_percent,ram_used,ram_total,
-                disk_percent,disk_free,disk_read_bps,disk_write_bps,net_rx_bps,net_tx_bps,
-                docker_containers,running_containers
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            node_id,stamp,float(metrics.get("cpu_percent") or 0),float(metrics.get("load_1") or 0),
-            ((memory_total-memory_available)/memory_total*100) if memory_total else 0,
-            max(0,memory_total-memory_available),memory_total,
-            ((disk_total-disk_free)/disk_total*100) if disk_total else 0,disk_free,
-            float(metrics.get("disk_read_bps") or 0),float(metrics.get("disk_write_bps") or 0),
-            float(metrics.get("net_rx_bps") or 0),float(metrics.get("net_tx_bps") or 0),
-            int(metrics.get("docker_containers") or 0),int(metrics.get("running_containers") or 0),
-        ))
-        con.execute("""
-            UPDATE nodes
-            SET status='online',
-                docker_version=?,
-                agent_version=?,
-                rdad_ok=?,
-                gpu_ok=?,
-                last_seen=?,
-                updated_at=?
-            WHERE node_id=?
-        """, (
-            metrics.get("docker_version"),
-            agent_version,
-            int(bool(metrics.get("rdad_present"))),
-            int(bool(metrics.get("gpu_present"))),
-            stamp,
-            stamp,
-            node_id,
-        ))
+        con.execute('UPDATE nodes SET last_seen=?,agent_version=? WHERE node_id=?', (stamp, agent_version, node_id))
+        # Old agents may still send metrics with a heartbeat. Lightweight heartbeats
+        # must leave the previous sample and its timestamp completely unchanged.
+        if metrics:
+            store_agent_metrics(con, node_id, metrics, agent_version,
+                                payload.get('metrics_collected_at') or stamp)
     return JSONResponse({
         "status": "ok",
         "server_version": VERSION,
-        "heartbeat_interval": 60,
+        "heartbeat_interval": min(60, AGENT_ONLINE_SECONDS // 3),
     })
 
 
@@ -4748,6 +4835,7 @@ def api_reconciliation_run(node_id: str):
 @app.get("/api/agent/v1/{node_id}/commands")
 def agent_poll_commands(node_id: str, request: Request):
     authenticate_agent(request, node_id)
+    node = next((n for n in list_control_nodes() if n['node_id'] == node_id), None)
     with db_lock, db() as con:
         row = con.execute("""
             SELECT * FROM agent_commands
@@ -4756,6 +4844,13 @@ def agent_poll_commands(node_id: str, request: Request):
         """, (node_id,)).fetchone()
         if not row:
             return JSONResponse({"command": None})
+        queued_payload = json.loads(row['payload_json'] or '{}')
+        if row['command_type'] == 'appbox_action':
+            if not node or execution_block_reason(node, queued_payload.get('action', '')):
+                return JSONResponse({'command': None, 'reason': 'node_unavailable'})
+        if row['command_type'] in {'reference_discovery', 'reference_build'}:
+            if not node or node['status'] != 'online' or not node['agent_online']:
+                return JSONResponse({'command': None, 'reason': 'node_unavailable'})
         con.execute("""
             UPDATE agent_commands
             SET status='claimed',claimed_at=?
@@ -5022,7 +5117,7 @@ def launch_reference_discovery(build_id: str, source_instance: str = "") -> tupl
         raise HTTPException(404, "Build de référence introuvable.")
     nodes = {node["node_id"]: node for node in list_control_nodes()}
     node = nodes.get(build["source_node_id"])
-    if not node or not node.get("agent_online"):
+    if not node or node.get("status") != "online" or not node.get("agent_online"):
         raise HTTPException(409, "L’agent du node source est hors ligne.")
     caps = node.get("capabilities") or {}
     if not caps.get("reference_discovery"):
@@ -5971,6 +6066,12 @@ def enqueue_action(request: Request, client_id: str, action: str):
     item = get_appbox(client_id)
     if not item:
         raise HTTPException(404, "AppBox introuvable.")
+    if action in {'deploy', 'start', 'stop', 'restart', 'recreate'}:
+        node_id = str(item.get('node_id') or HOSTNAME)
+        node = next((n for n in list_control_nodes() if n['node_id'] == node_id), None)
+        reason = execution_block_reason(node, action) if node else 'Node inconnu.'
+        if reason:
+            raise HTTPException(409, reason)
     if active_job_for(client_id):
         raise HTTPException(409, "Une opération est déjà en attente ou en cours pour cette AppBox.")
     runtime = container_runtime(str(item.get("node_id") or HOSTNAME), item["containers"][0])
@@ -6059,10 +6160,9 @@ def claim_appbox(client_id: str, claim_code: str = Form(...)):
     node_id = str(item.get("node_id") or HOSTNAME)
     nodes = {node["node_id"]: node for node in list_control_nodes()}
     node = nodes.get(node_id)
-    if not node or not node.get("agent_online"):
-        raise HTTPException(409, f"Agent du node {node_id} hors ligne.")
-    if not node.get("capabilities", {}).get("deployment_executor"):
-        raise HTTPException(409, f"Agent {node_id} sans capacité deployment_executor.")
+    reason = execution_block_reason(node, 'claim') if node else 'Node inconnu.'
+    if reason:
+        raise HTTPException(409, reason)
 
     command_id = queue_agent_command(node_id, "appbox_action", {
         "client_id": client_id,
@@ -6208,7 +6308,13 @@ def api_node_status(node_id: str):
         "docker_containers": int(payload.get("docker_containers") or 0),
         "running_containers": int(payload.get("running_containers") or 0),
     }
-    return JSONResponse({"metrics": metrics, "running_jobs": 0, "queued_jobs": 0})
+    return JSONResponse({**{key: node[key] for key in (
+        'status', 'agent_status', 'agent_online', 'last_heartbeat', 'heartbeat_age_seconds',
+        'heartbeat_timeout_seconds', 'liveness_reason', 'actionable', 'provisioning_allowed',
+        'provisioning_block_reason', 'provisioning_warning', 'automatic_placement_allowed',
+        'automatic_placement_block_reason', 'execution_capable', 'metrics_collected_at',
+        'metrics_age_seconds', 'metrics_stale', 'metrics_fresh')},
+        "metrics": metrics, "running_jobs": 0, "queued_jobs": 0})
 
 
 @app.get("/api/nodes/{node_id}/metrics")

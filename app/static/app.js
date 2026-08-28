@@ -381,3 +381,20 @@ document.addEventListener('DOMContentLoaded',()=>{
    if(command)await navigator.clipboard.writeText(command.textContent);
  });
 });
+
+// Server-side liveness remains authoritative; refresh badges even on an idle page.
+async function pollAvailability(id){
+ const badges=()=>$$('[data-node-liveness]').filter(el=>el.dataset.nodeLiveness===id);
+ try{
+  const r=await fetch(`/api/nodes/${encodeURIComponent(id)}/status`,{cache:'no-store'});
+  if(!r.ok)throw new Error('statut indisponible');
+  const p=await r.json();
+  for(const el of badges()){el.textContent=(p.status||'unknown').toUpperCase();el.classList.toggle('ok',p.status==='online');el.classList.toggle('warn',p.status!=='online');el.title=p.liveness_reason||'';}
+  for(const el of $$('[data-node-freshness]').filter(el=>el.dataset.nodeFreshness===id))el.textContent=`${p.metrics_collected_at||'Jamais'}${p.metrics_stale?' — expirées':''}`;
+  for(const el of $$('[data-node-placement]').filter(el=>el.dataset.nodePlacement===id)){el.textContent=`${el.dataset.nodeLabel} · ${(p.status||'unknown').toUpperCase()}${(p.provisioning_block_reason||p.provisioning_warning)?' · '+(p.provisioning_block_reason||p.provisioning_warning):''}`;el.disabled=!p.provisioning_allowed;el.title=p.provisioning_block_reason||p.provisioning_warning||'';if(el.disabled&&el.selected){el.selected=false;el.closest('select').value='';}}
+ }catch(e){
+  for(const el of badges()){el.textContent='UNKNOWN';el.classList.remove('ok');el.classList.add('warn');el.title='Control Plane inaccessible : disponibilité non confirmée';}
+  for(const el of $$('[data-node-placement]').filter(el=>el.dataset.nodePlacement===id)){el.textContent=`${el.dataset.nodeLabel} · UNKNOWN`;el.disabled=true;if(el.selected){el.selected=false;el.closest('select').value='';}}
+ }finally{setTimeout(()=>pollAvailability(id),5000);}
+}
+for(const id of new Set([...$$('[data-node-liveness]'),...$$('[data-node-placement]')].map(el=>el.dataset.nodeLiveness||el.dataset.nodePlacement)))pollAvailability(id);

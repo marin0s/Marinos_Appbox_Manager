@@ -37,8 +37,8 @@
    <label data-target-node>Node cible
     <select name="target_node_id">
      {% for node in nodes %}
-     <option value="{{node.node_id}}" {{'selected' if node.node_id==hostname else ''}} {{'disabled' if not node.actionable else ''}}>
-      {{node.name}}{% if 'bare-metal' in node.tag_ids %} · Bare-Metal{% elif 'appbox-node' in node.tag_ids %} · AppBox-Node{% endif %}{% if not node.actionable %} · Agent absent{% endif %}
+     <option value="{{node.node_id}}" data-node-placement="{{node.node_id}}" data-node-label="{{node.name}}" {{'disabled' if not node.provisioning_allowed else ''}}>
+      {{node.name}}{% if 'bare-metal' in node.tag_ids %} · Bare-Metal{% elif 'appbox-node' in node.tag_ids %} · AppBox-Node{% endif %} · {{node.status|upper}}{% if not node.provisioning_allowed %} · {{node.provisioning_block_reason}}{% elif node.provisioning_warning %} · {{node.provisioning_warning}}{% endif %}
      </option>
      {% endfor %}
     </select>

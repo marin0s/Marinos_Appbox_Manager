@@ -9,7 +9,7 @@
   <thead><tr><th>Image / version</th>{% for node in nodes %}<th>{{node.name}}</th>{% endfor %}</tr></thead>
   <tbody>{% for item in matrix %}<tr>
    <td><strong>{{item.image_name}}</strong><small>{{item.version}} · {{item.media_type|upper}}</small></td>
-   {% for cell in item.nodes %}<td><span class="pill {{'ok' if cell.distribution.status in ['local','synced'] else 'warn'}}">{{cell.distribution.status|upper}}</span><small>{{cell.node.agent_status or 'agent absent'}}</small></td>{% endfor %}
+   {% for cell in item.nodes %}<td><span class="pill {{'ok' if cell.distribution.status in ['local','synced'] else 'warn'}}">{{cell.distribution.status|upper}}</span><small data-node-liveness="{{cell.node.node_id}}">{{cell.node.status|upper}}</small></td>{% endfor %}
   </tr>{% endfor %}</tbody>
  </table>
 </div>

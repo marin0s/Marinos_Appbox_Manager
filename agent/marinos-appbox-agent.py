@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from threading import Event, Lock, Thread
 import uuid
 import urllib.error
 import urllib.request
@@ -1437,15 +1438,15 @@ def api(config, method, path, payload=None):
         return json.loads(raw.decode("utf-8")) if raw else {}
 
 
-def heartbeat(config):
-    metrics = collect_metrics(config)
+def heartbeat(config, metrics=None):
+    metrics = metrics or {}
     payload = {
         "agent_id": config.get("agent_id", f"agent-{config['node_id']}"),
         "agent_version": VERSION,
         "endpoint": config.get("endpoint", ""),
         "capabilities": {
-            "docker": metrics["docker_ok"],
-            "compose": metrics["compose_version"] is not None,
+            "docker": bool(metrics.get("docker_ok")),
+            "compose": metrics.get("compose_version") is not None,
             "filesystem": True,
             "inventory": True,
             "reference_distribution": True,
@@ -1458,8 +1459,8 @@ def heartbeat(config):
             "reference_builder_intrusive_actions": False,
             "deployment_executor": True,
             "plex_runtime_preferences": True,
+            "independent_heartbeat": True,
         },
-        "metrics": metrics,
     }
     return api(
         config,
@@ -1849,7 +1850,7 @@ def execute_command(config, command):
     raise RuntimeError(f"Commande non supportée : {command_type}")
 
 
-def command_cycle(config):
+def command_cycle(config, inventory_request=None):
     response = api(
         config,
         "GET",
@@ -1859,8 +1860,15 @@ def command_cycle(config):
     if not command:
         return
     try:
-        result = execute_command(config, command)
-        if command.get("command_type") == "appbox_action":
+        if command.get('command_type') == 'inventory' and inventory_request is not None:
+            inventory_request.set()
+            result = {'inventory_refresh': 'scheduled'}
+        else:
+            result = execute_command(config, command)
+        if command.get('command_type') == 'appbox_action' and inventory_request is not None:
+            inventory_request.set()
+            result['inventory_sync'] = 'scheduled'
+        elif command.get("command_type") == "appbox_action":
             try:
                 result["inventory_sync"] = send_inventory(config)
             except Exception as inventory_exc:
@@ -1878,37 +1886,78 @@ def command_cycle(config):
     )
 
 
-def main():
-    config = json.loads(CONFIG.read_text())
-    heartbeat_interval = max(15, int(config.get("heartbeat_interval", 60)))
-    inventory_interval = max(10, int(config.get("inventory_interval", 30)))
-    command_poll_interval = max(1, int(config.get("command_poll_interval", 2)))
+class AgentLoops:
+    """One serial business worker, independent lightweight heartbeat and telemetry."""
+    def __init__(self, config):
+        self.config = config
+        self.stop = Event()
+        self.inventory_request = Event()
+        self.lock = Lock()
+        self.metrics = {}
+        self.heartbeat_interval = min(60, max(1, float(config.get('heartbeat_interval', 60))))
+        self.inventory_interval = max(1, float(config.get('inventory_interval', 30)))
+        self.command_interval = max(0.1, float(config.get('command_poll_interval', 2)))
 
-    next_heartbeat = 0.0
-    next_inventory = 0.0
+    def report_error(self, loop, exc):
+        # Never print HTTP bodies (which may contain credentials).
+        print(f"Agent {loop}: {_sanitize_diagnostic_text(str(exc))}", flush=True)
 
-    while True:
-        now = time.monotonic()
+    def heartbeat_loop(self):
+        while not self.stop.is_set():
+            try:
+                with self.lock:
+                    metrics = dict(self.metrics)
+                response = heartbeat(self.config, metrics)
+                recommended = response.get('heartbeat_interval')
+                if recommended is not None:
+                    self.heartbeat_interval = min(self.heartbeat_interval, max(1, float(recommended)))
+            except Exception as exc:
+                self.report_error('heartbeat', exc)
+            self.stop.wait(self.heartbeat_interval)
+
+    def telemetry_loop(self):
+        while not self.stop.is_set():
+            self.inventory_request.clear()
+            try:
+                # Timestamp the beginning of collection, not a delayed upload.
+                stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                metrics = collect_metrics(self.config)
+                with self.lock:
+                    self.metrics = dict(metrics)
+                api(self.config, 'POST', f"/api/agent/v1/{self.config['node_id']}/metrics",
+                    {'agent_version': VERSION, 'collected_at': stamp, 'metrics': metrics})
+            except Exception as exc:
+                self.report_error('metrics', exc)
+            try:
+                send_inventory(self.config)
+            except Exception as exc:
+                self.report_error('inventory', exc)
+            self.inventory_request.wait(self.inventory_interval)
+
+    def command_loop(self):
+        while not self.stop.is_set():
+            try:
+                command_cycle(self.config, self.inventory_request)
+            except Exception as exc:
+                self.report_error('command', exc)
+            self.stop.wait(self.command_interval)
+
+    def run(self):
+        workers = [Thread(target=target, name=name, daemon=True) for name, target in (
+            ('agent-heartbeat', self.heartbeat_loop), ('agent-telemetry', self.telemetry_loop))]
+        for worker in workers:
+            worker.start()
         try:
-            # Les commandes sont interrogées indépendamment du heartbeat afin que
-            # start/stop/restart/delete soient pris en charge en quelques secondes.
-            command_cycle(config)
+            self.command_loop()
+        finally:
+            self.stop.set()
+            self.inventory_request.set()
+            for worker in workers:
+                worker.join(timeout=2)
 
-            now = time.monotonic()
-            if now >= next_heartbeat:
-                heartbeat(config)
-                next_heartbeat = time.monotonic() + heartbeat_interval
 
-            now = time.monotonic()
-            if now >= next_inventory:
-                send_inventory(config)
-                next_inventory = time.monotonic() + inventory_interval
-        except urllib.error.HTTPError as exc:
-            print(f"HTTP {exc.code}: {exc.read().decode(errors='replace')}", flush=True)
-        except Exception as exc:
-            print(f"Agent error: {exc}", flush=True)
-
-        time.sleep(command_poll_interval)
+def main():
+    AgentLoops(json.loads(CONFIG.read_text(encoding='utf-8'))).run()
 
 
 if __name__ == "__main__":

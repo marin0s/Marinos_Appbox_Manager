@@ -18,13 +18,13 @@
 <article class="card control-node-card">
  <div class="card-top">
   <div><div class="eyebrow">{{node.node_id}}</div><h3><a href="/nodes/{{node.node_id}}">{{node.name}}</a></h3></div>
-  <span class="pill {{'ok' if node.status=='online' else 'warn'}}">{{node.status|upper}}</span>
+  <span data-node-liveness="{{node.node_id}}" class="pill {{'ok' if node.status=='online' else 'warn'}}" title="{{node.liveness_reason}}">{{node.status|upper}}</span>
  </div>
  <div class="node-tags">{% for tag in node.tags %}<span class="service-chip {{'warning' if tag.tag_id=='bare-metal' else ''}}">{{tag.name}}</span>{% else %}<span class="metric-sub">Aucun tag</span>{% endfor %}</div>
  <div class="node-summary-grid">
-  <div><span>Agent</span><strong>{{node.agent_status or 'not_installed'}}</strong></div>
+  <div><span>Agent</span><strong data-node-liveness="{{node.node_id}}">{{node.status|upper}}</strong></div>
   <div><span>AppBox</span><strong>{{node.appbox_count}}</strong></div>
-  <div><span>RDAD</span><strong>{{'OK' if node.rdad_ok else 'NON'}}</strong></div>
+  <div><span>RDAD</span><strong>{{'INCONNU (métriques expirées)' if node.metrics_stale else ('OK' if node.rdad_ok else 'NON')}}</strong></div>
   <div><span>Maintenance</span><strong>{{'OUI' if node.maintenance else 'NON'}}</strong></div>
  </div>
  <div class="actions">
@@ -41,7 +41,7 @@
  <div class="modal-head"><div><div class="eyebrow">Registre</div><h3>Ajouter un node</h3></div><button class="close" data-close-dialog>×</button></div>
  <form method="post" action="/nodes" class="modal-form">
   <div class="grid two"><label>Identifiant<input name="node_id" required placeholder="demeter"></label><label>Nom affiché<input name="name" required placeholder="DEMETER"></label></div>
-  <label>État initial<select name="status"><option value="planned">Planifié</option><option value="offline">Hors ligne</option><option value="online">En ligne</option></select></label>
+  <p>La disponibilité est calculée depuis le heartbeat. Sans heartbeat : UNKNOWN.</p>
   <div class="tag-check-grid">{% for tag in tags %}<label><input type="checkbox" name="tag_ids" value="{{tag.tag_id}}"><span><strong>{{tag.name}}</strong><small>{{tag.description}}</small></span></label>{% endfor %}</div>
   <div class="modal-actions"><button>Enregistrer</button><button type="button" class="secondary" data-close-dialog>Annuler</button></div>
  </form>
@@ -58,13 +58,7 @@
    <label>Nom affiché
     <input name="name" required value="{{node.name}}">
    </label>
-   <label>État administratif
-    <select name="status">
-     <option value="planned" {{'selected' if node.status=='planned' else ''}}>Planifié</option>
-     <option value="offline" {{'selected' if node.status=='offline' else ''}}>Hors ligne</option>
-     <option value="online" {{'selected' if node.status=='online' else ''}}>En ligne</option>
-    </select>
-   </label>
+   <p>Disponibilité automatique ; utiliser Maintenance pour interdire le placement.</p>
   </div>
   <div class="tag-check-grid">
    {% for tag in tags %}

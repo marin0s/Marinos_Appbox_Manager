@@ -1,0 +1,114 @@
+import threading
+import unittest
+import asyncio
+import json
+import tempfile
+from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+from test_agent_deployment import agent
+from test_node_liveness import Request
+from app import main
+
+
+class AgentLoopTests(unittest.TestCase):
+    def test_heartbeat_does_not_collect_or_send_metrics(self):
+        with patch.object(agent, 'collect_metrics', side_effect=AssertionError('heavy work')), patch.object(agent, 'api', return_value={}) as api:
+            agent.heartbeat({'node_id':'test'}, {'docker_ok':True, 'cpu_count':8})
+        payload = api.call_args.args[3]
+        self.assertNotIn('metrics', payload)
+        self.assertTrue(payload['capabilities']['independent_heartbeat'])
+
+    def test_long_command_and_blocked_telemetry_do_not_block_heartbeats(self):
+        loops = agent.AgentLoops({'node_id':'test'})
+        loops.heartbeat_interval = .01
+        loops.command_interval = .01
+        loops.inventory_interval = .01
+        command_entered, metrics_entered, release = (threading.Event() for _ in range(3))
+        heartbeats_continue = threading.Event()
+        calls = {'polls':0, 'beats':0, 'executions':0}
+        clock = [datetime.now(timezone.utc)]
+        statuses = []
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0]
+
+        def api(config, method, path, payload=None):
+            if path.endswith('/heartbeat'):
+                if command_entered.is_set() and metrics_entered.is_set():
+                    # Advance beyond the default timeout while the same command is
+                    # still blocked. Only real handler heartbeats keep CP online.
+                    clock[0] += timedelta(seconds=120)
+                    asyncio.run(main.agent_heartbeat('test', Request(payload)))
+                    statuses.append(json.loads(main.api_node_status('test').body)['status'])
+                    calls['beats'] += 1
+                    if calls['beats'] >= 3:
+                        heartbeats_continue.set()
+                return {}
+            if path.endswith('/commands'):
+                calls['polls'] += 1
+                return {'command':{'command_id':'one', 'command_type':'reference_build'}}
+            return {}
+
+        def execute(config, command):
+            calls['executions'] += 1
+            command_entered.set()
+            if not release.wait(5):
+                raise AssertionError('test worker not released')
+            return {'ok':True}
+
+        def metrics(config):
+            metrics_entered.set()
+            release.wait(5)
+            return {'docker_ok':True}
+
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            stack.enter_context(patch.object(main, 'DB_FILE', Path(directory)/'loops.db'))
+            stack.enter_context(patch.object(main, 'HOSTNAME', 'cronos'))
+            stack.enter_context(patch.object(main, 'datetime', Clock))
+            stack.enter_context(patch.object(main, 'authenticate_agent'))
+            main.init_database()
+            with main.db() as con:
+                con.execute("INSERT INTO nodes(node_id,name,mode,status,created_at,updated_at) VALUES('test','TEST','remote','online',?,?)", (main.now_iso(), main.now_iso()))
+            self.assertEqual(json.loads(main.api_node_status('test').body)['status'], 'unknown')
+            stack.enter_context(patch.object(agent, 'api', side_effect=api))
+            stack.enter_context(patch.object(agent, 'execute_command', side_effect=execute))
+            stack.enter_context(patch.object(agent, 'collect_metrics', side_effect=metrics))
+            stack.enter_context(patch.object(agent, 'send_inventory', return_value={}))
+            runner = threading.Thread(target=loops.run)
+            runner.start()
+            try:
+                self.assertTrue(heartbeats_continue.wait(3), 'heartbeat blocked by another worker')
+                self.assertEqual(calls['executions'], 1)
+                self.assertEqual(calls['polls'], 1, 'business work must remain sequential')
+                self.assertTrue(all(status == 'online' for status in statuses))
+                self.assertGreaterEqual(len(statuses), 3)
+            finally:
+                loops.stop.set()
+                loops.inventory_request.set()
+                release.set()
+                runner.join(4)
+            self.assertFalse(runner.is_alive())
+
+    def test_inventory_command_requests_the_single_collector(self):
+        request = threading.Event()
+        with patch.object(agent, 'api', side_effect=[{'command':{'command_id':'refresh','command_type':'inventory'}},{}]), patch.object(agent, 'execute_command') as execute:
+            agent.command_cycle({'node_id':'test'}, request)
+        self.assertTrue(request.is_set())
+        execute.assert_not_called()
+
+    def test_failed_heartbeat_retries_and_respects_server_interval(self):
+        loops = agent.AgentLoops({'node_id':'test', 'heartbeat_interval':60})
+        waits = []
+        def wait(seconds):
+            waits.append(seconds)
+            if len(waits) == 2:
+                loops.stop.set()
+        with patch.object(agent, 'heartbeat', side_effect=[RuntimeError('network unavailable'), {'heartbeat_interval':10}]), patch.object(loops.stop, 'wait', side_effect=wait), patch.object(loops, 'report_error') as error:
+            loops.heartbeat_loop()
+        self.assertEqual(waits, [60, 10])
+        error.assert_called_once()

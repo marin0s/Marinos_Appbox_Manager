@@ -5,7 +5,7 @@
 <section class="hero">
  <div><div class="eyebrow">Supervision node</div><h1>{{node.name}}</h1>
  <p>{{'Monitoring temps réel du Control Plane local.' if node.is_local else 'Inventaire et heartbeat remontés par l’agent distant.'}}</p></div>
- <span class="pill {{'ok' if node.agent_online or node.is_local else 'warn'}}"><span class="dot"></span>{{'ONLINE' if node.agent_online or node.is_local else 'OFFLINE'}}</span>
+ <span data-node-liveness="{{node.node_id}}" class="pill {{'ok' if node.status=='online' else 'warn'}}" title="{{node.liveness_reason}}">{{node.status|upper}}</span>
 </section>
 
 {% if node.is_local %}
@@ -27,23 +27,23 @@
   <div class="info-row"><span>Hostname</span><strong>{{node.hostname or node.name}}</strong></div>
   <div class="info-row"><span>OS</span><strong>{{node.os_name or 'Inconnu'}}</strong></div>
   <div class="info-row"><span>Kernel</span><strong>{{node.kernel_version or 'Inconnu'}}</strong></div>
-  <div class="info-row"><span>Dernier heartbeat</span><strong>{{node.last_heartbeat or node.last_seen or 'Jamais'}}</strong></div>
+  <div class="info-row"><span>Dernier heartbeat</span><strong>{{node.last_heartbeat or 'Jamais'}}</strong></div>
  </div></div>
  <div class="card"><h2>Agent</h2><div class="info-list">
   <div class="info-row"><span>Version</span><strong>{{node.registered_agent_version or node.agent_version or 'Inconnue'}}</strong></div>
   <div class="info-row"><span>Docker</span><strong>{{node.docker_version or 'Inconnu'}}</strong></div>
   <div class="info-row"><span>Compose</span><strong>{{node.compose_version or 'Inconnu'}}</strong></div>
-  <div class="info-row"><span>Inventaire</span><strong>{{node.metrics_collected_at or 'Jamais'}}</strong></div>
+  <div class="info-row"><span>Métriques</span><strong data-node-freshness="{{node.node_id}}">{{node.metrics_collected_at or 'Jamais'}}{{' — expirées' if node.metrics_stale else ''}}</strong></div>
  </div></div>
 </div>
 {% endif %}
 
 <div class="section-head"><div><h2>Services système</h2></div></div>
 <div class="grid metrics">
- <div class="card"><div class="metric-label">RDAD</div><div class="metric-value {{'ok' if node.rdad_ok else 'bad'}}">{{'ONLINE' if node.rdad_ok else 'OFFLINE'}}</div></div>
+ <div class="card"><div class="metric-label">RDAD</div><div class="metric-value {{'ok' if node.rdad_ok else 'bad'}}">{{'INCONNU' if node.metrics_stale and not node.is_local else ('ONLINE' if node.rdad_ok else 'OFFLINE')}}</div></div>
  <div class="card"><div class="metric-label">GPU /dev/dri</div><div class="metric-value {{'ok' if node.gpu_ok else 'warn'}}">{{'PRÉSENT' if node.gpu_ok else 'ABSENT'}}</div></div>
  <div class="card"><div class="metric-label">AppBox</div><div class="metric-value">{{node.appbox_count}}</div></div>
- <div class="card"><div class="metric-label">État agent</div><div class="metric-value" style="font-size:22px">{{node.agent_status|upper}}</div></div>
+ <div class="card"><div class="metric-label">État agent</div><div class="metric-value" data-node-liveness="{{node.node_id}}" style="font-size:22px">{{node.status|upper}}</div></div>
 </div>
 
 {% if node.is_local %}

@@ -102,7 +102,7 @@ class ReferenceBuildOrchestrationTests(unittest.TestCase):
 
     def test_control_plane_claim_erases_queued_token_on_success_and_failure(self):
         item={'type':'plex','node_id':'ouranos','containers':['plex-appb-test']}
-        nodes=[{'node_id':'ouranos','agent_online':True,'capabilities':{'deployment_executor':True,'plex_runtime_preferences':True}}]
+        nodes=[{'node_id':'ouranos','agent_online':True,'status':'online','actionable':True,'rdad_ok':True,'capabilities':{'deployment_executor':True,'plex_runtime_preferences':True}}]
         for ok,result,error in [(True,{'claimed':True},''),(True,{'claimed':False},'claim refused'),(False,{},'timeout')]:
             with self.subTest(ok=ok,result=result), patch.object(main,'get_appbox',return_value=item), patch.object(main,'list_control_nodes',return_value=nodes), patch.object(main,'wait_agent_command',return_value=(ok,result,error)), patch.object(main,'record_event') as event:
                 if ok and result.get('claimed'):
@@ -131,7 +131,7 @@ class ReferenceBuildOrchestrationTests(unittest.TestCase):
     def test_restore_job_rejects_unverified_agent_success(self):
         item={'node_id':'ouranos','path':self.tmp.name,'type':'plex','reference_version_id':'v1','containers':['plex-appb-test']}
         job={'job_id':'job-test','client_id':'abtest','action':'deploy'}
-        nodes=[{'node_id':'ouranos','agent_online':True,'capabilities':{'deployment_executor':True,'plex_runtime_preferences':True}}]
+        nodes=[{'node_id':'ouranos','agent_online':True,'status':'online','actionable':True,'rdad_ok':True,'capabilities':{'deployment_executor':True,'plex_runtime_preferences':True}}]
         from contextlib import ExitStack
         for result in ({'output':'docker success'}, {'health_verified':True,'reference_cache':{'status':'ready','checksum':'wrong'}}):
             with self.subTest(result=result), ExitStack() as stack:

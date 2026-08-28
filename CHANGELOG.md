@@ -2,6 +2,13 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Disponibilité des nœuds
+- Liveness centralisée : heartbeat récent online, expiré offline, absent/invalide unknown ; maintenance prioritaire, timeout configurable de 180 secondes par défaut.
+- UI/API et contrôles de placement, provisioning, exécution et remise des commandes utilisent les états dérivés ; CRONOS reste exclu des AppBox.
+- Agent : exécution métier séquentielle, heartbeat léger et collecte métriques/inventaire dans trois boucles indépendantes.
+- Endpoint metrics séparé ; un heartbeat léger ne réécrit pas les échantillons, les anciens échantillons ne remplacent pas les nouveaux. Métriques expirées signalées séparément : exclusion possible du placement automatique uniquement ; placement manuel et actions existantes restent disponibles avec heartbeat/capacités valides.
+- Rafraîchissement des badges de disponibilité et des choix de placement ; suppression du réglage manuel ONLINE.
+
 ### Préférences runtime Plex
 - Références nouvellement capturées neutres : suppression du nom, des mappings de ports et connexions personnalisées source.
 - Nouvelles AppBox Plex : nom majuscule et port manuel issus du provisioning, transmis dans le manifeste et appliqués avant démarrage, y compris depuis les anciennes références.
