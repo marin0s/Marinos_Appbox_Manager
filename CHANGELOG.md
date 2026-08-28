@@ -2,6 +2,11 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Préférences runtime Plex
+- Références nouvellement capturées neutres : suppression du nom, des mappings de ports et connexions personnalisées source.
+- Nouvelles AppBox Plex : nom majuscule et port manuel issus du provisioning, transmis dans le manifeste et appliqués avant démarrage, y compris depuis les anciennes références.
+- La personnalisation touche uniquement Preferences.xml, jamais Metadata/Media/DB ; elle ne s'applique pas au claim ni au recreate d'une instance existante.
+
 ### Images de référence Plex — Phase 1
 - Définition d’un contrat d’archive Plex fondé sur une liste d’inclusion explicite, avec conservation de `Metadata`, `Media`, bases canoniques, plugins, scanners, profils, ressources et préférences assainies.
 - Capture à chaud d’un Plex actif sans interruption du service ; les bases SQLite sont figées via `Plex SQLite` dans le conteneur, avec validation `quick_check` et fallback Python SQLite si nécessaire.

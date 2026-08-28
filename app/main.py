@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
-from agent.reference_contract import validate_archive, sha256_file, sanitize_preferences, redact_result
+from agent.reference_contract import validate_archive, sha256_file, sanitize_preferences, redact_result, plex_runtime_preferences, apply_plex_runtime_preferences
 
 os.environ.setdefault("PSUTIL_PROCFS_PATH", os.getenv("APPBOX_PROCFS", "/host/proc"))
 import psutil
@@ -395,6 +395,8 @@ def build_deployment_manifest(item: dict[str, Any], compose: str, env_content: s
         "generated_at": now_iso(),
         "files": files,
     }
+    if item.get("type") == "plex":
+        manifest["plex_runtime"] = plex_runtime_preferences(client_id, int(item["plex_port"]))
     canonical = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     manifest["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return manifest
@@ -3662,6 +3664,9 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
     env_content = deployment_env_for(item) if action in {"deploy", "recreate"} else ""
     manifest = build_deployment_manifest(item, control_plane_compose, env_content) if action in {"deploy", "recreate"} else None
     reference_archive = None
+    if action == "deploy" and item.get("type") == "plex" and not node.get("capabilities", {}).get("plex_runtime_preferences"):
+        fail_workflow(job_id, "validate_node", "Mettre à jour l'agent : personnalisation Plex non supportée.")
+        return
     if action == "deploy" and item.get("reference_version_id"):
         archive, archive_checksum = reference_deployment_archive(item["reference_version_id"])
         reference_archive = {
@@ -5829,6 +5834,8 @@ def create_appbox(
                 provision_snapshot(snapshot_id, media_type, appbox_dir)
                 if reference_version_id and media_type == "plex":
                     sanitize_plex_clone(appbox_dir / "plex-config")
+                if media_type == "plex":
+                    apply_plex_runtime_preferences(appbox_dir / "plex-config", client_id, media_port)
             elif snapshot_id and not reference_version_id:
                 # Legacy snapshots are local-only. Reference images are transferred
                 # directly from the central library by the target node agent.

@@ -17,6 +17,52 @@ spec.loader.exec_module(agent)
 
 
 class AgentDeploymentTests(unittest.TestCase):
+    def test_runtime_preferences_only_change_preferences_and_accept_old_reference(self):
+        from agent.reference_contract import apply_plex_runtime_preferences, PLEX_ROOT
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.install(root, reference_archive(root).read_bytes())
+            config = root / 'appbox/plex-config'
+            prefs = config / PLEX_ROOT / 'Preferences.xml'
+            prefs.write_text('<Preferences FriendlyName="SOURCE" ManualPortMappingPort="32434" customConnections="http://source" MachineIdentifier="source-id" PlexOnlineToken="secret" Language="fr"/>')
+            before = {p.relative_to(config): p.read_bytes() for p in config.rglob('*') if p.is_file() and p != prefs}
+            for identifier, port in [('newbox01', 32448), ('ab-other', 32500)]:
+                apply_plex_runtime_preferences(config, identifier, port)
+                attrs = ET.parse(prefs).getroot().attrib
+                self.assertEqual(attrs, {'Language':'fr', 'FriendlyName':identifier.upper(), 'ManualPortMappingMode':'1', 'ManualPortMappingPort':str(port)})
+            self.assertEqual(before, {p.relative_to(config): p.read_bytes() for p in config.rglob('*') if p.is_file() and p != prefs})
+            for port in (0, 65536, True, '32448'):
+                with self.assertRaises(RuntimeError):
+                    apply_plex_runtime_preferences(config, 'newbox01', port)
+
+    def test_blank_plex_preferences_and_manifest(self):
+        from agent.reference_contract import apply_plex_runtime_preferences, PLEX_ROOT
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            compose = main.compose_for('newbox01', 'plex', 32448, None)
+            manifest = main.build_deployment_manifest({'client_id':'newbox01', 'type':'plex', 'plex_port':32448}, compose, '')
+            self.assertEqual(manifest['plex_runtime']['FriendlyName'], 'NEWBOX01')
+            apply_plex_runtime_preferences(root, 'newbox01', 32448)
+            self.assertIn('ManualPortMappingPort="32448"', (root / PLEX_ROOT / 'Preferences.xml').read_text())
+
+    def test_blank_deploy_and_recreate_preserve_claimed_identity(self):
+        from agent.reference_contract import PLEX_ROOT
+        with tempfile.TemporaryDirectory() as tmp:
+            compose = main.compose_for('newbox01', 'plex', 32448, None)
+            manifest = main.build_deployment_manifest({'client_id':'newbox01','type':'plex','plex_port':32448}, compose, '')
+            payload = {'client_id':'newbox01','action':'deploy','compose':compose,'env':'','manifest':manifest,'containers':['plex-appb-newbox01']}
+            config = {'appbox_base_dir':tmp}
+            with patch.object(agent, 'run', return_value=(0,'','')), patch.object(agent, '_wait_for_container_state'), patch.object(agent, '_wait_plex_ready'):
+                agent.execute_command(config, {'command_type':'appbox_action','payload':payload})
+                prefs = Path(tmp) / 'newbox01/plex-config' / PLEX_ROOT / 'Preferences.xml'
+                self.assertIn('FriendlyName="NEWBOX01"', prefs.read_text())
+                prefs.write_text('<Preferences MachineIdentifier="new-identity" PlexOnlineToken="claimed-token"/>')
+                before = prefs.read_bytes()
+                payload['action'] = 'recreate'
+                agent.execute_command(config, {'command_type':'appbox_action','payload':payload})
+                self.assertEqual(prefs.read_bytes(), before)
+
     def test_naming_consistent_for_ab_prefix_separator(self):
         for identifier in ('ab34ah','ab-34ah','34ah'):
             compose=main.compose_for(identifier,'plex',32499,None,acceleration_mode='disabled')

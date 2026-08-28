@@ -23,9 +23,9 @@ import sqlite3
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 try:
-    from agent.reference_contract import IDENTITY_ATTRIBUTES, sanitize_preferences, validate_archive, extract_archive, sha256_file
+    from agent.reference_contract import IDENTITY_ATTRIBUTES, sanitize_preferences, validate_archive, extract_archive, sha256_file, plex_runtime_preferences, apply_plex_runtime_preferences
 except ModuleNotFoundError:
-    from reference_contract import IDENTITY_ATTRIBUTES, sanitize_preferences, validate_archive, extract_archive, sha256_file
+    from reference_contract import IDENTITY_ATTRIBUTES, sanitize_preferences, validate_archive, extract_archive, sha256_file, plex_runtime_preferences, apply_plex_runtime_preferences
 
 PRODUCT_VERSION = "1.6.0-alpha.5"
 VERSION = f"{PRODUCT_VERSION}-dev"
@@ -1457,6 +1457,7 @@ def heartbeat(config):
             "reference_archive_schemas": {"plex": PLEX_REFERENCE_ARCHIVE_SCHEMA},
             "reference_builder_intrusive_actions": False,
             "deployment_executor": True,
+            "plex_runtime_preferences": True,
         },
         "metrics": metrics,
     }
@@ -1700,6 +1701,14 @@ def execute_command(config, command):
             if not compose:
                 raise RuntimeError("Compose absent du manifeste de déploiement.")
             manifest = verify_manifest(payload, client_id, compose, env_content)
+            runtime = manifest.get("plex_runtime")
+            if runtime is not None:
+                try:
+                    port = int(runtime["ManualPortMappingPort"])
+                except (ValueError, TypeError, KeyError):
+                    raise RuntimeError("Préférences Plex du manifeste invalides.") from None
+                if runtime != plex_runtime_preferences(client_id, port) or f'"{port}:32400"' not in compose:
+                    raise RuntimeError("Préférences Plex incompatibles avec le Compose.")
             reference_archive = payload.get("reference_archive") or None
             reference_result = None
             if reference_archive:
@@ -1709,6 +1718,8 @@ def execute_command(config, command):
                 staging_app.mkdir()
                 try:
                     reference_result = install_reference_archive(config, reference_archive, staging_app)
+                    if runtime is not None:
+                        apply_plex_runtime_preferences(staging_app / "plex-config", client_id, port)
                     atomic_write(staging_app / "compose.yml", compose)
                     atomic_write(staging_app / ".env", env_content)
                     atomic_write(staging_app / "deployment-manifest.json", json.dumps(manifest))
@@ -1719,7 +1730,10 @@ def execute_command(config, command):
                     if staging_app.exists():
                         shutil.rmtree(staging_app)
             else:
+                new_plex = not (app_dir / "plex-config" / PLEX_REFERENCE_ROOT / "Preferences.xml").exists()
                 app_dir.mkdir(parents=True, exist_ok=True)
+                if action == "deploy" and runtime is not None and new_plex:
+                    apply_plex_runtime_preferences(app_dir / "plex-config", client_id, port)
                 atomic_write(compose_path, compose)
                 atomic_write(env_path, env_content)
                 atomic_write(manifest_path, json.dumps(manifest))

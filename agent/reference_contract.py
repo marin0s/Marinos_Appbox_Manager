@@ -1,6 +1,7 @@
 """Portable reference archive primitives shared by the agent and Control Plane."""
 import gzip
 import hashlib
+import os
 import re
 import shutil
 import sqlite3
@@ -17,6 +18,8 @@ IDENTITY_ATTRIBUTES = (
     'PlexClaim', 'PLEX_CLAIM', 'ClaimToken', 'PlexOnlineAuthToken',
     'LastAutomaticMappedPort',
 )
+HOST_ATTRIBUTES = {'FriendlyName', 'ManualPortMappingMode', 'ManualPortMappingPort',
+                   'LastAutomaticMappedPort', 'customConnections'}
 
 
 def identity_attribute(name):
@@ -33,11 +36,46 @@ def sanitize_preferences(path):
         raise RuntimeError('Preferences.xml invalide.')
     removed = []
     for key in list(root.attrib):
-        if identity_attribute(key):
+        if identity_attribute(key) or key.lower() in {name.lower() for name in HOST_ATTRIBUTES}:
             root.attrib.pop(key)
             removed.append(key)
     tree.write(path, encoding='utf-8', xml_declaration=True)
     return removed
+
+
+def plex_runtime_preferences(client_id, port):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{2,20}', client_id) or '--' in client_id or client_id.endswith('-'):
+        raise RuntimeError('Identifiant Plex invalide.')
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise RuntimeError('Port Plex alloué invalide.')
+    return {'FriendlyName': client_id.upper(), 'ManualPortMappingMode': '1',
+            'ManualPortMappingPort': str(port)}
+
+
+def apply_plex_runtime_preferences(config_dir, client_id, port):
+    """Initialize only a new instance; never call on claim/recreate of an existing one."""
+    values = plex_runtime_preferences(client_id, port)
+    path = Path(config_dir) / PLEX_ROOT / 'Preferences.xml'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError('Preferences.xml ne doit pas être un lien.')
+    tree = ET.parse(path) if path.exists() else ET.ElementTree(ET.Element('Preferences'))
+    root = tree.getroot()
+    if root.tag != 'Preferences':
+        raise RuntimeError('Preferences.xml invalide.')
+    for key in list(root.attrib):
+        if identity_attribute(key) or key.lower() in {name.lower() for name in HOST_ATTRIBUTES}:
+            root.attrib.pop(key)
+    root.attrib.update(values)
+    temporary = path.with_name('.Preferences.xml.appbox-tmp')
+    try:
+        with temporary.open('xb') as stream:
+            tree.write(stream, encoding='utf-8', xml_declaration=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def sha256_file(path):

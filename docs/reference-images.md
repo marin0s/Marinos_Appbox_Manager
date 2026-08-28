@@ -71,3 +71,19 @@ Chaque base canonique figée est d’abord copiée, avec ses éventuels sidecars
 ### Vérification et rollback opérateur
 
 Les tests de Phase 1 utilisent uniquement un `/config` synthétique et des primitives Docker simulées. Pour une vérification contrôlée sur un node non-production, comparer le manifeste retourné avec le contenu du tar, vérifier l’absence des chemins exclus, puis confirmer que Plex a retrouvé son état initial. En cas d’échec de restauration signalé par le builder, ne pas relancer automatiquement une capture : vérifier l’état Docker du conteneur source et le redémarrer explicitement avant toute nouvelle tentative.
+
+## Personnalisation des nouvelles AppBox
+
+Le template est neutre : FriendlyName, ManualPortMappingMode/Port, LastAutomaticMappedPort
+et customConnections sont supprimés à la capture. Les anciennes archives publiées restent
+acceptées : leur copie restaurée est neutralisée puis personnalisée avant démarrage.
+Le manifeste inclut le nom client en majuscules et le port Plex alloué ; la cible applique
+FriendlyName, ManualPortMappingMode=1 et ManualPortMappingPort. Aucune donnée catalogue
+n'est modifiée. Les agents doivent annoncer plex_runtime_preferences pour un nouveau
+provisioning Plex. Le claim/restart/recreate ne réinitialise pas une identité existante.
+Vérification : créer un nouvel ID sur un nœud autorisé, comparer les trois attributs avec
+le provisioning, puis vérifier claim et lecture. Rollback : restaurer CP et package agent
+du même commit précédent ; aucune modification rétroactive des AppBox ou archives.
+L'E2E ARTEMIS rapporté par l'opérateur depuis 689c336 valide la chaîne capture live,
+publication, transfert/cache, restore, identité, claim, catalogue et lectures ATHENA/RDAD.
+Il a révélé les préférences héritées ; cette correction nécessite sa propre validation terrain.

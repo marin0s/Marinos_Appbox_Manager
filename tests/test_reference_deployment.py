@@ -45,7 +45,7 @@ class ReferenceDeploymentTests(unittest.TestCase):
             content = prefs.read_text()
             self.assertNotIn("MachineIdentifier", content)
             self.assertNotIn("PlexOnlineToken", content)
-            self.assertIn("FriendlyName", content)
+            self.assertNotIn("FriendlyName", content)
             self.assertFalse(cache.exists())
 
 
