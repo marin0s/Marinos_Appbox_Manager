@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib.util
 import secrets
 import os
 import re
@@ -16,6 +17,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
@@ -44,6 +46,7 @@ JOBS_FILE = Path(os.getenv("APPBOX_JOBS", str(DATA_DIR / "jobs.json")))
 AGENT_ASSET_DIR = Path(os.getenv("APPBOX_AGENT_ASSET_DIR", "/app/agent"))
 METRICS_INTERVAL = max(5, int(os.getenv("APPBOX_METRICS_INTERVAL", "10")))
 JOB_TIMEOUT_SECONDS = max(60, int(os.getenv("APPBOX_JOB_TIMEOUT_SECONDS", "900")))
+AGENT_CLAIM_TIMEOUT_SECONDS = max(5, int(os.getenv("APPBOX_AGENT_CLAIM_TIMEOUT_SECONDS", "60")))
 JOB_WATCHDOG_INTERVAL = max(15, int(os.getenv("APPBOX_JOB_WATCHDOG_INTERVAL", "30")))
 REFERENCE_ROOT = Path(os.getenv("APPBOX_REFERENCE_ROOT", "/srv/appbox-manager/reference-images"))
 PLEX_RANGE = range(int(os.getenv("APPBOX_PLEX_PORT_START", "32435")), int(os.getenv("APPBOX_PLEX_PORT_END", "32499")) + 1)
@@ -1589,6 +1592,9 @@ def queue_agent_command(
     payload: dict[str, Any] | None = None,
 ) -> str:
     command_id = str(uuid.uuid4())
+    payload = dict(payload or {})
+    if command_type == 'appbox_action':
+        payload['_claim_deadline'] = (datetime.now(timezone.utc) + timedelta(seconds=AGENT_CLAIM_TIMEOUT_SECONDS)).isoformat()
     with db_lock, db() as con:
         agent_upgrades.require_idle(con, node_id)
         con.execute("""
@@ -3376,6 +3382,9 @@ def create_job(client_id: str, action: str, title: str, detail: str = "", node_i
     job_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     stamp = now_iso()
     steps = workflow_definition(action)
+    options = dict(options or {})
+    if action == 'delete':
+        options['original_client_id'] = client_id  # jobs.client_id is detached at finalization
     with db_lock, db() as con:
         agent_upgrades.require_idle(con, node_id or HOSTNAME)
         con.execute("""
@@ -3621,27 +3630,87 @@ def queued_jobs(limit: int = 50) -> list[dict[str, Any]]:
     return [job_dict(row) for row in rows]
 
 
+CLAIM_TIMEOUT_MESSAGE = 'Commande distante non prise en charge par le node dans le délai imparti.'
+
+
+def appbox_claim_expired(command, now=None):
+    if command['command_type'] != 'appbox_action' or command['status'] != 'queued':
+        return False
+    try:
+        payload = json.loads(command['payload_json'] or '{}')
+        stamp = payload.get('_claim_deadline')
+        deadline = datetime.fromisoformat(stamp or command['created_at'])
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)  # legacy SQLite UTC
+        if not stamp:
+            deadline += timedelta(seconds=AGENT_CLAIM_TIMEOUT_SECONDS)
+        return (now or datetime.now(timezone.utc)) >= deadline
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return True  # malformed legacy timestamps cannot authorize a late execution
+
+
+def expire_appbox_commands(con, node_id=None, interrupted_jobs=()):
+    rows = con.execute("SELECT * FROM agent_commands WHERE command_type='appbox_action' AND status='queued'").fetchall()
+    for row in rows:
+        if node_id is not None and row['node_id'] != node_id:
+            continue
+        try:
+            payload = json.loads(row['payload_json'] or '{}')
+            if not isinstance(payload, dict):
+                raise ValueError('Invalid payload')
+            malformed = False
+        except (ValueError, TypeError):
+            payload, malformed = {}, True
+        interrupted = any(row['node_id'] == job['node_id'] and
+            payload.get('client_id') == job['client_id'] and payload.get('action') == job['action']
+            for job in interrupted_jobs)
+        job = con.execute('SELECT status FROM jobs WHERE job_id=?', (payload.get('_job_id'),)).fetchone()
+        detached = payload.get('_job_id') and (not job or job['status'] != 'running')
+        if interrupted or detached or malformed or appbox_claim_expired(row):
+            error = 'Workflow interrompu ; commande non exécutée annulée.' if interrupted or detached else CLAIM_TIMEOUT_MESSAGE
+            con.execute("UPDATE agent_commands SET status='failed',completed_at=?,error_text=? WHERE command_id=? AND status='queued'",
+                        (now_iso(), error, row['command_id']))
+
+
+def fail_pending_command(command_id, message, queued_only=False):
+    with db_lock, db() as con:
+        statuses = ('queued',) if queued_only else ('queued', 'claimed')
+        placeholders = ','.join('?' for _ in statuses)
+        return con.execute(f"UPDATE agent_commands SET status='failed',completed_at=?,error_text=? WHERE command_id=? AND status IN ({placeholders})",
+                           (now_iso(), message, command_id, *statuses)).rowcount
+
+
 def wait_agent_command(command_id: str, timeout: int = 300, job_id: str | None = None) -> tuple[bool, dict[str, Any], str]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with db() as con:
+        interrupted = worker_stop.is_set()
+        with db_lock, db() as con:
             if job_id:
                 job = con.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
                 if not job or job["status"] != "running":
-                    return False, {}, "Workflow interrompu ; résultat tardif non appliqué."
-                con.execute("UPDATE jobs SET updated_at=? WHERE job_id=?", (now_iso(), job_id))
+                    interrupted = True
+                else:
+                    con.execute("UPDATE jobs SET updated_at=? WHERE job_id=?", (now_iso(), job_id))
             row = con.execute(
-                "SELECT status,result_json,error_text FROM agent_commands WHERE command_id=?",
+                "SELECT * FROM agent_commands WHERE command_id=?",
                 (command_id,),
             ).fetchone()
         if not row:
             return False, {}, "Commande agent introuvable."
+        if interrupted:
+            message = 'Workflow interrompu ; résultat tardif non appliqué.'
+            fail_pending_command(command_id, message, queued_only=True)
+            return False, {}, message
         if row["status"] == "success":
             return True, json.loads(row["result_json"] or "{}"), ""
         if row["status"] == "failed":
             return False, json.loads(row["result_json"] or "{}"), row["error_text"] or "Échec distant."
-        time.sleep(1)
-    return False, {}, f"Délai d’attente agent dépassé ({timeout} s)."
+        if appbox_claim_expired(row) and fail_pending_command(command_id, CLAIM_TIMEOUT_MESSAGE, queued_only=True):
+            return False, {}, CLAIM_TIMEOUT_MESSAGE
+        worker_stop.wait(1)
+    message = f'Délai d’attente agent dépassé ({timeout} s) ; exécution distante non confirmée, vérifier le node avant relance.'
+    fail_pending_command(command_id, message)
+    return False, {}, message
 
 
 def finalize_appbox_deletion(client_id: str, job_id: str, purge: bool = False) -> bool:
@@ -3718,7 +3787,7 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
     # Le Compose d'une AppBox distante appartient au node d'exécution.
     # Le Control Plane peut en transmettre un pour un déploiement/recreate,
     # mais start/stop/restart ne doivent jamais dépendre de sa présence locale.
-    control_plane_compose = compose_path.read_text(encoding="utf-8") if compose_path.exists() else ""
+    control_plane_compose = compose_path.read_text(encoding="utf-8") if action in {'deploy', 'recreate'} and compose_path.exists() else ""
 
     nodes = {node["node_id"]: node for node in list_control_nodes()}
     node = nodes.get(node_id)
@@ -3753,6 +3822,7 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
             "target_directory": "plex-config" if item.get("type") == "plex" else "jellyfin-config",
         }
     payload = {
+        "_job_id": job_id,
         "client_id": client_id,
         "action": action,
         "compose": control_plane_compose if action in {"deploy", "recreate"} else "",
@@ -3763,6 +3833,8 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
         "deletion_mode": deletion_mode,
         "reference_archive": reference_archive,
     }
+    if action == 'delete':
+        payload['path'] = str(appbox_dir)
     if reference_archive:
         set_reference_distribution(node_id, item["reference_version_id"], "transferring")
     command_id = queue_agent_command(node_id, "appbox_action", payload)
@@ -3816,9 +3888,9 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
                             (now_iso(), detail[-3000:], now_iso(), client_id))
             inventory_message = "AppBox archivée."
         else:
-            path_exists = bool(result.get("path_exists", True))
-            containers_remaining = result.get("containers_remaining") or []
-            if path_exists or containers_remaining:
+            path_exists = result.get("path_exists", True)
+            containers_remaining = result.get("containers_remaining")
+            if path_exists is not False or not isinstance(containers_remaining, list) or containers_remaining:
                 verify_detail = f"Vérification refusée : path_exists={path_exists}, containers_remaining={containers_remaining}"
                 update_step(job_id, "cleanup_files", "failed", verify_detail, 100, executor=f"agent-{node_id}", resources=result)
                 fail_workflow(job_id, "cleanup_files", verify_detail)
@@ -3834,6 +3906,19 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
     update_step(job_id, "notification", "success", "Résultat distant enregistré.", 100)
     update_job(job_id, "success", 100, detail)
     record_event(client_id, f"{action}_success", detail, "success")
+
+
+@lru_cache(maxsize=1)
+def embedded_deletion_executor():
+    # Reuse the shipped agent primitive: one safety/idempotence implementation,
+    # no new ZIP member (legacy managed validators have a strict allowlist).
+    source = AGENT_ASSET_DIR / 'marinos-appbox-agent.py'
+    if not source.is_file():
+        source = APP_DIR.parent / 'agent' / 'marinos-appbox-agent.py'
+    spec = importlib.util.spec_from_file_location('appbox_embedded_cleanup', source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.delete_appbox_resources
 
 
 def execute_job(job: dict[str, Any]) -> None:
@@ -4047,29 +4132,16 @@ def execute_job(job: dict[str, Any]) -> None:
             save_appbox_status(client_id, "running", "\n".join(output_parts))
 
         elif action == "delete":
-            ok, msg = run_workflow_step(job_id, "validate_appbox", lambda: (appbox_dir.exists(), f"Dossier : {appbox_dir}"), "Validation avant suppression.")
-            if not ok:
-                fail_workflow(job_id, "validate_appbox", msg)
+            if APPBOX_MODE != 'real':
+                fail_workflow(job_id, 'validate_appbox', 'Mode mock : suppression locale réelle interdite.')
                 return
-            ok, down = run_workflow_step(job_id, "docker_remove", lambda: run_compose(appbox_dir, "down", "--remove-orphans"), "Suppression des ressources Docker.")
-            output_parts.append(down)
-            if not ok:
-                fail_workflow(job_id, "docker_remove", down)
-                record_audit("DELETE_APPBOX", client_id, item.get("node_id"), deletion_mode, "FAILED", down)
-                return
-
-            def cleanup() -> tuple[bool, str]:
-                if deletion_mode == "archive":
-                    return True, f"Configuration conservée : {appbox_dir}"
-                if appbox_dir.exists():
-                    shutil.rmtree(appbox_dir)
-                return True, f"Dossier supprimé : {appbox_dir}"
-
-            ok, msg = run_workflow_step(job_id, "cleanup_files", cleanup, "Traitement des données persistantes.")
-            if not ok:
-                fail_workflow(job_id, "cleanup_files", msg)
-                record_audit("DELETE_APPBOX", client_id, item.get("node_id"), deletion_mode, "FAILED", msg)
-                return
+            update_step(job_id, 'validate_appbox', 'success', 'Validation du chemin et des ressources par l’exécuteur local.', 100)
+            update_step(job_id, 'docker_remove', 'running', 'Suppression et vérification des ressources AppBox.', 20)
+            result = embedded_deletion_executor()(BASE_DIR, client_id, item.get('containers') or [], deletion_mode, str(appbox_dir))
+            msg = result['output']
+            output_parts.append(msg)
+            update_step(job_id, 'docker_remove', 'success', msg, 100, resources=result)
+            update_step(job_id, 'cleanup_files', 'success', msg, 100, resources=result)
 
             if deletion_mode == "archive":
                 with db_lock, db() as con:
@@ -4077,13 +4149,6 @@ def execute_job(job: dict[str, Any]) -> None:
                                 (now_iso(), msg, now_iso(), client_id))
                 inventory_message = "AppBox archivée."
             else:
-                remaining = [name for name in (item.get("containers") or []) if run_command(["docker", "inspect", name], timeout=20)[0]]
-                if appbox_dir.exists() or remaining:
-                    verify_detail = f"Suppression incomplète : dossier={appbox_dir.exists()}, conteneurs={remaining}"
-                    fail_workflow(job_id, "cleanup_files", verify_detail)
-                    save_appbox_status(client_id, "error", verify_detail)
-                    record_audit("DELETE_APPBOX", client_id, item.get("node_id"), deletion_mode, "FAILED", verify_detail)
-                    return
                 finalize_appbox_deletion(client_id, job_id, purge=(deletion_mode == "purge"))
                 inventory_message = "AppBox supprimée de l’inventaire actif."
             update_step(job_id, "inventory", "success", inventory_message, 100)
@@ -4124,16 +4189,31 @@ def _force_fail_job(job_id: str, message: str, client_id: str | None = None, act
         print(f"[worker] impossible de finaliser le job {job_id}: {recovery_exc}", flush=True)
 
 
+def run_claimed_job(job):
+    try:
+        execute_job(job)
+    except BaseException as exc:
+        message = f'Exception worker non gérée : {type(exc).__name__}: {exc}'
+        _force_fail_job(job['job_id'], message, job.get('client_id'), job.get('action'))
+    finally:
+        worker_wakeup.set()
+
+
 def queue_worker() -> None:
+    active = {}  # one sequential lane per node; never wait remotely in this dispatcher
     while not worker_stop.is_set():
         row = None
         changed = 0
         try:
+            active = {node: thread for node, thread in active.items() if thread.is_alive()}
             with db_lock, db() as con:
-                row = con.execute("""
-                    SELECT * FROM jobs WHERE status='queued'
-                    ORDER BY created_at LIMIT 1
-                """).fetchone()
+                candidates = con.execute("""
+                    SELECT j.* FROM jobs j WHERE j.status='queued' AND NOT EXISTS (
+                        SELECT 1 FROM jobs running WHERE running.status='running'
+                        AND COALESCE(running.node_id,?)=COALESCE(j.node_id,?))
+                    ORDER BY j.created_at,j.job_id
+                """, (HOSTNAME, HOSTNAME)).fetchall()
+                row = next((job for job in candidates if (job['node_id'] or HOSTNAME) not in active), None)
                 if row:
                     stamp = now_iso()
                     changed = con.execute("""
@@ -4142,12 +4222,9 @@ def queue_worker() -> None:
                     """, (stamp, stamp, row["job_id"])).rowcount
             if row and changed:
                 job = dict(row)
-                try:
-                    execute_job(job)
-                except BaseException as exc:
-                    message = f"Exception worker non gérée : {type(exc).__name__}: {exc}"
-                    print(f"[worker] {message}", flush=True)
-                    _force_fail_job(job["job_id"], message, job.get("client_id"), job.get("action"))
+                thread = Thread(target=run_claimed_job, args=(job,), name=f"appbox-job-{job['node_id'] or HOSTNAME}", daemon=True)
+                active[job['node_id'] or HOSTNAME] = thread
+                thread.start()
                 continue
         except BaseException as exc:
             print(f"[worker] erreur de boucle: {type(exc).__name__}: {exc}", flush=True)
@@ -4163,8 +4240,10 @@ def recover_interrupted_jobs() -> int:
     """Close jobs left running by a previous Control Plane process."""
     with db_lock, db() as con:
         rows = con.execute(
-            "SELECT job_id,client_id,action FROM jobs WHERE status='running'"
+            "SELECT job_id,client_id,node_id,action FROM jobs WHERE status='running'"
         ).fetchall()
+        # Includes old commands without a job_id: match interrupted node/client/action.
+        expire_appbox_commands(con, interrupted_jobs=rows)
     for row in rows:
         _force_fail_job(
             row["job_id"],
@@ -4861,6 +4940,7 @@ def agent_poll_commands(node_id: str, request: Request):
     authenticate_agent(request, node_id)
     node = next((n for n in list_control_nodes() if n['node_id'] == node_id), None)
     with db_lock, db() as con:
+        expire_appbox_commands(con, node_id=node_id)
         row = con.execute("""
             SELECT * FROM agent_commands
             WHERE node_id=? AND status='queued'
@@ -4909,6 +4989,8 @@ async def agent_command_result(node_id: str, command_id: str, request: Request):
             # The serial worker only acknowledges preparation. Only helper events
             # can confirm activation/rollback; a late result must not override it.
             return JSONResponse({'status': 'ok', 'confirmation': 'helper_required'})
+        if command['command_type'] == 'appbox_action' and command['status'] in {'success', 'failed'}:
+            return JSONResponse({'status':'ok', 'ignored':'terminal_command'})
         con.execute("""
             UPDATE agent_commands
             SET status=?,completed_at=?,result_json=?,error_text=?
@@ -6161,12 +6243,28 @@ def delete_appbox(
     deletion_mode: str = Form("delete"),
     confirmation: str = Form(""),
 ):
-    item = get_appbox(client_id)
-    if not item:
-        raise HTTPException(404, "AppBox introuvable.")
     deletion_mode = deletion_mode.strip().lower()
     if deletion_mode not in {"archive", "delete", "purge"}:
         raise HTTPException(400, "Mode de suppression invalide.")
+    item = get_appbox(client_id)
+    if not item:
+        if deletion_mode == 'archive':
+            raise HTTPException(404, 'AppBox introuvable pour archivage.')
+        # A retry returns the verified historical job, not an invented runtime success.
+        with db() as con:
+            rows = con.execute("SELECT job_id,options_json FROM jobs WHERE action='delete' AND status='success' ORDER BY created_at DESC").fetchall()
+        for row in rows:
+            try:
+                options = json.loads(row['options_json'] or '{}')
+                if not isinstance(options, dict):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            if options.get('original_client_id') == client_id and options.get('deletion_mode', 'delete') in {'delete','purge'}:
+                if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                    return JSONResponse({'job_id':row['job_id'],'client_id':client_id,'action':'delete','already_deleted':True})
+                return RedirectResponse(f"/jobs/{row['job_id']}", status_code=303)
+        raise HTTPException(404, "AppBox introuvable ; aucune suppression vérifiée enregistrée.")
     if active_job_for(client_id):
         raise HTTPException(409, "Une opération est déjà en attente ou en cours pour cette AppBox.")
     protected = str(item.get("protection_level") or "standard").lower() == "production"

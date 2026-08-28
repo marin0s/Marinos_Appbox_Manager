@@ -1493,6 +1493,132 @@ def safe_appbox_dir(base: Path, client_id: str) -> Path:
     return target
 
 
+def deletion_target(base, client_id, supplied_path=None):
+    """Never resolve a client symlink into another client's directory."""
+    base = Path(base)
+    if not CLIENT_RE.fullmatch(client_id) or not base.is_absolute() or base == base.parent:
+        raise RuntimeError("Racine ou identifiant AppBox invalide pour suppression.")
+    if base.resolve() != base:
+        raise RuntimeError("Racine AppBox via symlink refusée.")
+    target = base / client_id
+    if supplied_path is not None and Path(supplied_path) != target:
+        raise RuntimeError("Chemin AppBox hors racine ou appartenant à un autre client.")
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return target, False
+    if stat.S_ISLNK(info.st_mode) or target.resolve() != target or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("Chemin AppBox non sûr : symlink ou dossier invalide.")
+    return target, True
+
+
+def reject_appbox_mounts(target, mountinfo=None):
+    # A bind mount can expose unrelated data inside an otherwise safe directory.
+    if mountinfo is None:
+        if not sys.platform.startswith('linux'):
+            return
+        mountinfo = Path('/proc/self/mountinfo').read_text()
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) < 6:
+            raise RuntimeError('Table des montages illisible ; suppression refusée.')
+        point = Path(re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), fields[4]))
+        if point == target or target in point.parents:
+            raise RuntimeError(f'Montage actif dans le dossier AppBox : {point}.')
+
+
+def delete_appbox_resources(base, client_id, containers, mode, supplied_path=None):
+    """Idempotent absence only; Docker/filesystem/security failures remain failures."""
+    target, present = deletion_target(base, client_id, supplied_path)
+    if mode not in {'archive', 'delete', 'purge'}:
+        raise RuntimeError('Mode de suppression invalide.')
+    # Historical ab40ah / ab-40ah naming is retained.
+    short = client_id[2:].lstrip('-') if client_id.startswith('ab') else client_id
+    expected = {f'plex-appb-{short}', f'plex-{client_id}', f'jellyfin-{client_id}', f'tautulli-{client_id}'}
+    requested = set(containers or [])
+    if any(not isinstance(n, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', n) for n in requested):
+        raise RuntimeError('Nom de conteneur invalide.')
+    messages = [] if present else ['Répertoire déjà absent ; nettoyage Docker poursuivi.']
+
+    def project_containers():
+        code, out, err = run(['docker', 'ps', '-a', '--filter',
+            f'label=com.docker.compose.project={client_id}', '--format', '{{.Names}}'], timeout=30)
+        if code:
+            raise RuntimeError(err or out or 'Docker indisponible.')
+        names = set(out.splitlines())
+        if any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', n) for n in names):
+            raise RuntimeError('Inventaire Docker invalide.')
+        return names
+
+    def absent_error(output, name):
+        return bool(re.fullmatch(r'(?:Error(?: response from daemon)?: )?No such (?:container|object): '
+                                 + re.escape(name), output.strip(), re.I))
+
+    def inspect(name):
+        code, out, err = run(['docker', 'inspect', '--type', 'container', name], timeout=20)
+        if code:
+            if absent_error(err or out, name):
+                return None
+            raise RuntimeError(err or out or 'Vérification Docker impossible.')
+        info = json.loads(out)[0]
+        project = (info.get('Config', {}).get('Labels') or {}).get('com.docker.compose.project')
+        legacy_mount = any(target == source or target in source.parents for source in
+                           (Path(m.get('Source') or '').resolve() for m in info.get('Mounts') or []))
+        if (project and project != client_id) or (not project and (name not in expected or not legacy_mount)):
+            raise RuntimeError(f'Conteneur hors AppBox : {name}.')
+        return info
+
+    names = requested | expected | project_containers()
+    existing = {name for name in names if inspect(name) is not None}
+    if names - existing:
+        messages.append('Conteneur déjà absent.')
+    compose = target / 'compose.yml'
+    try:
+        compose_info = compose.lstat()
+    except FileNotFoundError:
+        compose_info = None
+    if compose_info:
+        deletion_target(base, client_id, supplied_path)
+        if not stat.S_ISREG(compose_info.st_mode):
+            raise RuntimeError('Compose non sûr : fichier régulier requis.')
+        code, out, err = run(['docker', 'compose', '-p', client_id, '-f', str(compose),
+                              'down', '--remove-orphans'], timeout=300)
+        output = '\n'.join(x for x in (out, err) if x)
+        if code and not re.fullmatch(r'(?:Warning: )?No resource found to remove\.?', output.strip(), re.I):
+            raise RuntimeError(output or f'Docker Compose a retourné {code}.')
+        if output:
+            messages.append(output)
+    else:
+        messages.append('Compose déjà absent ; nettoyage Docker direct.')
+    for name in sorted(existing):
+        code, out, err = run(['docker', 'rm', '-f', name], timeout=300)
+        if code and not absent_error(err or out, name):
+            raise RuntimeError(err or out or f'Suppression Docker impossible : {name}.')
+    remaining = project_containers() | {name for name in names if inspect(name) is not None}
+    if remaining:
+        raise RuntimeError(f'Suppression incomplète : conteneurs restants {sorted(remaining)}.')
+    target, present = deletion_target(base, client_id, supplied_path)
+    if mode != 'archive' and present:
+        reject_appbox_mounts(target)
+        try:
+            shutil.rmtree(target)
+        except FileNotFoundError:
+            # Only the absent final directory is success, not arbitrary inner errors.
+            if deletion_target(base, client_id, supplied_path)[1]:
+                raise
+    _, present = deletion_target(base, client_id, supplied_path)
+    if mode != 'archive' and present:
+        raise RuntimeError('Suppression incomplète : dossier AppBox restant.')
+    remaining = project_containers() | {name for name in names if inspect(name) is not None}
+    if remaining:
+        raise RuntimeError(f'Suppression incomplète : conteneurs recréés {sorted(remaining)}.')
+    messages.append('AppBox archivée, configuration conservée.' if mode == 'archive'
+                    else 'Suppression idempotente terminée.')
+    return {'output':'\n'.join(messages)[-16000:], 'state':'archived' if mode == 'archive' else 'deleted',
+            'deletion_mode':mode, 'path':str(target), 'path_exists':present,
+            'containers_remaining':[], 'data_preserved':mode == 'archive', 'executor':'docker-verified'}
+
+
 def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
@@ -1702,6 +1828,9 @@ def execute_command(config, command):
             raise RuntimeError("Action AppBox non autorisée.")
 
         base = Path(config.get("appbox_base_dir", "/srv/appboxes"))
+        if action == 'delete':
+            return delete_appbox_resources(base, client_id, payload.get('containers') or [],
+                                           deletion_mode, payload.get('path'))
         base.mkdir(parents=True, exist_ok=True)
         app_dir = safe_appbox_dir(base, client_id)
         compose_path = app_dir / "compose.yml"
@@ -1795,38 +1924,12 @@ def execute_command(config, command):
                 code, out, err, executor = docker_direct("restart")
             elif action == "stop":
                 code, out, err, executor = docker_direct("stop")
-            elif action == "delete":
-                code, out, err, executor = docker_direct("rm")
-                if code != 0:
-                    code, out, err = run(["docker", "rm", "-f", *containers], timeout=300)
             else:
                 raise RuntimeError("Recréation impossible : aucun Compose disponible sur le node ni transmis par le Control Plane.")
 
         output = "\n".join(x for x in (out, err) if x)[-16000:]
         if code != 0:
             raise RuntimeError(output or f"Docker a retourné {code}")
-
-        if action == "delete":
-            if deletion_mode != "archive":
-                shutil.rmtree(app_dir, ignore_errors=False)
-            remaining = []
-            for name in containers:
-                code_check, out_check, _ = run(["docker", "inspect", "-f", "{{.Name}}", name], timeout=15)
-                if code_check == 0 and out_check.strip():
-                    remaining.append(name)
-            path_exists = app_dir.exists()
-            if deletion_mode != "archive" and (path_exists or remaining):
-                raise RuntimeError(f"Suppression incomplète : path_exists={path_exists}, containers_remaining={remaining}")
-            return {
-                "output": output or ("AppBox archivée, configuration conservée." if deletion_mode == "archive" else "AppBox supprimée et vérifiée."),
-                "state": "archived" if deletion_mode == "archive" else "deleted",
-                "deletion_mode": deletion_mode,
-                "path": str(app_dir),
-                "path_exists": path_exists,
-                "containers_remaining": remaining,
-                "data_preserved": deletion_mode == "archive",
-                "executor": executor,
-            }
 
         if action in {"deploy", "start", "restart", "recreate"}:
             if not containers:

@@ -2,6 +2,13 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Hotfix suppression AppBox et file multi-node
+- Delete/purge idempotents lorsque dossier, Compose ou conteneurs sont déjà absents ; archive conserve les données. Vérification Docker réelle avant nettoyage, erreurs disque/daemon conservées, chemin et propriété des conteneurs contrôlés.
+- Exécuteur de suppression partagé par agent et mode embedded, sans nouveau composant ZIP ; suppression locale réelle interdite en mode mock. Réparation des AppBox legacy error/deleted/missing jusqu'à l'inventaire, l'audit et la notification.
+- Dispatcher CP avec une voie séquentielle par node : ORION ne bloque plus ARTEMIS. Délai de claim persistant de 60 s par défaut, configurable ; commandes expirées non distribuées et résultats tardifs non appliqués aux commandes terminales.
+- Restart CP : jobs interrompus finalisés en erreur et commandes non claimées associées annulées, y compris legacy ; jobs queued conservés. Aucun changement de schéma SQLite ni du mécanisme de liveness ou de suppression des Reference Images.
+- Recette et limites documentées dans `docs/appbox-deletion-hotfix.md`.
+
 ### Supervision agent sans polling permanent en idle
 - Réveil systemd sur la demande durable, timer rapide seulement pendant upgrade/reprise/notifications ; contrôle au boot puis retour idle, sans nouveau daemon.
 - Migration automatique du timer 5 s des nodes managed depuis une release confirmée : path/drop-in connus, écritures atomiques, sauvegarde et reprise/restauration durables, daemon-reload et activations asynchrones vérifiées.

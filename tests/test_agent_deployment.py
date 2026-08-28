@@ -5,6 +5,9 @@ import tempfile
 import unittest
 import io
 import tarfile
+import errno
+import stat
+import pytest
 from pathlib import Path
 from unittest.mock import patch
 from reference_fixtures import reference_archive
@@ -14,6 +17,161 @@ AGENT_PATH = Path(__file__).parents[1] / "agent" / "marinos-appbox-agent.py"
 spec = importlib.util.spec_from_file_location("marinos_agent", AGENT_PATH)
 agent = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(agent)
+
+
+class DeletionDocker:
+    def __init__(self, names=()):
+        self.names = set(names)
+        self.calls = []
+        self.compose_result = (0, '', '')
+        self.rm_absent = False
+
+    def __call__(self, args, timeout=15):
+        self.calls.append(args)
+        if args[1] == 'ps':
+            return 0, '\n'.join(sorted(self.names)), ''
+        if args[1] == 'inspect':
+            name = args[-1]
+            if name not in self.names:
+                return 1, '', f'Error: No such object: {name}'
+            return 0, json.dumps([{'Config':{'Labels':{'com.docker.compose.project':'ab40ah'}}}]), ''
+        if args[1] == 'compose':
+            return self.compose_result
+        if args[1] == 'rm':
+            self.names.discard(args[-1])
+            return (1, '', f'Error response from daemon: No such container: {args[-1]}') if self.rm_absent else (0,'removed','')
+        raise AssertionError(args)
+
+
+@pytest.mark.parametrize('mode', ['delete','purge','archive'])
+@pytest.mark.parametrize('has_path,has_container,has_compose', [
+    (True,True,True), (True,False,True), (False,True,False), (False,False,False), (True,True,False)])
+def test_appbox_deletion_absence_matrix_and_repeat(tmp_path,monkeypatch,mode,has_path,has_container,has_compose):
+    directory=tmp_path/'ab40ah'
+    if has_path:
+        directory.mkdir(); (directory/'data').write_text('persistent config')
+    if has_compose: (directory/'compose.yml').write_text('services: {}')
+    docker=DeletionDocker(['plex-appb-40ah'] if has_container else [])
+    monkeypatch.setattr(agent,'run',docker)
+    payload={'client_id':'ab40ah','action':'delete','deletion_mode':mode,'containers':['plex-appb-40ah']}
+    for _ in range(2):
+        result=agent.execute_command({'appbox_base_dir':str(tmp_path)}, {'command_type':'appbox_action','payload':payload})
+        assert result['containers_remaining']==[] and not docker.names
+        assert result['path_exists']==(has_path and mode=='archive')
+        assert directory.exists()==result['path_exists']
+        if mode!='archive': assert 'idempotente terminée' in result['output']
+    assert not any(c[1]=='network' for c in docker.calls)
+
+
+@pytest.mark.parametrize('code', [0,1])
+def test_appbox_delete_compose_no_resource_and_rm_no_such_container(tmp_path,monkeypatch,code):
+    directory=tmp_path/'ab40ah'; directory.mkdir(); (directory/'compose.yml').write_text('services: {}')
+    docker=DeletionDocker(['plex-appb-40ah']); docker.rm_absent=True
+    docker.compose_result=(code,'','Warning: No resource found to remove')
+    monkeypatch.setattr(agent,'run',docker)
+    assert not agent.delete_appbox_resources(tmp_path,'ab40ah',['plex-appb-40ah'],'purge')['path_exists']
+
+
+@pytest.mark.parametrize('error', [PermissionError(errno.EACCES,'denied'), OSError(errno.EROFS,'read only'), OSError(errno.EIO,'I/O')])
+def test_appbox_delete_real_filesystem_errors_propagate(tmp_path,monkeypatch,error):
+    directory=tmp_path/'ab40ah'; directory.mkdir()
+    monkeypatch.setattr(agent,'run',DeletionDocker())
+    def fail(*args,**kwargs): raise error
+    monkeypatch.setattr(agent.shutil,'rmtree',fail)
+    with pytest.raises(type(error)) as caught:
+        agent.delete_appbox_resources(tmp_path,'ab40ah',[],'purge')
+    assert caught.value.errno==error.errno and directory.exists()
+
+
+@pytest.mark.parametrize('stage', ['ps','inspect','compose','rm','final_ps','after_cleanup'])
+def test_appbox_delete_docker_failure_is_not_absence(tmp_path,monkeypatch,stage):
+    directory=tmp_path/'ab40ah'; directory.mkdir(); (directory/'compose.yml').write_text('services: {}')
+    docker=DeletionDocker(['plex-appb-40ah']); ps_calls=0
+    def fail(args,timeout=15):
+        nonlocal ps_calls
+        if args[1]=='ps': ps_calls+=1
+        if args[1]==stage or (stage=='final_ps' and args[1]=='ps' and ps_calls==2) or (stage=='after_cleanup' and args[1]=='ps' and ps_calls==3):
+            return 1,'','Cannot connect to the Docker daemon'
+        return docker(args,timeout)
+    monkeypatch.setattr(agent,'run',fail)
+    with pytest.raises(RuntimeError,match='Docker daemon'):
+        agent.delete_appbox_resources(tmp_path,'ab40ah',['plex-appb-40ah'],'purge')
+    assert directory.exists() == (stage!='after_cleanup')
+
+
+@pytest.mark.parametrize('identifier,path', [('../other',None),('/srv/appboxes',None),('ab40ah','/etc'),
+                                          ('ab40ah','root'),('ab40ah','sibling')])
+def test_appbox_delete_rejects_traversal_root_and_other_client(tmp_path,monkeypatch,identifier,path):
+    supplied=str(tmp_path) if path=='root' else str(tmp_path/'other') if path=='sibling' else path
+    with patch.object(agent,'run') as docker:
+        with pytest.raises(RuntimeError):
+            agent.delete_appbox_resources(tmp_path,identifier,[],'purge',supplied)
+        docker.assert_not_called()
+
+
+def test_appbox_delete_symlink_and_sibling_resolution_rejected(tmp_path,monkeypatch):
+    directory=tmp_path/'ab40ah'; directory.mkdir()
+    original=Path.lstat
+    from types import SimpleNamespace
+    monkeypatch.setattr(Path,'lstat',lambda self: SimpleNamespace(st_mode=stat.S_IFLNK) if self==directory else original(self))
+    with pytest.raises(RuntimeError,match='symlink'):
+        agent.deletion_target(tmp_path,'ab40ah')
+    monkeypatch.setattr(Path,'lstat',original)
+    resolved=Path.resolve
+    monkeypatch.setattr(Path,'resolve',lambda self,*a,**kw: tmp_path/'other' if self==directory else resolved(self,*a,**kw))
+    with pytest.raises(RuntimeError,match='non sûr'):
+        agent.deletion_target(tmp_path,'ab40ah')
+
+
+def test_appbox_delete_refuses_container_owned_by_other_client(tmp_path,monkeypatch):
+    docker=DeletionDocker(['plex-appb-40ah'])
+    def wrong_owner(args,timeout=15):
+        if args[1]=='inspect' and args[-1]=='plex-appb-40ah':
+            return 0,json.dumps([{'Config':{'Labels':{'com.docker.compose.project':'someone-else'}}}]),''
+        return docker(args,timeout)
+    monkeypatch.setattr(agent,'run',wrong_owner)
+    with pytest.raises(RuntimeError,match='hors AppBox'):
+        agent.delete_appbox_resources(tmp_path,'ab40ah',['plex-appb-40ah'],'purge')
+    assert not any(c[1] in {'rm','compose'} for c in docker.calls)
+
+
+@pytest.mark.parametrize('owned',[True,False])
+def test_appbox_delete_unlabelled_legacy_requires_matching_mount(tmp_path,monkeypatch,owned):
+    docker=DeletionDocker(['plex-appb-40ah'])
+    def legacy(args,timeout=15):
+        if args[1]=='inspect' and args[-1] in docker.names:
+            source=tmp_path/('ab40ah' if owned else 'other')/'plex-config'
+            return 0,json.dumps([{'Config':{'Labels':{}},'Mounts':[{'Source':str(source)}]}]),''
+        return docker(args,timeout)
+    monkeypatch.setattr(agent,'run',legacy)
+    if owned:
+        assert agent.delete_appbox_resources(tmp_path,'ab40ah',[],'purge')['state']=='deleted'
+    else:
+        with pytest.raises(RuntimeError,match='hors AppBox'):
+            agent.delete_appbox_resources(tmp_path,'ab40ah',[],'purge')
+
+
+def test_appbox_delete_refuses_nested_bind_mounts(tmp_path):
+    target=tmp_path/'ab40ah'
+    safe=f'1 0 0:1 / {tmp_path.as_posix()} rw - ext4 device rw'
+    agent.reject_appbox_mounts(target,safe)
+    for point in (target,target/'shared-media'):
+        with pytest.raises(RuntimeError,match='Montage actif'):
+            agent.reject_appbox_mounts(target,f'1 0 0:1 / {point.as_posix()} rw - none device rw')
+
+
+def test_appbox_delete_recreated_container_prevents_false_success(tmp_path,monkeypatch):
+    directory=tmp_path/'ab40ah'; directory.mkdir()
+    docker=DeletionDocker(); calls=0
+    def recreated(args,timeout=15):
+        nonlocal calls
+        if args[1]=='ps':
+            calls+=1
+            if calls==3: docker.names.add('plex-appb-40ah')
+        return docker(args,timeout)
+    monkeypatch.setattr(agent,'run',recreated)
+    with pytest.raises(RuntimeError,match='recréés'):
+        agent.delete_appbox_resources(tmp_path,'ab40ah',[],'purge')
 
 
 class AgentDeploymentTests(unittest.TestCase):

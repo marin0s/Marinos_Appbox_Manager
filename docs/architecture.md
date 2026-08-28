@@ -4,6 +4,16 @@ AppBox Manager utilise un modèle control plane / agents.
 
 Le Control Plane sur CRONOS conserve l'état métier, les jobs, les décisions de placement et la file de commandes. Les agents interrogent l'API, exécutent localement les opérations Docker puis renvoient leur résultat et leur inventaire.
 
+Le dispatcher de jobs CP réserve atomiquement les jobs dans SQLite et lance au plus
+un exécuteur de job par node. Une attente distante sur ORION ne monopolise pas ARTEMIS ;
+les jobs d'un même node et le worker métier de chaque agent restent séquentiels.
+Les commandes AppBox doivent être claimées sous 60 s par défaut
+(`APPBOX_AGENT_CLAIM_TIMEOUT_SECONDS`, minimum 5 s). Le délai et le lien au job sont
+portés par des métadonnées du payload existant, sans migration SQL. L'API de poll et
+le waiter appliquent la même expiration, avec transition conditionnelle sous verrou.
+Après restart, les jobs running sont finalisés en erreur et leurs commandes encore
+queued annulées ; les jobs queued sont conservés. Voir [suppression et reprise](appbox-deletion-hotfix.md).
+
 Le runtime observé par les agents est la source de vérité pour l'état des conteneurs. La base conserve l'état désiré et les informations métier. Le moteur de réconciliation compare les deux.
 
 Les communications sont initiées par les agents vers le Control Plane. Aucun accès Docker distant direct depuis CRONOS n'est requis.
