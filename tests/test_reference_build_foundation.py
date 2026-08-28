@@ -34,8 +34,17 @@ class ReferenceBuildFoundationTests(unittest.TestCase):
             builder = con.execute(
                 "SELECT application,intrusive_actions_enabled FROM reference_builder_registry WHERE builder_key='plex'"
             ).fetchone()
-            self.assertEqual(builder, ("plex", 1))
+            self.assertEqual(builder, ("plex", 0))
             self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_existing_builder_reporting_is_updated_without_disabling_capture(self):
+        with main.db() as con:
+            con.execute("UPDATE reference_builder_registry SET intrusive_actions_enabled=1,description='Capture avec arrêt temporaire' WHERE builder_key='plex'")
+        main.init_database()
+        with main.db() as con:
+            builder = con.execute("SELECT enabled,intrusive_actions_enabled,description FROM reference_builder_registry WHERE builder_key='plex'").fetchone()
+        self.assertEqual(tuple(builder[:2]), (1, 0))
+        self.assertIn('sans arrêt/redémarrage', builder['description'])
 
     def test_create_draft_is_non_intrusive_and_logged(self):
         build_id = main.create_reference_build_draft(

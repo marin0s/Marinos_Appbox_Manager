@@ -711,6 +711,64 @@ def test_package_includes_dispatcher_abi_and_managed_components(artifact):
         assert name in contents and name in manifest['files']
 
 
+@pytest.mark.parametrize('mode,output,success', [
+    ('free', 'controller:tick\n', True),
+    ('busy', '', True),
+    ('controller_error', 'controller:tick\nrescue:recover\n', True),
+    ('lock_io_error', '', False),
+    ('lock_permission_error', '', False),
+    ('other_blocking_error', '', False),
+])
+def test_launcher_lock_exit_status_and_rescue(tmp_path, mode, output, success):
+    # Run the real main/dispatch in a process; only POSIX flock/root and controller
+    # execution are simulated so Windows also verifies exit code and traceback.
+    code = r'''
+import errno, importlib.util, sys
+from pathlib import Path
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location('launcher_test', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.STATE = Path(sys.argv[2])
+module.os = SimpleNamespace(name='posix', geteuid=lambda: 0)
+mode = sys.argv[3]
+locks = []
+def flock(lock, flags):
+    assert flags == 6 and not lock.closed
+    locks.append(lock)
+    if mode == 'busy':
+        raise BlockingIOError(errno.EAGAIN, 'already locked')
+    if mode == 'lock_io_error':
+        raise OSError(errno.EIO, 'real lock I/O error')
+    if mode == 'lock_permission_error':
+        raise PermissionError(errno.EACCES, 'real lock permission error')
+    if mode == 'other_blocking_error':
+        raise BlockingIOError(errno.EINPROGRESS, 'not lock contention')
+sys.modules['fcntl'] = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=flock)
+module.resolve_helper = lambda root, pointer: pointer
+def run(controller, action):
+    print(controller + ':' + action)
+    if mode == 'controller_error' and controller == 'controller':
+        raise OSError(errno.EIO, 'controller failed')
+    return True
+dispatch = module.dispatch
+module.dispatch = lambda: dispatch(root=module.STATE, run=run)
+for _ in range(2 if mode == 'busy' else 1):
+    module.main()
+assert all(lock.closed for lock in locks)
+'''
+    result = subprocess.run([sys.executable, '-I', '-c', code,
+        str(SOURCE/'upgrade_launcher.py'), str(tmp_path), mode],
+        capture_output=True, text=True, timeout=15)
+    assert result.stdout == output
+    if success:
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ''
+    else:
+        assert result.returncode != 0
+        assert 'Traceback' in result.stderr
+
+
 @pytest.mark.parametrize('directive',['ExecStartPre=/bin/sh -c bad','EnvironmentFile=/etc/secrets',
                                      'ExecStopPost=/bin/sh -c bad'])
 def test_versioned_unit_rejects_arbitrary_execution(directive):

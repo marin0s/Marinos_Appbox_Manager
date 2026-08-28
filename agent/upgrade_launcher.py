@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Stable dispatch ABI 1. No package, network, unit-install or upgrade policy here."""
+import errno
 import os
 import signal
 import subprocess
@@ -61,7 +62,12 @@ def main():
     import fcntl
     STATE.mkdir(parents=True, exist_ok=True)
     with (STATE / 'supervisor.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            if exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise
+            return  # Another supervisor/bootstrap owns this tick; nothing to do.
         # FD lock belongs to the launcher, surviving controller crashes/timeouts.
         if not dispatch():
             raise SystemExit('Upgrade dispatch failed; inspect durable state')

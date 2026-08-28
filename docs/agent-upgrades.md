@@ -42,6 +42,16 @@ superviseur, exécute `controller/upgrade_helper.py tick` avec un timeout, et, e
 d'échec, appelle `rescue/upgrade_helper.py recover`. Les chemins doivent être des releases
 locales ; aucune URL ni commande arbitraire. stdout/stderr des enfants sont masqués.
 Sous Linux, tout le groupe de processus défaillant est tué avant la récupération.
+Si le verrou est déjà détenu (bootstrap ou autre superviseur), le tick retourne 0
+silencieusement, sans lancer controller ni rescue. Seule cette contention est ignorée ;
+les autres erreurs du verrou et le mécanisme de secours restent inchangés.
+
+Le lanceur étant fixe après bootstrap, un upgrade managed transporte sa nouvelle copie
+dans la release mais ne remplace pas `/opt/marinos-appbox-agent/upgrade_launcher.py`.
+La correction de contention s'applique aux prochains bootstraps ; sur un node déjà
+managed, son activation exige une mise à jour opérateur ciblée du seul lanceur fixe.
+Ne pas relancer le bootstrap pour cela. Le package reste un nouvel artefact/build
+utilisable pour tester N → N+1 sans modifier l'ABI ni le protocole.
 
 Pour N → N+1, le contrôleur N reste actif pendant toute la transaction, même après la
 bascule de current vers N+1. Il sauvegarde l'unité précédente et un état de récupération

@@ -2,6 +2,10 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Correctif après bootstrap ARTEMIS
+- Un tick du lanceur dont le verrou est déjà détenu quitte silencieusement avec code 0, sans controller/rescue ; les autres erreurs et le secours restent inchangés.
+- `/health` et le registre Plex annoncent la capture sans interruption (`intrusive_actions=false`) ; documentation et tests réalignés sans changement du moteur, de l'ABI, du bootstrap ou du rollback.
+
 ### Layout du détail node
 - Espacement vertical des rangées métriques et Système/Agent via la grille existante, sans modification des breakpoints ni du layout local.
 - Critères E2E du lot 2 documentés, dont extinction physique du node et rafraîchissement UI sans restart CP ; aucun changement de liveness.

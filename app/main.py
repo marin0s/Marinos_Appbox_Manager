@@ -1175,7 +1175,7 @@ def init_database() -> None:
             INSERT INTO reference_builder_registry(
                 builder_key,application,display_name,builder_version,enabled,
                 intrusive_actions_enabled,supported_manifest_schema,description,updated_at
-            ) VALUES('plex','plex','Plex Reference Builder','1.6.0-alpha.5-phase1',1,1,1,?,?)
+            ) VALUES('plex','plex','Plex Reference Builder','1.6.0-alpha.5-phase1',1,0,1,?,?)
             ON CONFLICT(builder_key) DO UPDATE SET
                 display_name=excluded.display_name,
                 builder_version=excluded.builder_version,
@@ -1184,7 +1184,7 @@ def init_database() -> None:
                 description=excluded.description,
                 updated_at=excluded.updated_at
         """, (
-            "Capture Plex avec arrêt temporaire, restauration de la source et validation SQLite privée.",
+            "Capture Plex à chaud sans arrêt/redémarrage de la source active et validation SQLite privée.",
             stamp,
         ))
 
@@ -2682,7 +2682,7 @@ def _reference_build_storage(build_id: str) -> Path:
 
 
 def queue_reference_capture(build_id: str, discovery: dict[str, Any]) -> str:
-    """Queue the intrusive-but-source-preserving capture after successful discovery."""
+    """Queue the live, source-preserving capture after successful discovery."""
     with db() as con:
         build = con.execute("SELECT * FROM reference_builds WHERE build_id=?", (build_id,)).fetchone()
     if not build:
@@ -6396,7 +6396,7 @@ def health():
         "reference_build_jobs": True,
         "reference_discovery": True,
         "reference_discovery_read_only": True,
-        "reference_build_intrusive_actions": True,
+        "reference_build_intrusive_actions": False,
         "advanced_appbox_options": True,
         "control_plane_foundation": True,
         "node_tags": True,

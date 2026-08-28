@@ -23,7 +23,7 @@ class Alpha5VersionReportingTests(unittest.TestCase):
         self.assertEqual(main.PRODUCT_VERSION, "1.6.0-alpha.5")
         self.assertEqual(main.VERSION, "1.6.0-alpha.5-dev")
         self.assertEqual(main.health()["version"], main.VERSION)
-        self.assertTrue(main.health()["reference_build_intrusive_actions"])
+        self.assertFalse(main.health()["reference_build_intrusive_actions"])
         footer = main.templates.env.get_template("base.html").render(active_page="")
         self.assertIn("v1.6.0-alpha.5-dev", footer)
 

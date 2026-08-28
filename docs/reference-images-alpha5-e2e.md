@@ -43,7 +43,7 @@ docker compose up -d --build appbox-manager
 curl -fsS http://127.0.0.1:8090/health
 ```
 
-Exiger version `1.6.0-alpha.5-dev` et `reference_build_intrusive_actions=true`.
+Exiger version `1.6.0-alpha.5-dev` et `reference_build_intrusive_actions=false` : une source Plex running reste active sans stop/restart pendant la capture.
 Depuis Agents, télécharger le ZIP de ce Control Plane. Sur les seuls nœuds approuvés, décompresser dans un répertoire privé et installer ensemble les deux fichiers Python :
 
 ```bash
