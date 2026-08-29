@@ -29,10 +29,10 @@
 - Critères E2E du lot 2 documentés, dont extinction physique du node et rafraîchissement UI sans restart CP ; aucun changement de liveness.
 
 ### Suppression des images de référence
-- Confirmation UI/API avec nom, nombre de versions et dépendances explicites ; aucune suppression forcée.
-- Refus des liens AppBox, déploiement, profil, snapshot partagé, build/distribution actifs ; protection des écrivains tardifs sur les colonnes historiques sans FK.
-- Suppression atomique du catalogue avec journal durable de nettoyage des archives centrales ; reprise idempotente après erreur disque ou interruption, chemins confinés et fichiers remplacés refusés.
-- Historiques de builds/snapshots conservés, caches distants consignés comme orphelins sans action sur les nodes. Documentation : `docs/reference-image-deletion.md`.
+- Suppression UI/API d’une ancienne version ou d’une image inactive, avec plan détaillé, confirmation liée à l’état et saisie du nom pour l’image ; aucune suppression forcée ou promotion implicite.
+- Refus des versions active/default, images publiées, provisioning, opérations/déploiements/jobs/builds/distributions actifs et ressources partagées ; AppBox restaurées autonomes préservées avec détachement du lien catalogue.
+- Machine d’état persistante, verrouillage logique contre les écrivains concurrents, validation DB avant unlink, nettoyage central idempotent et audit des succès, refus et erreurs.
+- Purge agent strictement confinée au cache SHA-256. Nodes offline en `purge_pending`, erreurs en `partial`, reprise au poll et retry avec le même operation_id. Documentation : `docs/reference-image-deletion.md`.
 
 ### Upgrades distants des agents
 - Déclenchement manuel dans Agents/Nodes ; versions installée/disponible, build, SHA-256, taille et phases observables, distinctes de la liveness.

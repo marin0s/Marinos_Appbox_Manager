@@ -18,6 +18,16 @@ Le runtime observé par les agents est la source de vérité pour l'état des co
 
 Les communications sont initiées par les agents vers le Control Plane. Aucun accès Docker distant direct depuis CRONOS n'est requis.
 
+## Suppression des Reference Images
+
+Le Control Plane pilote une opération persistante par image/version. Il verrouille
+logiquement les versions, émet des commandes de purge confinées aux caches adressés par
+SHA-256, puis supprime archive centrale et catalogue après validation transactionnelle.
+Les caches de nodes offline restent des tâches `purge_pending` et sont réconciliés au
+poll suivant, sans accès entrant ni blocage global. Les AppBox déjà restaurées sont
+autonomes et leur lien catalogue est détaché; provisioning et opérations actifs restent
+des blockers. Voir [le contrat de suppression](reference-image-deletion.md).
+
 ## Disponibilité et boucles agent (alpha.5, lot 2)
 
 La disponibilité distante est dérivée exclusivement de `node_agents.last_heartbeat`,

@@ -1,80 +1,114 @@
 # Suppression sûre des Reference Images — alpha.5
 
-## Utilisation
+## Périmètre et dépendances
 
-Dans **Images de référence**, choisir **Supprimer**. Une page de confirmation affiche
-le nom, le nombre total de versions et les dépendances. La confirmation porte sur
-l'état affiché : toute modification des versions/artefacts impose de recharger la page.
-La suppression est définitive ; sauvegarder la base et les archives avant utilisation.
-Aucun force-delete et aucune commande de suppression distante.
+La suppression porte soit sur une ancienne version, soit sur une image entière et toutes
+ses versions. Le catalogue central utilise `reference_images`,
+`reference_image_versions`, `reference_builds`, `catalog_snapshots`,
+`reference_image_distribution` et `node_reference_cache`. Les consommateurs inspectés
+sont `appboxes`, `provisioning_profiles`, `control_plane_deployments`,
+`snapshot_deployments`, les `jobs` et les `agent_commands` actifs. Les opérations et
+leur progression par node sont conservées dans `reference_image_deletions` et
+`reference_image_deletion_nodes`; `audit_log` conserve démarrages, refus, résultats et
+erreurs.
 
-API : `GET /api/reference-images/{image_id}/deletion` donne `confirmation`, `blockers`,
-`version_count` et `state`. Envoyer ensuite `DELETE /api/reference-images/{image_id}`
-avec `{"confirmation":"<valeur reçue>"}`. Confirmation absente : 422 ; référence modifiée
-ou dépendances présentes : 409 ; image jamais connue : 404. La confirmation est une
-protection contre les changements concurrents, pas un mécanisme d'authentification/CSRF.
-Les règles d'accès opérateur existantes s'appliquent ; leur durcissement reste un sujet séparé.
+Les fichiers centraux connus sont l’archive publiée, sa copie `deployment-cache` et le
+marqueur de capture déclaré sous `APPBOX_REFERENCE_ROOT`. Une source importée externe
+n’est jamais supprimée. Chaque node peut détenir une copie adressée par SHA-256 sous son
+`reference_cache_dir`.
 
-## Dépendances bloquantes
+Une AppBox restaurée est autonome : `recreate` réutilise son Compose et sa configuration
+existants et ne restaure pas l’archive. Sa référence catalogue est donc détachée pendant
+la finalisation, sans toucher ses données, conteneurs ou fichiers. Un profil de
+provisioning reste en revanche un usage futur et bloque. Les déploiements terminaux sont
+conservés comme historique et leur lien catalogue est détaché; tout déploiement ou job
+reprenable/en cours bloque.
 
-- AppBox liée par image, version **ou snapshot**, quel que soit son état.
-- Déploiement Control Plane ou historique snapshot référençant une version/snapshot.
-  Alpha.5 conserve volontairement tous ces déploiements, même échoués : aucun détachement
-  automatique d'un historique. Le refus indique ID et statut.
-- Profil de provisioning lié, même désactivé ; snapshot ou archive partagé avec une autre image.
-- Build actif rattaché à l'image/version ; distribution `transferring`.
-- Chemin d'artefact hors de `APPBOX_REFERENCE_ROOT`, relatif, contenant `..`, lien,
-  jonction ou répertoire au lieu d'un fichier.
+## Prévisualisation et refus
 
-Le contrôle est refait dans une transaction SQLite `BEGIN IMMEDIATE`. Des triggers
-sur les colonnes historiques sans FK d'AppBox/profil refusent les écrivains tardifs
-référençant une image/version supprimée ou un snapshot marqué deleted.
+Depuis **Images de référence**, une ancienne version éligible propose **Supprimer**.
+L’image complète possède une action séparée. La page affiche la cible, les versions, la
+taille connue, les archives, les caches et nodes, les éléments conservés, ainsi que tous
+les motifs de refus. La version courante/default et une image publiée/active sont
+refusées; alpha.5 ne promeut jamais implicitement une autre version.
 
-## Base, archives et reprise
+Sont également bloqués : profil de provisioning, déploiement actif, job ou commande
+active mentionnant la cible, build/capture actif, distribution `transferring`, snapshot
+ou archive partagé, et toute autre suppression non terminée sur la même image. Un chemin
+central relatif, traversant, hors storage, remplacé, lié ou désignant un répertoire est
+refusé. Il n’existe aucun force-delete.
 
-Une table additive `reference_image_deletions` est créée au démarrage du CP, sans
-migration manuelle. Elle conserve identité, versions, snapshots sources, liens de builds,
-caches distants orphelins, distributions, liste exacte des fichiers et état du nettoyage.
-Sauvegarder la base avant déploiement. Les versions sont supprimées par cascade ; les
-FK des builds passent à NULL selon le modèle existant, leurs statuts/logs sont conservés.
-Un résultat de build déjà publié ne republie donc pas l'image après sa suppression.
-Les snapshots sont conservés pour audit avec `status=deleted` et `source_path=NULL` ;
-leur état original est enregistré dans le journal.
+La confirmation est liée par SHA-256 au plan exact. Supprimer une image impose aussi de
+saisir son nom exact. Les GET ne suppriment rien. L’API expose :
 
-La transaction supprime le catalogue et crée **atomiquement** le journal de nettoyage.
-Aucun fichier n'est supprimé avant son commit. Les archives déclarées par les versions,
-leurs archives `deployment-cache` et marqueurs de capture sont ensuite supprimés,
-individuellement, sans suppression récursive. Les sources externes importées restent intactes.
-Les répertoires vides et fichiers non déclarés ne sont pas balayés.
+- `GET /api/reference-images/{image_id}/deletion`;
+- `GET /api/reference-images/{image_id}/versions/{version_id}/deletion`;
+- `DELETE /api/reference-images/{image_id}` avec `confirmation` et `confirmed_name`;
+- `DELETE /api/reference-images/{image_id}/versions/{version_id}`;
+- `GET /api/reference-deletions/{operation_id}`.
 
-Une panne disque renvoie **202 / cleanup_pending**, pas un faux succès. L'image n'est
-plus proposée au provisioning ; la bibliothèque affiche « Nettoyage en attente ».
-« Reprendre le nettoyage » rejoue le journal. Un fichier déjà absent est accepté,
-y compris après une interruption entre unlink et commit. Le contrôle d'identité
-(device/inode/taille/mtime) suspend le nettoyage si le fichier a été remplacé.
-Un changement du storage root suspend aussi la reprise. Les erreurs sont affichées.
-Réparer les permissions/le stockage puis reprendre ; ne pas supprimer le journal.
+L’authentification opérateur et la protection CSRF restent celles du Control Plane; la
+confirmation protège surtout d’un plan devenu obsolète.
 
-Après succès : **200 / deleted**. Répéter la même confirmation est sans effet. Un nouvel
-usage du même image_id n'est possible qu'après nettoyage ; une ancienne confirmation
-ne supprime pas une nouvelle image. Le journal reste un audit, pas une sauvegarde des archives.
-Un retour arrière après suppression physique exige une sauvegarde cohérente base + archives.
+## Machine d’état et ordre des opérations
 
-Les chemins sont revérifiés à chaque reprise. Sous Linux, l'ouverture des répertoires
-avec `O_NOFOLLOW` et l'unlink relatif à des descripteurs empêchent la redirection par
-substitution d'un parent. Le storage configuré et ses parents doivent rester sous
-contrôle administrateur. La génération locale des archives est sérialisée avec le
-nettoyage pour éviter une écriture tardive du cache par ce processus CP.
+Le preflight est recalculé dans une transaction SQLite `BEGIN IMMEDIATE`. L’opération
+durable est créée en `running`, puis les versions passent à `deleting`. Des triggers
+refusent alors une nouvelle publication, distribution, restauration ou association.
+Il n’existe aucun verrou conservé pendant l’attente réseau; les brèves transactions sont
+nécessairement sérialisées par SQLite, et les suppressions d’une même image sont
+explicitement sérialisées.
 
-## Caches distants et validation terrain
+Chaque cache connu reçoit une tâche persistante. Un node online et compatible reçoit
+`reference_cache_delete`; les autres restent `pending`. Lorsque toutes les commandes
+émises ont répondu, une mutation catalogue complète est d’abord exercée dans un
+savepoint puis annulée. Ceci vérifie les FK et triggers avant de toucher les fichiers.
+L’archive centrale est ensuite supprimée, puis la mutation DB est appliquée : liens
+autonomes/historiques détachés, caches centraux nettoyés, snapshots sans autre
+propriétaire marqués `deleted`, version ou image supprimée. Builds, snapshots, journal
+d’opération et audit restent consultables.
 
-Les lignes de `node_reference_cache` deviennent des enregistrements historiques dans
-`manifest_json.orphaned_node_cache`, sans FK vivante vers une version supprimée.
-Les fichiers distants ne bougent pas. Aucun node n'a besoin d'être online. Le nettoyage
-physique distant éventuel sera une opération séparée, explicitement autorisée.
+États visibles :
 
-Tests locaux : catalogue vide/multiversion, dépendances, archives absentes, chemins
-invalides/liens simulés, FK, échec DB avant unlink, erreur disque, interruption/reprise,
-réutilisation d'identifiant, confirmation et blockers UI. Avant utilisation réelle,
-valider les permissions/montages Linux, les descripteurs `O_NOFOLLOW`, une interruption
-processus et les fichiers ouverts sur le stockage cible. Ces validations n'ont pas été exécutées.
+- `running` : au moins une purge distante émise attend son résultat;
+- `purge_pending` : catalogue et archive centraux supprimés, un node offline reste à purger;
+- `partial` : une purge ou un nettoyage a échoué; les métadonnées de retry sont conservées;
+- `deleted` : catalogue, archive et tous les caches connus sont confirmés absents.
+
+`phase`, `progress`, `detail`, `error_code`, dates et résultats par node permettent de
+distinguer preflight, purge nodes, validation DB, archive centrale, nettoyage DB et fin.
+Un retry réutilise le même `operation_id`; fichier/cache déjà absent vaut succès. Un
+double clic ne crée ni seconde opération ni seconde commande utile.
+
+## Nodes offline et sécurité agent
+
+Un node offline ne bloque pas la suppression centrale. Sa ligne durable conserve node,
+version, chemin et checksum; l’opération reste `purge_pending`. À son prochain poll
+authentifié, le Control Plane réémet seulement sa purge, puis passe à `deleted` après ACK
+`cache_absent=true`. Aucun autre node et aucune file AppBox ne sont bloqués.
+
+L’agent accepte uniquement le fichier exact
+`<reference_cache_dir>/<sha256>.tar.gz`. Racine absolue non liée, checksum hexadécimal,
+version bornée, chemin exact, fichier régulier et checksum réel sont obligatoires. Racine,
+traversée, chemin arbitraire, symlink, répertoire ou contenu différent sont refusés. Les
+erreurs permission, filesystem read-only ou I/O remontent; aucune erreur n’est masquée.
+
+## Migration, reprise et exploitation
+
+Au démarrage, le Control Plane ajoute les colonnes manquantes à
+`reference_image_deletions`, crée `reference_image_deletion_nodes`, son index et les
+triggers. Aucune commande de migration manuelle ni nouvelle configuration n’est requise.
+Les opérations anciennes `cleanup_pending` restent rejouables.
+
+Avant E2E, sauvegarder ensemble la base SQLite et `APPBOX_REFERENCE_ROOT`. Tester une
+ancienne version non courante avec un cache sur ARTEMIS online et ORION offline : vérifier
+ACK ARTEMIS, `purge_pending`, archive centrale absente, AppBox existante inchangée, puis
+retour ORION et transition `deleted`. Tester ensuite une erreur de permission, corriger
+le filesystem et relancer la même opération. Redémarrer CP pendant `running` et l’agent
+après claim de la commande; confirmer qu’aucune cible différente n’est supprimée et que
+les métadonnées de reprise subsistent.
+
+Ne pas utiliser DEMETER. Sur Linux réel, valider les montages, permissions, `fsync`,
+comportement des fichiers ouverts et des symlinks avec les sauvegardes disponibles. Un
+rollback après suppression physique exige la restauration cohérente de la base et des
+archives; le journal n’est pas une sauvegarde des données.

@@ -4938,6 +4938,9 @@ def api_reconciliation_run(node_id: str):
 @app.get("/api/agent/v1/{node_id}/commands")
 def agent_poll_commands(node_id: str, request: Request):
     authenticate_agent(request, node_id)
+    # A polling agent is available to resume offline Reference Image purges.
+    # Reconciliation is per node and idempotent; it never blocks other nodes.
+    reference_deletion.reconcile_node(node_id)
     node = next((n for n in list_control_nodes() if n['node_id'] == node_id), None)
     with db_lock, db() as con:
         expire_appbox_commands(con, node_id=node_id)
@@ -5004,6 +5007,8 @@ async def agent_command_result(node_id: str, command_id: str, request: Request):
         ))
     finalize_reference_discovery_command(command, status, payload.get("result") or {}, payload.get("error"))
     await run_in_threadpool(finalize_reference_build_command, command, status, payload.get("result") or {}, payload.get("error"))
+    await run_in_threadpool(reference_deletion.finalize_remote_command, command, status,
+                            payload.get("result") or {}, payload.get("error"))
     record_event(
         None,
         "agent_command_completed",

@@ -1460,6 +1460,7 @@ def heartbeat(config, metrics=None):
             "inventory": True,
             "reference_distribution": True,
             "reference_deployment": True,
+            "reference_cache_delete": True,
             "reference_builder_foundation": True,
             "reference_discovery": True,
             "reference_builders": ["plex"],
@@ -1700,6 +1701,53 @@ def install_reference_archive(config: dict, descriptor: dict, app_dir: Path):
             shutil.rmtree(staging)
 
 
+def delete_reference_cache(config: dict, payload: dict):
+    """Delete exactly one checksum-addressed cached archive, idempotently."""
+    checksum = str(payload.get('checksum') or '').lower()
+    version_id = str(payload.get('version_id') or '')
+    supplied = Path(str(payload.get('local_path') or ''))
+    if (not re.fullmatch(r'[0-9a-f]{64}', checksum)
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,159}', version_id)):
+        raise RuntimeError('Descripteur de purge Reference Image invalide.')
+    root = Path(config.get('reference_cache_dir', '/var/lib/marinos-appbox-agent/reference-cache'))
+    if not root.is_absolute() or root == root.parent or root.resolve() != root:
+        raise RuntimeError('Racine de cache Reference Images non sûre.')
+    expected = root / (checksum + '.tar.gz')
+    if supplied != expected or supplied == root or '..' in supplied.parts:
+        raise RuntimeError('Purge hors du cache Reference Images autorisé.')
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        return {'cache_absent':True, 'version_id':version_id, 'checksum':checksum,
+                'local_path':str(expected), 'bytes_freed':0,
+                'output':'Cache déjà absent ; purge idempotente terminée.'}
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise RuntimeError('Racine de cache invalide ou liée symboliquement.')
+    try:
+        info = expected.lstat()
+    except FileNotFoundError:
+        return {'cache_absent':True, 'version_id':version_id, 'checksum':checksum,
+                'local_path':str(expected), 'bytes_freed':0,
+                'output':'Cache déjà absent ; purge idempotente terminée.'}
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or expected.resolve() != expected:
+        raise RuntimeError('Artefact de cache non sûr : fichier régulier requis.')
+    if not secrets.compare_digest(sha256_file(expected), checksum):
+        raise RuntimeError('Checksum du cache différent : suppression refusée.')
+    size = info.st_size
+    expected.unlink()
+    if hasattr(os, 'O_DIRECTORY'):
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    if expected.exists() or expected.is_symlink():
+        raise RuntimeError('Purge incomplète : cache toujours présent.')
+    return {'cache_absent':True, 'version_id':version_id, 'checksum':checksum,
+            'local_path':str(expected), 'bytes_freed':size,
+            'output':'Cache Reference Image supprimé et absence vérifiée.'}
+
+
 def verify_manifest(payload: dict, client_id: str, compose: str, env_content: str) -> dict:
     manifest = payload.get("manifest")
     if not isinstance(manifest, dict):
@@ -1815,6 +1863,8 @@ def execute_command(config, command):
         return discover_plex_instance(config, command.get("payload") or {})
     if command_type == "reference_build":
         return build_and_upload_plex_reference(config, command.get("payload") or {})
+    if command_type == "reference_cache_delete":
+        return delete_reference_cache(config, command.get('payload') or {})
     if command_type == "appbox_action":
         payload = command.get("payload") or {}
         client_id = str(payload.get("client_id") or "").strip().lower()

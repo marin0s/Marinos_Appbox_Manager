@@ -63,6 +63,47 @@ def test_appbox_deletion_absence_matrix_and_repeat(tmp_path,monkeypatch,mode,has
     assert not any(c[1]=='network' for c in docker.calls)
 
 
+def test_reference_cache_delete_present_absent_and_dispatch(tmp_path):
+    root=tmp_path/'reference-cache'; root.mkdir()
+    content=b'immutable reference archive'; checksum=hashlib.sha256(content).hexdigest()
+    cached=root/f'{checksum}.tar.gz'; cached.write_bytes(content)
+    payload={'version_id':'v1','checksum':checksum,'local_path':str(cached)}
+    result=agent.execute_command({'reference_cache_dir':str(root)},
+        {'command_type':'reference_cache_delete','payload':payload})
+    assert result['cache_absent'] and result['bytes_freed']==len(content) and not cached.exists()
+    repeated=agent.delete_reference_cache({'reference_cache_dir':str(root)},payload)
+    assert repeated['cache_absent'] and repeated['bytes_freed']==0
+    root.rmdir()
+    assert agent.delete_reference_cache({'reference_cache_dir':str(root)},payload)['cache_absent']
+
+
+@pytest.mark.parametrize('kind',['outside','root','relative','wrong_checksum','wrong_version','directory','symlink'])
+def test_reference_cache_delete_rejects_unsafe_or_wrong_target(tmp_path,monkeypatch,kind):
+    root=tmp_path/'cache'; root.mkdir(); data=b'cache'; checksum=hashlib.sha256(data).hexdigest()
+    target=root/f'{checksum}.tar.gz'; target.write_bytes(data)
+    supplied={'outside':tmp_path/'outside.tar.gz','root':root,'relative':Path('cache')/target.name}.get(kind,target)
+    payload={'version_id':'../wrong' if kind=='wrong_version' else 'v1',
+             'checksum':'0'*64 if kind=='wrong_checksum' else checksum,'local_path':str(supplied)}
+    if kind=='directory': target.unlink(); target.mkdir()
+    if kind=='symlink':
+        original=Path.lstat
+        monkeypatch.setattr(Path,'lstat',lambda path: type('Info',(),{'st_mode':stat.S_IFLNK})()
+                            if path==target else original(path))
+    with pytest.raises(RuntimeError): agent.delete_reference_cache({'reference_cache_dir':str(root)},payload)
+    if kind not in {'directory'}: assert target.exists()
+
+
+@pytest.mark.parametrize('failure',[PermissionError('denied'),OSError(errno.EROFS,'read only'),OSError(errno.EIO,'I/O')])
+def test_reference_cache_delete_preserves_real_filesystem_errors(tmp_path,monkeypatch,failure):
+    root=tmp_path/'cache'; root.mkdir(); data=b'cache'; checksum=hashlib.sha256(data).hexdigest()
+    target=root/f'{checksum}.tar.gz'; target.write_bytes(data)
+    monkeypatch.setattr(Path,'unlink',lambda path: (_ for _ in ()).throw(failure) if path==target else None)
+    with pytest.raises(type(failure)):
+        agent.delete_reference_cache({'reference_cache_dir':str(root)},
+            {'version_id':'v1','checksum':checksum,'local_path':str(target)})
+    assert target.exists()
+
+
 @pytest.mark.parametrize('code', [0,1])
 def test_appbox_delete_compose_no_resource_and_rm_no_such_container(tmp_path,monkeypatch,code):
     directory=tmp_path/'ab40ah'; directory.mkdir(); (directory/'compose.yml').write_text('services: {}')

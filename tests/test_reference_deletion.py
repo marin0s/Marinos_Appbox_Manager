@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import sqlite3
 import stat
 from types import SimpleNamespace
@@ -10,6 +11,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import main, reference_deletion as deletion
+
+AGENT_PATH=Path(__file__).parents[1]/'agent'/'marinos-appbox-agent.py'
+spec=importlib.util.spec_from_file_location('reference_deletion_agent',AGENT_PATH)
+agent=importlib.util.module_from_spec(spec); spec.loader.exec_module(agent)
 
 
 @pytest.fixture
@@ -38,7 +43,7 @@ def catalogue(tmp_path, monkeypatch):
 
 
 def erase():
-    return deletion.delete('image', deletion.preview('image')['confirmation'])
+    return deletion.delete('image', deletion.preview('image')['confirmation'], confirmed_name='Plex Test')
 
 
 def appbox(con, **fields):
@@ -54,7 +59,7 @@ def test_empty_image_and_idempotent_delete(catalogue):
     assert preview['name'] == 'Plex Test' and preview['version_count'] == 0
     assert client.delete('/api/reference-images/image').status_code == 422
     for _ in range(2):
-        response = client.request('DELETE', '/api/reference-images/image', json={'confirmation': preview['confirmation']})
+        response = client.request('DELETE', '/api/reference-images/image', json={'confirmation': preview['confirmation'], 'confirmed_name':'Plex Test'})
         assert response.status_code == 200 and response.json()['state'] == 'deleted'
     assert client.get('/api/reference-images/missing/deletion').status_code == 404
     with main.db() as con:
@@ -63,14 +68,10 @@ def test_empty_image_and_idempotent_delete(catalogue):
 
 def test_multiple_versions_artifacts_cache_and_audit(catalogue, monkeypatch):
     files = [*catalogue(1), *catalogue(2)]
-    # Availability of nodes is irrelevant; no remote command is ever queued.
-    remote = Mock(side_effect=AssertionError('No remote deletion allowed'))
-    monkeypatch.setattr(main, 'queue_agent_command', remote)
     stamp = main.now_iso()
     build = main.create_reference_build_draft(source_node_id=main.HOSTNAME, display_name='Plex Test')
     with main.db() as con:
         con.execute("UPDATE reference_builds SET image_id='image',version_id='v1',status='published' WHERE build_id=?", (build,))
-        con.execute("INSERT INTO node_reference_cache(node_id,version_id,local_path,status,updated_at) VALUES(?,'v1','/remote/cache','ready',?)", (main.HOSTNAME, stamp))
         con.execute("INSERT INTO reference_image_distribution(version_id,node_id,status,updated_at) VALUES('v1',?,'ready',?)", (main.HOSTNAME, stamp))
     assert erase()['state'] == 'deleted'
     assert not any(file.exists() for file in files)
@@ -82,37 +83,40 @@ def test_multiple_versions_artifacts_cache_and_audit(catalogue, monkeypatch):
         assert tuple(row) == (None, None, 'published')
         assert con.execute('SELECT COUNT(*) FROM reference_build_logs WHERE build_id=?', (build,)).fetchone()[0] > 0
         manifest = json.loads(con.execute('SELECT manifest_json FROM reference_image_deletions').fetchone()[0])
-        assert manifest['orphaned_node_cache'][0]['local_path'] == '/remote/cache'
-        assert manifest['distributions'][0]['status'] == 'ready'
-    remote.assert_not_called()
+        assert len(manifest['versions']) == 2
 
 
 @pytest.mark.parametrize('fields', [{'reference_image_id': 'image'}, {'reference_version_id': 'v1'}, {'snapshot_id': 's1'}])
-def test_appbox_blocker_and_ui(catalogue, fields):
+def test_appbox_is_autonomous_and_preserved_in_plan(catalogue, fields):
     files = catalogue(1)
     with main.db() as con:
         appbox(con, **fields)
     preview = deletion.preview('image')
-    assert 'AppBox : ab-test' in preview['blockers']
+    assert not preview['blockers']
+    assert any('AppBox autonome' in item for item in preview['preserved'])
     response = TestClient(main.app).get('/reference-images/image/delete')
     assert response.status_code == 200
     assert 'Plex Test' in response.text and '1 version(s)' in response.text
-    assert 'data-deletion-blockers' in response.text and 'AppBox : ab-test' in response.text
-    assert 'type="submit"' not in response.text
-    with pytest.raises(HTTPException) as error:
-        deletion.delete('image', preview['confirmation'])
-    assert error.value.status_code == 409
-    assert all(file.exists() for file in files)
+    assert 'Éléments conservés' in response.text and 'AppBox autonome' in response.text
+    assert 'type="submit"' in response.text
+    deletion.delete('image', preview['confirmation'], confirmed_name='Plex Test')
+    assert not any(file.exists() for file in files)
+    with main.db() as con:
+        detached=con.execute("SELECT reference_image_id,reference_version_id,snapshot_id FROM appboxes WHERE client_id='ab-test'").fetchone()
+    assert tuple(detached)==(None,None,None)
 
 
-@pytest.mark.parametrize('status', ['planned', 'success', 'failed'])
-def test_all_deployment_references_block(catalogue, status):
+@pytest.mark.parametrize('status,blocked', [('planned',True),('running',True),('success',False),('failed',False)])
+def test_only_active_deployment_references_block(catalogue, status, blocked):
     catalogue(1)
     with main.db() as con:
         con.execute("INSERT INTO control_plane_deployments(deployment_id,reference_version_id,status,created_at,updated_at) VALUES('dep','v1',?,?,?)", (status, main.now_iso(), main.now_iso()))
-    assert f'Déploiement : dep ({status})' in deletion.preview('image')['blockers']
-    with pytest.raises(HTTPException):
-        erase()
+    preview=deletion.preview('image')
+    assert any('Déploiement actif' in item for item in preview['blockers']) is blocked
+    if blocked:
+        with pytest.raises(HTTPException): erase()
+    else:
+        assert erase()['state']=='deleted'
 
 
 def test_profile_and_active_distribution_block(catalogue):
@@ -151,12 +155,11 @@ def test_database_failure_rolls_back_before_unlink(catalogue):
     files = catalogue(1)
     with main.db() as con:
         con.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON reference_images BEGIN SELECT RAISE(ABORT,'injected failure'); END")
-    with pytest.raises(sqlite3.IntegrityError, match='injected failure'):
-        erase()
+    assert erase()['state']=='partial'
     assert all(path.exists() for path in files)
     with main.db() as con:
         assert con.execute('SELECT COUNT(*) FROM reference_image_versions').fetchone()[0] == 1
-        assert con.execute('SELECT COUNT(*) FROM reference_image_deletions').fetchone()[0] == 0
+        assert con.execute('SELECT state FROM reference_image_deletions').fetchone()[0] == 'partial'
         assert con.execute('PRAGMA foreign_key_check').fetchall() == []
         assert con.execute('SELECT status FROM catalog_snapshots').fetchone()[0] == 'ready'
 
@@ -171,14 +174,14 @@ def test_partial_io_failure_durable_resume_and_ui(catalogue, monkeypatch):
         return original(root, entry)
     monkeypatch.setattr(deletion, 'remove_file', fail)
     client = TestClient(main.app)
-    response = client.request('DELETE', '/api/reference-images/image', json={'confirmation': token})
-    assert response.status_code == 202 and response.json()['state'] == 'cleanup_pending'
+    response = client.request('DELETE', '/api/reference-images/image', json={'confirmation': token, 'confirmed_name':'Plex Test'})
+    assert response.status_code == 202 and response.json()['state'] == 'partial'
     assert archive.exists() and not cache.exists() and not marker.exists()
-    assert 'Reprendre le nettoyage' in client.get('/reference-images/image/delete').text
+    assert 'Reprendre la purge' in client.get('/reference-images/image/delete').text
     assert 'Nettoyage en attente : Plex Test' in client.get('/reference-images').text
     with main.db() as con:
         assert con.execute('PRAGMA foreign_key_check').fetchall() == []
-        assert con.execute('SELECT COUNT(*) FROM reference_images').fetchone()[0] == 0
+        assert con.execute('SELECT COUNT(*) FROM reference_images').fetchone()[0] == 1
     # Simulate a CP restart: only the SQLite journal is needed for recovery.
     main.init_database()
     monkeypatch.setattr(deletion, 'remove_file', original)
@@ -217,11 +220,11 @@ def test_replaced_artifact_is_not_removed_on_retry(catalogue, monkeypatch):
     token = deletion.preview('image')['confirmation']
     original = deletion.remove_file
     monkeypatch.setattr(deletion, 'remove_file', Mock(side_effect=OSError('disk unavailable')))
-    assert deletion.delete('image', token)['state'] == 'cleanup_pending'
+    assert deletion.delete('image', token, confirmed_name='Plex Test')['state'] == 'partial'
     archive.write_bytes(b'a different archive')
     monkeypatch.setattr(deletion, 'remove_file', original)
     result = deletion.delete('image', token)
-    assert result['state'] == 'cleanup_pending'
+    assert result['state'] == 'partial'
     assert any('remplacé' in message for message in result['errors'])
     assert archive.read_bytes() == b'a different archive'
 
@@ -249,9 +252,9 @@ def test_crash_during_cleanup_replays_durable_manifest(catalogue, monkeypatch):
         raise SystemExit('simulated process loss')
     monkeypatch.setattr(deletion, 'remove_file', crash)
     with pytest.raises(SystemExit):
-        deletion.delete('image', token)
+        deletion.delete('image', token, confirmed_name='Plex Test')
     monkeypatch.setattr(deletion, 'remove_file', original)
-    assert deletion.pending()[0]['state'] == 'cleanup_pending'
+    assert deletion.pending()[0]['state'] == 'running'
     assert deletion.delete('image', token)['state'] == 'deleted'
     assert not any(file.exists() for file in files)
 
@@ -274,7 +277,7 @@ def test_active_build_and_shared_archive_block(catalogue):
 
 def test_old_confirmation_never_deletes_recreated_image(catalogue):
     token = deletion.preview('image')['confirmation']
-    deletion.delete('image', token)
+    deletion.delete('image', token, confirmed_name='Plex Test')
     with main.db() as con:
         con.execute("INSERT INTO reference_images(image_id,name,media_type,created_at,updated_at) VALUES('image','Recreated','plex',?,?)", (main.now_iso(), main.now_iso()))
     assert deletion.delete('image', token)['state'] == 'deleted'
@@ -284,9 +287,137 @@ def test_old_confirmation_never_deletes_recreated_image(catalogue):
 def test_ui_confirmation_form_and_delete_button(catalogue):
     catalogue(1)
     client = TestClient(main.app)
-    assert 'href="/reference-images/image/delete">Supprimer' in client.get('/reference-images').text
+    listing=client.get('/reference-images').text
+    assert 'href="/reference-images/image/delete">Supprimer l’image' in listing
+    assert 'href="/reference-images/image/versions/v1/delete">Supprimer' in listing
     preview = deletion.preview('image')
     html = client.get('/reference-images/image/delete').text
-    assert 'Supprimer définitivement : Plex Test (1 version(s))' in html
-    response = client.post('/reference-images/image/delete', data={'confirmation': preview['confirmation']})
+    assert 'Supprimer définitivement' in html and 'Plex Test' in html
+    response = client.post('/reference-images/image/delete', data={'confirmation': preview['confirmation'], 'confirmed_name':'Plex Test'})
     assert response.status_code == 200 and 'Suppression terminée' in response.text
+
+
+def test_delete_old_version_only_and_active_default_refused(catalogue):
+    first=catalogue(1); second=catalogue(2)
+    with main.db() as con:
+        con.execute("UPDATE reference_images SET status='published',current_version_id='v2' WHERE image_id='image'")
+    listing=TestClient(main.app).get('/reference-images').text
+    assert 'disabled title="Version active/default' in listing
+    assert 'disabled title="Image active/publiée' in listing
+    old=deletion.preview('image','v1')
+    assert not old['blockers'] and old['version_count']==1
+    result=deletion.delete('image',old['confirmation'],'v1')
+    assert result['state']=='deleted' and not any(path.exists() for path in first)
+    assert all(path.exists() for path in second)
+    with main.db() as con:
+        assert [row[0] for row in con.execute("SELECT version_id FROM reference_image_versions").fetchall()]==['v2']
+    assert any('active/default' in item for item in deletion.preview('image','v2')['blockers'])
+    assert any('active/publiée' in item for item in deletion.preview('image')['blockers'])
+
+
+def _online_cache(catalogue,tmp_path,monkeypatch,online=True):
+    catalogue(1); cache_root=tmp_path/'node-cache'; cache_root.mkdir()
+    data=b'node archive'; checksum=__import__('hashlib').sha256(data).hexdigest()
+    cached=cache_root/f'{checksum}.tar.gz'; cached.write_bytes(data)
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("""INSERT INTO node_agents(node_id,status,agent_version,last_heartbeat,capabilities_json,updated_at)
+            VALUES(?, 'online','test',?,?,?) ON CONFLICT(node_id) DO UPDATE SET
+            last_heartbeat=excluded.last_heartbeat,capabilities_json=excluded.capabilities_json,updated_at=excluded.updated_at""",
+            (main.HOSTNAME,stamp,json.dumps({'reference_cache_delete':True}),stamp))
+        con.execute("INSERT INTO node_reference_cache(node_id,version_id,local_path,checksum,status,size_bytes,updated_at) VALUES(?,'v1',?,?,'ready',?,?)",
+                    (main.HOSTNAME,str(cached),checksum,len(data),stamp))
+        con.execute("INSERT INTO reference_image_distribution(version_id,node_id,status,local_path,actual_checksum,updated_at) VALUES('v1',?,'ready',?,?,?)",
+                    (main.HOSTNAME,str(cached),checksum,stamp))
+        if not online:
+            con.execute("UPDATE node_agents SET last_heartbeat='2000-01-01T00:00:00+00:00' WHERE node_id=?",(main.HOSTNAME,))
+    availability={'online':online}
+    monkeypatch.setattr(main,'list_control_nodes',lambda: [{
+        'node_id':main.HOSTNAME,
+        'status':'online' if availability['online'] else 'offline',
+        'agent_online':availability['online'],
+        'capabilities':{'reference_cache_delete':True},
+    }])
+    return cache_root,cached,checksum,availability
+
+
+def test_online_node_purge_ack_then_catalogue_cleanup(catalogue,tmp_path,monkeypatch):
+    root,cached,checksum,_=_online_cache(catalogue,tmp_path,monkeypatch)
+    plan=deletion.preview('image','v1'); result=deletion.delete('image',plan['confirmation'],'v1')
+    assert result['state']=='running' and result['nodes'][0]['status']=='queued'
+    with main.db() as con:
+        command=con.execute("SELECT * FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()
+    payload=json.loads(command['payload_json'])
+    remote=agent.delete_reference_cache({'reference_cache_dir':str(root)},payload)
+    deletion.finalize_remote_command(command,'success',remote,None)
+    final=deletion.operation(plan['confirmation'])
+    assert final['state']=='deleted' and final['nodes'][0]['status']=='success' and not cached.exists()
+    with main.db() as con:
+        assert not con.execute("SELECT 1 FROM reference_image_versions WHERE version_id='v1'").fetchone()
+        assert con.execute('PRAGMA foreign_key_check').fetchall()==[]
+
+
+def test_offline_node_is_purge_pending_then_resumes(catalogue,tmp_path,monkeypatch):
+    root,cached,_,availability=_online_cache(catalogue,tmp_path,monkeypatch,online=False)
+    plan=deletion.preview('image','v1'); result=deletion.delete('image',plan['confirmation'],'v1')
+    assert result['state']=='purge_pending' and result['nodes'][0]['status']=='pending'
+    assert cached.exists() and not (main.REFERENCE_ROOT/'builds/1/reference.tar.gz').exists()
+    stamp=main.now_iso()
+    with main.db() as con: con.execute("UPDATE node_agents SET last_heartbeat=? WHERE node_id=?",(stamp,main.HOSTNAME))
+    availability['online']=True
+    deletion.reconcile_node(main.HOSTNAME)
+    with main.db() as con:
+        command=con.execute("SELECT * FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()
+    assert command and deletion.operation(plan['confirmation'])['nodes'][0]['status']=='queued'
+
+
+def test_remote_failure_keeps_retry_information(catalogue,tmp_path,monkeypatch):
+    _online_cache(catalogue,tmp_path,monkeypatch)
+    plan=deletion.preview('image','v1'); deletion.delete('image',plan['confirmation'],'v1')
+    with main.db() as con: command=con.execute("SELECT * FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()
+    deletion.finalize_remote_command(command,'failed',{},'read-only filesystem')
+    result=deletion.operation(plan['confirmation'])
+    assert result['state']=='partial' and result['nodes'][0]['status']=='failed'
+    assert result['nodes'][0]['local_path'] and result['nodes'][0]['checksum'] and result['nodes'][0]['attempts']==1
+    deletion.delete('image',plan['confirmation'],'v1')
+    assert deletion.operation(plan['confirmation'])['nodes'][0]['attempts']==2
+
+
+@pytest.mark.parametrize('kind',['job','command'])
+def test_active_job_or_agent_command_blocks_and_refusal_is_audited(catalogue,kind):
+    catalogue(1); stamp=main.now_iso()
+    with main.db() as con:
+        if kind=='job':
+            con.execute("INSERT INTO jobs(job_id,node_id,action,title,status,progress,detail,created_at,updated_at,options_json) VALUES('j',?,'deploy','x','running',1,'',?,?,?)",
+                        (main.HOSTNAME,stamp,stamp,json.dumps({'reference_version_id':'v1'})))
+        else:
+            con.execute("INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,created_at) VALUES('c',?,'appbox_action',?,'queued',?)",
+                        (main.HOSTNAME,json.dumps({'reference_version_id':'v1'}),stamp))
+    plan=deletion.preview('image','v1'); assert any(('Job actif' if kind=='job' else 'Commande agent active') in item for item in plan['blockers'])
+    with pytest.raises(HTTPException): deletion.delete('image',plan['confirmation'],'v1')
+    with main.db() as con: assert con.execute("SELECT COUNT(*) FROM audit_log WHERE action='reference_deletion_refused'").fetchone()[0]==1
+
+
+def test_deletion_lock_blocks_concurrent_publish_and_double_request_is_idempotent(catalogue,tmp_path,monkeypatch):
+    _online_cache(catalogue,tmp_path,monkeypatch)
+    plan=deletion.preview('image','v1')
+    first=deletion.delete('image',plan['confirmation'],'v1'); second=deletion.delete('image',plan['confirmation'],'v1')
+    assert first['operation_id']==second['operation_id']
+    with main.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM reference_image_deletions").fetchone()[0]==1
+        assert con.execute("SELECT COUNT(*) FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()[0]==1
+        with pytest.raises(sqlite3.IntegrityError,match='deletion'):
+            con.execute("UPDATE reference_images SET current_version_id='v1' WHERE image_id='image'")
+
+
+def test_version_deletion_serializes_other_deletions_for_same_image(catalogue,tmp_path,monkeypatch):
+    _online_cache(catalogue,tmp_path,monkeypatch)
+    version_plan=deletion.preview('image','v1')
+    running=deletion.delete('image',version_plan['confirmation'],'v1')
+    assert running['state']=='running'
+    image_plan=deletion.preview('image')
+    assert any('Suppression déjà active' in item for item in image_plan['blockers'])
+    with pytest.raises(HTTPException):
+        deletion.delete('image',image_plan['confirmation'],confirmed_name='Plex Test')
+    with main.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM reference_image_deletions").fetchone()[0]==1

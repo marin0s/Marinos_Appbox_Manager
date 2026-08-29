@@ -36,7 +36,14 @@
     <div><span>Taille</span><strong>{{'%.2f Go'|format((image.size_bytes or 0) / 1073741824)}}</strong></div>
     <div><span>Créée</span><strong>{{image.created_at[:10] if image.created_at else '—'}}</strong></div>
    </div>
-   <div class="actions"><a class="button danger" href="/reference-images/{{image.image_id}}/delete">Supprimer</a></div>
+   <div class="version-list">
+   {% for version in versions if version.image_id == image.image_id %}
+    <div class="version-row"><div><strong>Version {{version.version}}</strong><small>{{version.state}} · {{'%.2f Go'|format((version.size_bytes or 0)/1073741824)}}</small></div>
+    {% if version.version_id == image.current_version_id %}<span><a class="button secondary" href="/reference-images/{{image.image_id}}/versions/{{version.version_id}}/delete">Voir le plan</a> <button class="danger" disabled title="Version active/default : transition explicite requise">Supprimer</button></span>
+    {% else %}<a class="button danger" href="/reference-images/{{image.image_id}}/versions/{{version.version_id}}/delete">Supprimer</a>{% endif %}</div>
+   {% endfor %}
+   </div>
+   <div class="actions">{% if image.current_version_id or image.status == 'published' %}<a class="button secondary" href="/reference-images/{{image.image_id}}/delete">Voir le plan</a><button class="danger" disabled title="Image active/publiée : transition explicite requise">Supprimer l’image</button>{% else %}<a class="button danger" href="/reference-images/{{image.image_id}}/delete">Supprimer l’image</a>{% endif %}</div>
   </article>
  {% else %}
   <div class="card empty reference-empty"><strong>Aucune référence disponible</strong><span>Commencez par analyser une instance Plex existante depuis l’onglet « Depuis un serveur ».</span><button type="button" data-open-dialog="reference-create-server">Ajouter une référence</button></div>

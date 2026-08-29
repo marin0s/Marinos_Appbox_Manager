@@ -2,21 +2,31 @@
 {% block title %}Supprimer une référence — Marinos AppBox{% endblock %}
 {% block page_title %}Suppression de Reference Image{% endblock %}
 {% block content %}
-<section class="hero"><div><div class="eyebrow">Images de référence</div><h1>{{deletion.name}}</h1><p>{{deletion.version_count}} version(s) concernée(s).</p></div></section>
-<div class="card grid">
+{% if deletion.state in ['running','purge_pending'] %}<meta http-equiv="refresh" content="5">{% endif %}
+<section class="hero"><div><div class="eyebrow">Images de référence · {{deletion.target_type|upper}}</div><h1>{{deletion.target_label}}</h1><p>{{deletion.version_count}} version(s) · {{'%.2f Go'|format((deletion.size_bytes or 0)/1073741824)}} · {{deletion.node_count}} node(s)</p></div></section>
+<div class="card grid reference-delete-plan">
  {% if error %}<div class="reference-blocked" role="alert">{{error}}</div>{% endif %}
- {% if deletion.state == 'deleted' %}
- <h2>Suppression terminée</h2><p>Image et versions supprimées du catalogue, artefacts centraux nettoyés. Les historiques sont conservés.</p>
- {% elif deletion.blockers %}
- <h2>Suppression impossible</h2><p>Les dépendances suivantes doivent rester valides :</p>
+ <div class="reference-current compact"><div><span>Statut</span><strong>{{deletion.state|upper}}</strong></div><div><span>Phase</span><strong>{{deletion.phase}}</strong></div><div><span>Progression</span><strong>{{deletion.progress or 0}} %</strong></div></div>
+ {% if deletion.detail %}<p>{{deletion.detail}}</p>{% endif %}
+ {% if deletion.blockers %}
+ <div class="reference-blocked"><strong>Suppression impossible</strong><span>Terminez ou détachez les dépendances actives suivantes.</span></div>
  <ul data-deletion-blockers>{% for blocker in deletion.blockers %}<li>{{blocker}}</li>{% endfor %}</ul>
  {% else %}
- <h2>{{'Nettoyage en attente' if deletion.state == 'cleanup_pending' else 'Confirmer la suppression définitive'}}</h2>
- <p>Cette action supprime toutes les versions et leurs archives centrales. Elle est irréversible : vérifiez vos sauvegardes. Les sources externes et les caches des nodes ne sont pas supprimés.</p>
- {% if deletion.errors %}<ul role="alert">{% for error in deletion.errors %}<li>{{error}}</li>{% endfor %}</ul>{% endif %}
- <form method="post" action="/reference-images/{{deletion.image_id}}/delete">
+  {% if deletion.state == 'deleted' %}<div class="reference-ready"><strong>Suppression terminée</strong><span>Catalogue, archive centrale et caches connus confirmés absents.</span></div>
+  {% elif deletion.state == 'purge_pending' %}<div class="reference-ready pending"><strong>Purge distante en attente</strong><span>Un node offline sera repris automatiquement à son retour.</span></div>
+  {% elif deletion.state == 'partial' %}<div class="reference-blocked"><strong>Suppression partielle</strong><span>Tout l’espace distant n’est pas déclaré libéré. Corrigez l’erreur puis relancez.</span></div>
+  {% elif deletion.state == 'running' %}<div class="reference-ready pending"><strong>Suppression en cours</strong><span>Cette page se rafraîchit toutes les cinq secondes.</span></div>
+  {% else %}<h2>Plan avant confirmation</h2><p>Les archives centrales et caches listés seront supprimés. Les historiques et AppBox déjà restaurées sont conservés.</p>{% endif %}
+ {% endif %}
+ {% if deletion.files %}<details class="reference-details" open><summary>Artefacts Control Plane ({{deletion.files|length}})</summary><ul>{% for file in deletion.files %}<li><strong>{{file.path}}</strong><span>{{file.size_bytes or 0}} octets</span></li>{% endfor %}</ul></details>{% endif %}
+ {% if deletion.nodes %}<details class="reference-details" open><summary>Caches nodes</summary><ul>{% for node in deletion.nodes %}<li><strong>{{node.node_id|upper}} · {{node.version_id}}</strong><span>{{node.status}} · {{node.local_path or 'chemin inconnu'}}{% if node.detail %} · {{node.detail}}{% endif %}</span></li>{% endfor %}</ul></details>{% endif %}
+ {% if deletion.preserved %}<details class="reference-details"><summary>Éléments conservés</summary><ul>{% for item in deletion.preserved %}<li>{{item}}</li>{% endfor %}</ul></details>{% endif %}
+ {% if deletion.errors %}<ul role="alert">{% for item in deletion.errors %}<li>{{item}}</li>{% endfor %}</ul>{% endif %}
+ {% if not deletion.blockers and deletion.state in ['available','partial','purge_pending'] %}
+ <form method="post" action="/reference-images/{{deletion.image_id}}{% if deletion.version_id %}/versions/{{deletion.version_id}}{% endif %}/delete">
   <input type="hidden" name="confirmation" value="{{deletion.confirmation}}">
-  <button class="danger" type="submit">{{'Reprendre le nettoyage' if deletion.state == 'cleanup_pending' else 'Supprimer définitivement'}} : {{deletion.name}} ({{deletion.version_count}} version(s))</button>
+  {% if deletion.target_type == 'image' and deletion.state == 'available' %}<label>Pour confirmer, saisissez exactement <strong>{{deletion.name}}</strong><input name="confirmed_name" required autocomplete="off"></label>{% endif %}
+  <button class="danger" type="submit">{{'Reprendre la purge' if deletion.state in ['partial','purge_pending'] else 'Supprimer définitivement'}} · {{deletion.target_label}}</button>
  </form>
  {% endif %}
  <div class="actions"><a class="button secondary" href="/reference-images">Retour aux références</a></div>

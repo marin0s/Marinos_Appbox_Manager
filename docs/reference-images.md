@@ -18,6 +18,14 @@ Une configuration existante non vide n’est jamais écrasée. `recreate` ne ré
 
 `node_reference_cache` suit `transferring → ready/failed`. Le ready exige checksum, version et santé confirmés par l’agent ; ce statut décrit la distribution, pas le claim. Le déploiement reste `awaiting_claim`, et le snapshot `restored_unclaimed`, avant le claim explicite depuis l’interface. L’association est ensuite recontrôlée après retrait du jeton et recréation. Aucun claim automatique sans jeton fourni par l’opérateur. Les anciens agents restent compatibles pour les opérations ordinaires, mais une restauration alpha.5 exige le nouveau package et sa confirmation de santé.
 
+## Suppression du catalogue et des caches
+
+Une ancienne version non utilisée ou une image inactive peut être supprimée depuis le
+catalogue. Le plan, les refus, la machine d’état persistante et la purge des caches nodes
+sont décrits dans [Suppression sûre des Reference Images](reference-image-deletion.md).
+Une AppBox déjà restaurée reste autonome; son `recreate` ne relit pas l’archive. Une
+version courante, une image publiée ou une opération active sont toujours refusées.
+
 Le claim vérifie running, HTTP, identité générée, puis claimed, avec conservation de l’empreinte d’identité pendant les recréations. Les fichiers sont nettoyés sur succès et échec. Si la recréation de nettoyage échoue, le résultat signale une intervention obligatoire : le processus Docker pourrait encore porter le jeton ; ne pas relancer automatiquement. Les résultats entrants sont expurgés avant persistance côté Control Plane.
 
 Les diagnostics conservent les chemins techniques nécessaires au dépannage et ne doivent pas être diffusés publiquement. Les attributs d’identité/claim/token/password/secret sont supprimés des préférences ; cela ne constitue pas un scanner universel de secrets contenus dans les plugins ou les données métier SQLite. Examiner le template choisi avant diffusion hors du périmètre de confiance.
