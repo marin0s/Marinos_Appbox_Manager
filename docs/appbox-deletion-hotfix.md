@@ -49,7 +49,7 @@ son ancien comportement de suppression tant qu'il n'a pas été mis à jour.
   absence explicite des conteneurs (liste vide requise, pas un champ omis). Les étapes cleanup_files, inventory, audit et notification
   terminent normalement ; historiques et intégrité SQLite sont conservés.
 
-Une AppBox encore enregistrée en error / desired_state=deleted / observed_state=missing
+Une AppBox encore enregistrée avec une erreur métier / desired_state=deleted / observed_state=missing
 est donc réparable par Supprimer/Purger, sans nettoyage SQLite manuel. La primitive
 agent et la finalisation DB sont idempotentes. Une seconde requête UI/API renvoie le
 job de suppression déjà réussi grâce à original_client_id conservé dans ses options,
@@ -75,7 +75,7 @@ created_at + timeout configuré s'applique ; une date/payload invalide est refus
 Le waiter et le poll utilisent ce même calcul. Une transition conditionnelle
 `queued → failed` sous verrou empêche l'expiration d'une commande déjà claimée par
 une autre transaction. Les commandes expirées ne sont pas retournées à un agent.
-Le job concerné devient error/100 %, étapes restantes skipped, message explicite :
+Le job concerné devient failed/100 %, étapes restantes skipped, message explicite :
 « Commande distante non prise en charge par le node dans le délai imparti. »
 
 Le délai total existant reste borné : 900 s pour les jobs usuels, 7200 s pour un deploy
@@ -96,7 +96,7 @@ CRONOS reste interdit aux AppBox.
 Aucune migration de schéma SQLite, aucun réenrôlement, aucune modification de agent.json.
 Sauvegarder néanmoins la base avant livraison du CP. Au démarrage :
 
-1. Les anciens jobs running sont finalisés en erreur, comme précédemment.
+1. Les anciens jobs running sont finalisés en `failed`.
 2. Leurs commandes encore queued sont annulées avant distribution. Les anciennes
    commandes sans _job_id sont rattachées par node/client/action aux jobs interrompus.
 3. Les commandes queued expirées ou détachées d'un job actif sont finalisées en échec.
@@ -121,7 +121,7 @@ sauvegarder tout contenu à conserver ou utiliser archive.
    jour les agents ARTEMIS et ORION via le workflow managed. Vérifier build/SHA installé,
    heartbeat, agent.json inchangé et absence d'effet sur une AppBox témoin.
 2. Observer les anciens jobs : IMAGE-JELLY concerne **ORION**. Son job running doit
-   devenir error après restart, sa commande non claimée failed ; les jobs queued
+   devenir failed après restart, sa commande non claimée failed ; les jobs queued
    ARTEMIS doivent avancer. Aucun UPDATE SQLite manuel.
 3. Après vérification que AB40AH et AB37AH sont bien les entrées à retirer sur ARTEMIS,
    relancer Supprimer/Purger (confirmation SUPPRIMER si requise). Vérifier les messages

@@ -49,6 +49,10 @@ JOB_TIMEOUT_SECONDS = max(60, int(os.getenv("APPBOX_JOB_TIMEOUT_SECONDS", "900")
 AGENT_CLAIM_TIMEOUT_SECONDS = max(5, int(os.getenv("APPBOX_AGENT_CLAIM_TIMEOUT_SECONDS", "60")))
 JOB_WATCHDOG_INTERVAL = max(15, int(os.getenv("APPBOX_JOB_WATCHDOG_INTERVAL", "30")))
 REFERENCE_COMMAND_LEASE_SECONDS = max(30, int(os.getenv("APPBOX_REFERENCE_COMMAND_LEASE_SECONDS", "180")))
+APPBOX_COMMAND_LEASE_SECONDS = max(30, int(os.getenv("APPBOX_COMMAND_LEASE_SECONDS", "180")))
+JOB_ACTIVE_STATUSES = frozenset({'queued', 'running'})
+JOB_TERMINAL_STATUSES = frozenset({'success', 'failed', 'cancelled', 'error'})  # error is legacy-only
+COMMAND_TERMINAL_STATUSES = frozenset({'success', 'failed', 'cancelled'})
 REFERENCE_ROOT = Path(os.getenv("APPBOX_REFERENCE_ROOT", "/srv/appbox-manager/reference-images"))
 PLEX_RANGE = range(int(os.getenv("APPBOX_PLEX_PORT_START", "32435")), int(os.getenv("APPBOX_PLEX_PORT_END", "32499")) + 1)
 TAUTULLI_RANGE = range(int(os.getenv("APPBOX_TAUTULLI_PORT_START", "8182")), int(os.getenv("APPBOX_TAUTULLI_PORT_END", "8249")) + 1)
@@ -301,6 +305,13 @@ WORKFLOW_DEFINITIONS = {
         ("validate_node", "Validation du node"),
         ("validate_storage", "Validation RDAD et GPU"),
         ("validate_compose", "Validation du Compose"),
+        ("cache_reference", "Cache de la référence"),
+        ("checksum_reference", "Checksum de la référence"),
+        ("archive_validation", "Validation de l’archive"),
+        ("extraction", "Extraction de la référence"),
+        ("sqlite_validation", "Validation SQLite"),
+        ("runtime_customization", "Personnalisation runtime"),
+        ("write_configuration", "Écriture de la configuration"),
         ("docker_deploy", "Création et démarrage Docker"),
         ("healthcheck", "Vérification des services"),
         ("refresh", "Enregistrement du refresh ciblé"),
@@ -1138,9 +1149,14 @@ def init_database() -> None:
             "lease_expires_at": "TEXT",
             "cancel_requested_at": "TEXT",
             "progress_json": "TEXT NOT NULL DEFAULT '{}'",
+            "worker_activity_at": "TEXT",
         }.items():
             if column not in command_columns:
                 con.execute(f"ALTER TABLE agent_commands ADD COLUMN {column} {definition}")
+
+        agent_columns = {row["name"] for row in con.execute("PRAGMA table_info(node_agents)").fetchall()}
+        if "worker_last_poll_at" not in agent_columns:
+            con.execute("ALTER TABLE node_agents ADD COLUMN worker_last_poll_at TEXT")
 
         build_columns = {row["name"] for row in con.execute("PRAGMA table_info(reference_builds)").fetchall()}
         for column, definition in {
@@ -1149,6 +1165,14 @@ def init_database() -> None:
         }.items():
             if column not in build_columns:
                 con.execute(f"ALTER TABLE reference_builds ADD COLUMN {column} {definition}")
+
+        # Alpha.5 exposes one canonical set of job terminal states. Preserve
+        # the meaning of legacy error rows while removing their active ambiguity.
+        con.execute("UPDATE jobs SET status='failed' WHERE status='error'")
+        con.execute("""UPDATE appboxes SET desired_state='deleted',
+                    observed_state=CASE WHEN observed_state IN ('running','stopped','present') THEN observed_state ELSE 'missing' END,
+                    reconciliation_status=CASE WHEN observed_state IN ('running','stopped','present') THEN 'cleanup_required' ELSE 'in_sync' END
+                    WHERE status='deleted'""")
 
         profile_columns = {
             row["name"] for row in con.execute(
@@ -1453,7 +1477,7 @@ def migrate_json_data() -> None:
 
 
 def row_to_appbox(row: sqlite3.Row) -> dict[str, Any]:
-    return {
+    result = {
         "client_id": row["client_id"],
         "host": row["node_id"],
         "node_id": row["node_id"],
@@ -1489,6 +1513,20 @@ def row_to_appbox(row: sqlite3.Row) -> dict[str, Any]:
         "archived_at": row["archived_at"] if "archived_at" in row.keys() else None,
         "protection_level": row["protection_level"] if "protection_level" in row.keys() else "standard",
     }
+    result['lifecycle_category'] = appbox_lifecycle_category(result['status'], result['observed_state'])
+    result['ux_state'] = 'ready_to_deploy' if result['status'] == 'generated' else result['lifecycle_category']
+    return result
+
+
+def appbox_lifecycle_category(status: str | None, observed_state: str | None = None) -> str:
+    status = str(status or 'unknown').lower()
+    observed = str(observed_state or 'unknown').lower()
+    if status == 'deleted': return 'deleted'
+    if status == 'generated': return 'not_deployed'
+    if status in {'stopped','archived'} or observed == 'stopped': return 'stopped'
+    if status == 'running' or observed == 'running': return 'running'
+    if observed in {'missing','partial'}: return 'missing'
+    return 'active'
 
 
 def get_appbox(client_id: str) -> dict[str, Any] | None:
@@ -1566,6 +1604,8 @@ def execution_block_reason(node: dict[str, Any], action: str) -> str | None:
         return f"Node {node.get('status', 'unknown')} : heartbeat récent requis."
     if node.get('upgrade_in_progress'):
         return 'Mise à jour agent en cours : exécution suspendue.'
+    if node.get('executor_health') == 'stalled' or node.get('worker_lease_status') == 'stalled':
+        return 'Worker de commandes bloqué : bail expiré, réconciliation requise.'
     # Preserve maintenance cleanup: stop/delete remain available to an online agent.
     if (node.get('maintenance') or node.get('status') == 'maintenance') and action not in {'stop', 'delete'}:
         return 'Node en maintenance.'
@@ -1583,6 +1623,36 @@ def provisioning_block_reason(node: dict[str, Any], *, automatic: bool = False) 
             return 'metrics stale : capacité non fiable pour le placement automatique.'
         if not node.get('rdad_ok'):
             return 'RDAD indisponible pour le placement automatique.'
+    return None
+
+
+def automatic_placement_block_reason(node: dict[str, Any], config: dict[str, Any] | None = None) -> str | None:
+    config=config or placement_config()
+    reason=provisioning_block_reason(node,automatic=True)
+    if reason: return reason
+    tags=set(node.get('tag_ids') or [])
+    required=str(config.get('automatic_required_tag') or '').strip()
+    excluded=str(config.get('automatic_excluded_tag') or '').strip()
+    if not required or required not in tags:
+        return f"Tag requis {required or 'non configuré'} absent : rôle automatique ambigu."
+    if excluded and excluded in tags:
+        return f"Tag d’exclusion {excluded} présent."
+    if 'bare-metal' in tags:
+        return 'Node Bare-Metal exclu du placement automatique.'
+    if node.get('maintenance') or 'maintenance' in tags:
+        return 'Node en maintenance.'
+    return None
+
+
+def manual_placement_block_reason(node: dict[str, Any], confirmed: bool, config: dict[str, Any] | None = None) -> str | None:
+    config=config or placement_config()
+    reason=provisioning_block_reason(node)
+    if reason: return reason
+    if 'bare-metal' in set(node.get('tag_ids') or []):
+        if not bool(config.get('allow_manual_bare_metal')):
+            return 'Le placement manuel Bare-Metal est désactivé.'
+        if bool(config.get('require_confirmation_bare_metal')) and not confirmed:
+            return 'Ce node est Bare-Metal : confirmation explicite obligatoire.'
     return None
 
 
@@ -1657,6 +1727,7 @@ def list_control_nodes() -> list[dict[str, Any]]:
         nodes = [dict(row) for row in con.execute("""
             SELECT n.*,a.status AS agent_status,a.agent_version AS registered_agent_version,
                    a.endpoint AS agent_endpoint,a.last_heartbeat,
+                   a.worker_last_poll_at,
                    a.capabilities_json,
                    m.os_name,m.kernel_version,m.compose_version,m.cpu_model,m.cpu_count,
                    m.load_1,m.memory_total_bytes,m.memory_available_bytes,
@@ -1671,20 +1742,32 @@ def list_control_nodes() -> list[dict[str, Any]]:
             LEFT JOIN agent_node_metrics m ON m.node_id=n.node_id
             ORDER BY n.name
         """).fetchall()]
-        appbox_counts = {
-            row["node_id"]: int(row["count"])
-            for row in con.execute("""
-                SELECT node_id,COUNT(*) AS count
-                FROM appboxes
-                WHERE status!='deleted'
-                GROUP BY node_id
-            """).fetchall()
-        }
+        appbox_rows = con.execute("SELECT node_id,status,observed_state FROM appboxes").fetchall()
+        command_rows = con.execute("""SELECT node_id,command_id,command_type,status,claimed_at,
+            lease_expires_at,worker_activity_at FROM agent_commands
+            WHERE status='claimed'""").fetchall()
+        executor_failures = {row['node_id']: row['completed_at'] for row in con.execute("""
+            SELECT node_id,MAX(completed_at) AS completed_at FROM agent_commands
+            WHERE command_type='appbox_action' AND status='failed'
+              AND error_text LIKE 'Lease du worker AppBox expirée%'
+            GROUP BY node_id""").fetchall()}
+    appbox_stats: dict[str, dict[str,int]] = {}
+    for row in appbox_rows:
+        stats=appbox_stats.setdefault(row['node_id'],{'active_appboxes':0,'running_appboxes':0,'stopped_appboxes':0,'not_deployed_appboxes':0,'deleted_appboxes':0,'missing_appboxes':0})
+        category=appbox_lifecycle_category(row['status'],row['observed_state'])
+        key={'running':'running_appboxes','stopped':'stopped_appboxes','not_deployed':'not_deployed_appboxes','deleted':'deleted_appboxes','missing':'missing_appboxes'}.get(category)
+        if key: stats[key]+=1
+        if category not in {'deleted','not_deployed'}: stats['active_appboxes']+=1
+    commands_by_node: dict[str,list[sqlite3.Row]]={}
+    for row in command_rows: commands_by_node.setdefault(row['node_id'],[]).append(row)
+    config=placement_config()
     current = datetime.now(timezone.utc)
     for node in nodes:
         node["tags"] = tags.get(node["node_id"], [])
         node["tag_ids"] = [tag["tag_id"] for tag in node["tags"]]
-        node["appbox_count"] = appbox_counts.get(node["node_id"], 0)
+        stats=appbox_stats.get(node['node_id'],{'active_appboxes':0,'running_appboxes':0,'stopped_appboxes':0,'not_deployed_appboxes':0,'deleted_appboxes':0,'missing_appboxes':0})
+        node.update(stats)
+        node["appbox_count"] = stats['active_appboxes']
         node["capabilities"] = json.loads(node.pop("capabilities_json") or "{}")
         node["is_local"] = node["node_id"] == HOSTNAME
         node['persisted_status'] = node['status']
@@ -1703,22 +1786,49 @@ def list_control_nodes() -> list[dict[str, Any]]:
         node['metrics_age_seconds'] = metric_liveness['heartbeat_age_seconds']
         node['metrics_stale'] = not metric_liveness['agent_online']
         node['metrics_fresh'] = not node['metrics_stale']
-        node['execution_capable'] = bool(node['capabilities'].get('deployment_executor'))
-        node['actionable'] = bool(node['status'] == 'online' and node['agent_online']
+        active_commands=commands_by_node.get(node['node_id'],[])
+        ages=[]
+        stalled=False
+        for command in active_commands:
+            try:
+                claimed=datetime.fromisoformat(command['claimed_at'])
+                if claimed.tzinfo: ages.append(max(0,(current-claimed).total_seconds()))
+            except (ValueError,TypeError): pass
+            if command['lease_expires_at']:
+                try: stalled=stalled or datetime.fromisoformat(command['lease_expires_at']) <= current
+                except (ValueError,TypeError): stalled=True
+        failure_at=executor_failures.get(node['node_id'])
+        if failure_at:
+            try:
+                failed=datetime.fromisoformat(failure_at)
+                polled=datetime.fromisoformat(node['worker_last_poll_at']) if node.get('worker_last_poll_at') else None
+                stalled=stalled or polled is None or polled <= failed
+            except (ValueError,TypeError):
+                stalled=True
+        node['active_commands']=len(active_commands)
+        node['oldest_claim_age_seconds']=max(ages) if ages else None
+        node['worker_lease_status']='stalled' if stalled else ('active' if active_commands else 'idle')
+        node['executor_health']='stalled' if stalled else ('busy' if active_commands else 'healthy')
+        node['execution_capable'] = bool(node['capabilities'].get('deployment_executor')) and not stalled
+        node['actionable'] = bool(node['status'] == 'online' and node['agent_online'] and not stalled
                                   and not node['is_local'] and node['node_id'].lower() != 'cronos'
                                   and node['capabilities'].get('deployment_executor', False))
-        node['provisioning_block_reason'] = provisioning_block_reason(node)
+        manual_policy_reason=manual_placement_block_reason(node,confirmed=True,config=config)
+        node['provisioning_block_reason'] = manual_policy_reason
         node['provisioning_allowed'] = node['provisioning_block_reason'] is None
-        node['provisioning_warning'] = ('metrics stale : capacité non fiable ; validation technique sur le nœud cible.'
-                                        if node['metrics_stale'] else None)
-        node['automatic_placement_block_reason'] = provisioning_block_reason(node, automatic=True)
+        warnings=[]
+        if node['metrics_stale']: warnings.append('metrics stale : capacité non fiable ; validation technique sur le nœud cible.')
+        if ('bare-metal' in node['tag_ids'] and bool(config.get('require_confirmation_bare_metal'))
+                and bool(config.get('allow_manual_bare_metal'))): warnings.append('Bare-Metal : confirmation manuelle obligatoire.')
+        node['provisioning_warning']=' '.join(warnings) or None
+        node['automatic_placement_block_reason'] = automatic_placement_block_reason(node,config)
         node['automatic_placement_allowed'] = node['automatic_placement_block_reason'] is None
     agent_upgrades.decorate_nodes(nodes)
     for node in nodes:
         if node['upgrade_in_progress']:
             node['actionable'] = False
             node['provisioning_block_reason'] = provisioning_block_reason(node)
-            node['automatic_placement_block_reason'] = provisioning_block_reason(node, automatic=True)
+            node['automatic_placement_block_reason'] = automatic_placement_block_reason(node,config)
             node['provisioning_allowed'] = False
             node['automatic_placement_allowed'] = False
     return nodes
@@ -1757,14 +1867,9 @@ def evaluate_placement(
         node = by_id.get(requested_node_id or "")
         if not node:
             raise HTTPException(400, "Node cible introuvable.")
-        reason = provisioning_block_reason(node)
+        reason = manual_placement_block_reason(node,allow_bare_metal_override,config)
         if reason:
             raise HTTPException(409, reason)
-        if "bare-metal" in node["tag_ids"] and not allow_bare_metal_override:
-            raise HTTPException(
-                409,
-                "Ce node est tagué Bare-Metal. Confirme explicitement le déploiement manuel.",
-            )
         if not node["actionable"]:
             raise HTTPException(
                 409,
@@ -1781,18 +1886,9 @@ def evaluate_placement(
     required_tag = config["automatic_required_tag"]
     excluded_tag = config["automatic_excluded_tag"]
     for node in nodes:
-        reason = provisioning_block_reason(node, automatic=True)
+        reason = automatic_placement_block_reason(node,config)
         if reason:
             reject(node, reason)
-            continue
-        if required_tag not in node["tag_ids"]:
-            reject(node, f"Tag requis {required_tag} absent")
-            continue
-        if excluded_tag in node["tag_ids"]:
-            reject(node, f"Tag d’exclusion {excluded_tag} présent")
-            continue
-        if node["maintenance"] or "maintenance" in node["tag_ids"]:
-            reject(node, "Node en maintenance")
             continue
         if node["status"] != "online":
             reject(node, f"Node {node['status']}")
@@ -1904,9 +2000,11 @@ def list_appboxes() -> list[dict[str, Any]]:
 def save_appbox_status(client_id: str, status: str, message: str) -> None:
     with db_lock, db() as con:
         con.execute("""
-            UPDATE appboxes SET status=?, last_message=?, updated_at=?
+            UPDATE appboxes SET status=?,
+                desired_state=CASE WHEN ?='running' THEN 'running' WHEN ?='stopped' THEN 'stopped' ELSE desired_state END,
+                last_message=?, updated_at=?
             WHERE client_id=?
-        """, (status, message[-3000:], now_iso(), client_id))
+        """, (status,status,status,message[-3000:], now_iso(), client_id))
 
 
 def record_event(client_id: str | None, event_type: str, message: str, level: str = "info") -> None:
@@ -2231,42 +2329,52 @@ def sync_volume_inventory() -> tuple[int, list[str]]:
 
 def sync_port_reservations() -> int:
     stamp = now_iso()
-    appboxes = list_appboxes()
-    expected: set[tuple[str, int, str]] = set()
+    with db() as con:
+        appboxes=[row_to_appbox(row) for row in con.execute("SELECT * FROM appboxes WHERE status!='deleted'").fetchall()]
+    expected: set[tuple[str, str, int, str]] = set()
+    conflicted_clients: set[str] = set()
     with db_lock, db() as con:
         for item in appboxes:
             mappings = [
-                ("plex", item.get("plex_port")),
+                ("jellyfin" if item.get("type") == "jellyfin" else "plex", item.get("plex_port")),
                 ("tautulli", item.get("tautulli_port")),
             ]
             for service, port in mappings:
                 if not port:
                     continue
-                expected.add((item["client_id"], int(port), service))
+                node_id=str(item.get('selected_node_id') or item.get('node_id') or '')
+                expected.add((node_id,item["client_id"], int(port), service))
                 con.execute("""
                     INSERT INTO port_reservations(
                         node_id,client_id,service,port,protocol,status,reserved_at
                     ) VALUES(?,?,?,?,?,'reserved',?)
-                    ON CONFLICT(node_id,port,protocol) WHERE status='reserved'
-                    DO UPDATE SET
-                        client_id=excluded.client_id,
-                        service=excluded.service
-                """, (HOSTNAME, item["client_id"], service, int(port), "tcp", stamp))
+                    ON CONFLICT(node_id,port,protocol) WHERE status='reserved' DO NOTHING
+                """, (node_id, item["client_id"], service, int(port), "tcp", stamp))
+                owner = con.execute("""SELECT client_id,service FROM port_reservations
+                    WHERE node_id=? AND port=? AND protocol='tcp' AND status='reserved'""",
+                    (node_id,int(port))).fetchone()
+                if owner and (owner['client_id'] != item['client_id'] or owner['service'] != service):
+                    conflicted_clients.add(item['client_id'])
+                    con.execute("""UPDATE appboxes SET reconciliation_status='drift',drift_json=?,reconciled_at=?,updated_at=?
+                        WHERE client_id=?""",
+                        (json.dumps([{'type':'port_reservation_conflict','node_id':node_id,
+                                      'port':int(port),'protocol':'tcp','owner':owner['client_id']}],ensure_ascii=False),
+                         stamp,stamp,item['client_id']))
 
         active = con.execute("""
-            SELECT reservation_id,client_id,service,port
+            SELECT reservation_id,node_id,client_id,service,port
             FROM port_reservations
-            WHERE node_id=? AND status='reserved'
-        """, (HOSTNAME,)).fetchall()
+            WHERE status='reserved'
+        """).fetchall()
         for row in active:
-            key = (row["client_id"], int(row["port"]), row["service"])
-            if key not in expected:
+            key = (row['node_id'],row["client_id"], int(row["port"]), row["service"])
+            if key not in expected and row['client_id'] not in conflicted_clients:
                 con.execute("""
                     UPDATE port_reservations
                     SET status='released',released_at=?
                     WHERE reservation_id=?
                 """, (stamp, row["reservation_id"]))
-    return len(expected)
+        return con.execute("SELECT COUNT(*) FROM port_reservations WHERE status='reserved'").fetchone()[0]
 
 
 def sync_business_inventory() -> dict[str, Any]:
@@ -2780,7 +2888,7 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
             if build and build['job_id']:
                 con.execute("UPDATE job_steps SET status='failed',progress=100,detail=?,finished_at=? WHERE job_id=? AND step_key='capture'",(detail,stamp,build['job_id']))
                 con.execute("UPDATE job_steps SET status='skipped',progress=100,detail='Étape non exécutée.' WHERE job_id=? AND status='pending'",(build['job_id'],))
-                con.execute("UPDATE jobs SET status='error',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?",(detail,stamp,stamp,build['job_id']))
+                con.execute("UPDATE jobs SET status='failed',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?",(detail,stamp,stamp,build['job_id']))
             con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'capture','error',?,'{}',?)", (build_id, detail, stamp))
         return
     with db() as con:
@@ -2978,7 +3086,7 @@ def sanitize_plex_clone(config_dir: Path) -> None:
         pid.unlink(missing_ok=True)
 
 
-def choose_media_port(media_type: str, requested: str, port_mode: str, reserved: set[int]) -> int:
+def choose_media_port(media_type: str, requested: str, port_mode: str, reserved: set[int], *, check_local: bool = True) -> int:
     candidates = PLEX_RANGE if media_type == "plex" else JELLYFIN_RANGE
     if port_mode == "manual":
         try:
@@ -2987,10 +3095,10 @@ def choose_media_port(media_type: str, requested: str, port_mode: str, reserved:
             raise HTTPException(400, "Le port média manuel est invalide.")
         if port < 1024 or port > 65535:
             raise HTTPException(400, "Le port doit être compris entre 1024 et 65535.")
-        if port in reserved or port_in_use(port):
+        if port in reserved or (check_local and port_in_use(port)):
             raise HTTPException(409, f"Le port {port} est déjà utilisé ou réservé.")
         return port
-    return reserve_port(candidates, reserved)
+    return reserve_port(candidates, reserved, check_local=check_local)
 
 
 def provision_snapshot(snapshot_id: str | None, media_type: str, appbox_dir: Path) -> None:
@@ -3014,9 +3122,9 @@ def port_in_use(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
-def reserve_port(candidates: range, reserved: set[int]) -> int:
+def reserve_port(candidates: range, reserved: set[int], *, check_local: bool = True) -> int:
     for port in candidates:
-        if port not in reserved and not port_in_use(port):
+        if port not in reserved and (not check_local or not port_in_use(port)):
             return port
     raise RuntimeError("Aucun port libre dans la plage configurée.")
 
@@ -3243,7 +3351,7 @@ def reconcile_node(node_id: str) -> dict[str, Any]:
     changed = 0
     counts: dict[str, int] = {}
     with db_lock, db() as con:
-        rows = con.execute("SELECT * FROM appboxes WHERE node_id=? AND status!='deleted' ORDER BY client_id", (node_id,)).fetchall()
+        rows = con.execute("SELECT * FROM appboxes WHERE node_id=? ORDER BY client_id", (node_id,)).fetchall()
         for row in rows:
             item = row_to_appbox(row)
             names = item.get("containers") or []
@@ -3253,6 +3361,24 @@ def reconcile_node(node_id: str) -> dict[str, Any]:
             ).fetchall()} if names else {}
             drift: list[dict[str, Any]] = []
             states = []
+
+            if row['status']=='deleted':
+                if records: drift.append({'type':'deleted_container_present','containers':sorted(records)})
+                if Path(row['path']).exists(): drift.append({'type':'deleted_path_present','path':row['path']})
+                observed='present' if drift else 'missing'
+                result='cleanup_required' if drift else 'in_sync'
+                drift_json=json.dumps(drift,ensure_ascii=False)
+                con.execute("UPDATE appboxes SET desired_state='deleted',observed_state=?,reconciliation_status=?,drift_json=?,reconciled_at=?,updated_at=? WHERE client_id=?",
+                            (observed,result,drift_json,stamp,stamp,item['client_id']))
+                con.execute("UPDATE port_reservations SET status='released',released_at=COALESCE(released_at,?) WHERE client_id=? AND status='reserved'",(stamp,item['client_id']))
+                counts[result]=counts.get(result,0)+1
+                continue
+
+            if row['status']=='generated' and not records:
+                con.execute("UPDATE appboxes SET desired_state='not_deployed',observed_state='not_deployed',reconciliation_status='in_sync',drift_json='[]',reconciled_at=?,updated_at=? WHERE client_id=?",
+                            (stamp,stamp,item['client_id']))
+                counts['not_deployed']=counts.get('not_deployed',0)+1
+                continue
 
             archived_at = row["archived_at"] if "archived_at" in row.keys() else None
             if archived_at:
@@ -3287,10 +3413,11 @@ def reconcile_node(node_id: str) -> dict[str, Any]:
                 if not rec:
                     drift.append({"type": "missing_container", "container": name})
                     continue
-                states.append(str(rec.get("state") or "unknown"))
+                state=str(rec.get("state") or "unknown")
+                states.append(state)
                 expected_ports = _expected_host_ports(item, name)
                 actual_ports = {str(p.get("host_port")) for p in json.loads(rec.get("ports_json") or "[]") if p.get("host_port")}
-                if expected_ports and not expected_ports.issubset(actual_ports):
+                if state == 'running' and expected_ports and not expected_ports.issubset(actual_ports):
                     drift.append({"type": "port_drift", "container": name, "expected": sorted(expected_ports), "observed": sorted(actual_ports)})
             if not names or not records:
                 observed = "missing"
@@ -3331,7 +3458,7 @@ def reconcile_node(node_id: str) -> dict[str, Any]:
 
 def reconciliation_snapshot() -> dict[str, Any]:
     with db_lock, db() as con:
-        appboxes = [dict(r) for r in con.execute("""SELECT client_id,node_id,desired_state,observed_state,reconciliation_status,drift_json,reconciled_at FROM appboxes WHERE status!='deleted' ORDER BY node_id,client_id""").fetchall()]
+        appboxes = [dict(r) for r in con.execute("""SELECT client_id,node_id,status,desired_state,observed_state,reconciliation_status,drift_json,reconciled_at FROM appboxes ORDER BY node_id,client_id""").fetchall()]
         orphans = [dict(r) for r in con.execute("""SELECT c.node_id,c.name,c.image,c.state,c.health,c.last_seen FROM containers c LEFT JOIN appboxes a ON a.client_id=c.appbox_id WHERE c.appbox_id IS NULL OR a.client_id IS NULL ORDER BY c.node_id,c.name""").fetchall()]
     for item in appboxes:
         item["drift"] = json.loads(item.pop("drift_json") or "[]")
@@ -3491,17 +3618,18 @@ def update_job(job_id: str, status: str | None = None, progress: int | None = No
         if not row:
             return
         stamp = now_iso()
+        normalized_status = 'failed' if status == 'error' else status
         values = {
-            "status": status if status is not None else row["status"],
+            "status": normalized_status if normalized_status is not None else row["status"],
             "progress": max(0, min(100, int(progress))) if progress is not None else row["progress"],
             "detail": detail[-12000:] if detail is not None else row["detail"],
             "updated_at": stamp,
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
         }
-        if status == "running" and not values["started_at"]:
+        if normalized_status == "running" and not values["started_at"]:
             values["started_at"] = stamp
-        if status in {"success", "error", "cancelled"}:
+        if normalized_status in JOB_TERMINAL_STATUSES:
             values["finished_at"] = stamp
         con.execute("""
             UPDATE jobs SET status=:status,progress=:progress,detail=:detail,
@@ -3651,7 +3779,7 @@ def finish_remaining_steps(job_id: str, status: str = "skipped", detail: str = "
 def fail_workflow(job_id: str, step_key: str, message: str) -> None:
     update_step(job_id, step_key, "failed", message, 100)
     finish_remaining_steps(job_id, "skipped", "Étape non exécutée après l’échec du workflow.")
-    update_job(job_id, "error", 100, message)
+    update_job(job_id, "failed", 100, message)
 
 
 def run_workflow_step(
@@ -3671,6 +3799,8 @@ def run_workflow_step(
 
 def job_dict(row: sqlite3.Row, include_steps: bool = False) -> dict[str, Any]:
     result = dict(row)
+    result['is_active'] = result.get('status') in JOB_ACTIVE_STATUSES
+    result['is_terminal'] = result.get('status') in JOB_TERMINAL_STATUSES
     if result.get("started_at") and result.get("finished_at"):
         try:
             start = datetime.fromisoformat(result["started_at"])
@@ -3861,6 +3991,46 @@ def set_reference_distribution(node_id, version_id, status, cache=None):
             (node_id, version_id, cache.get("local_path"), cache.get("checksum"), status, cache.get("size_bytes", 0), now_iso(), now_iso()))
 
 
+def update_control_plane_deployment(client_id: str, status: str, current_step: str,
+                                    progress: int, detail: str, *, terminal: bool = False) -> None:
+    stamp = now_iso()
+    with db_lock, db() as con:
+        con.execute("""UPDATE control_plane_deployments SET status=?,current_step=?,progress=?,detail=?,
+            started_at=COALESCE(started_at,?),completed_at=CASE WHEN ? THEN ? ELSE completed_at END,updated_at=?
+            WHERE client_id=?""",
+            (status,current_step,max(0,min(100,int(progress))),detail[-12000:],stamp,int(terminal),stamp,stamp,client_id))
+
+
+DEPLOY_AGENT_PHASES = (
+    'cache_reference', 'checksum_reference', 'archive_validation', 'extraction',
+    'sqlite_validation', 'runtime_customization', 'write_configuration',
+)
+
+
+def finish_remote_deploy_phases(job_id: str, *, has_reference: bool,
+                                detailed_progress: bool) -> None:
+    """Close every deploy subphase without inventing execution telemetry."""
+    states = {step['step_key']: step['status'] for step in step_rows(job_id)}
+    reference_only = {
+        'cache_reference', 'checksum_reference', 'archive_validation',
+        'extraction', 'sqlite_validation',
+    }
+    for key in DEPLOY_AGENT_PHASES:
+        status = states.get(key)
+        if status not in {'pending', 'running'}:
+            continue
+        if key in reference_only and not has_reference:
+            detail = 'Phase non applicable : aucune Reference Image sélectionnée.'
+            update_step(job_id, key, 'skipped', detail, 100)
+        elif status == 'running':
+            detail = 'Phase terminée, confirmée par le résultat final de l’agent.'
+            update_step(job_id, key, 'success', detail, 100)
+        else:
+            detail = ('Phase non applicable à ce déploiement.' if detailed_progress else
+                      'Télémétrie détaillée indisponible avec cet agent compatible ; résultat final confirmé.')
+            update_step(job_id, key, 'skipped', detail, 100)
+
+
 def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
     job_id, client_id, action = job["job_id"], job["client_id"], job["action"]
     job_options = json.loads(job.get("options_json") or "{}")
@@ -3926,6 +4096,9 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
         "deploy": "docker_deploy", "start": "docker_start", "restart": "docker_restart", "recreate": "docker_recreate",
         "stop": "docker_stop", "delete": "docker_remove",
     }.get(action, "docker_deploy")
+    if action == 'deploy':
+        update_control_plane_deployment(client_id,'deploying','command_queued',35,
+                                        f'Commande {command_id[:8]} envoyée à {node_id}.')
     if action in {"deploy", "recreate"}:
         update_step(job_id, "validate_storage", "success", "Validation déléguée à l’agent distant.", 100, executor=f"agent-{node_id}")
         compose_detail = (
@@ -3953,13 +4126,23 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
         update_step(job_id, docker_step, "failed", detail, 100, executor=f"agent-{node_id}", resources=result)
         fail_workflow(job_id, docker_step, detail)
         save_appbox_status(client_id, "error", detail)
+        if action == 'deploy':
+            update_control_plane_deployment(client_id,'failed',docker_step,100,detail,terminal=True)
         return
     update_step(job_id, docker_step, "success", detail, 100, executor=f"agent-{node_id}", resources=result)
     if action in {"deploy", "start", "restart", "recreate"}:
+        if action == 'deploy':
+            finish_remote_deploy_phases(
+                job_id,
+                has_reference=bool(reference_archive),
+                detailed_progress=bool(node.get('capabilities', {}).get('appbox_progress')),
+            )
         update_step(job_id, "healthcheck", "success", result.get("state", "Services vérifiés par l’agent."), 100, executor=f"agent-{node_id}")
         if action == "deploy":
             update_step(job_id, "refresh", "skipped", "Intégration refresh ciblé prévue.", 100)
             update_step(job_id, "watchdog", "skipped", "Intégration watchdog prévue.", 100)
+            if not reference_archive:
+                update_control_plane_deployment(client_id,'success','health',100,detail,terminal=True)
         save_appbox_status(client_id, "running", detail)
     elif action == "stop":
         update_step(job_id, "verify_stopped", "success", result.get("state", "Services arrêtés."), 100, executor=f"agent-{node_id}")
@@ -4265,7 +4448,7 @@ def _force_fail_job(job_id: str, message: str, client_id: str | None = None, act
         if key != "workflow":
             update_step(job_id, key, "failed", message, 100)
         finish_remaining_steps(job_id, "skipped", "Étape non exécutée après l’échec du workflow.")
-        update_job(job_id, "error", 100, message)
+        update_job(job_id, "failed", 100, message)
         record_event(client_id, f"{action or 'workflow'}_error", message, "error")
         if action == "delete":
             record_audit("DELETE_APPBOX", client_id, None, None, "FAILED", message)
@@ -4343,6 +4526,7 @@ def job_watchdog_loop() -> None:
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=JOB_TIMEOUT_SECONDS)).isoformat()
         try:
             expire_reference_command_leases()
+            expire_appbox_command_leases()
             with db_lock, db() as con:
                 rows = con.execute("""
                     SELECT job_id,client_id,action,updated_at FROM jobs
@@ -4373,6 +4557,31 @@ def expire_reference_command_leases(now: datetime | None = None) -> int:
             if changed: expired.append(row)
     for row in expired:
         finalize_reference_build_command(row,'failed',{},'Lease de capture expirée : worker ou agent indisponible.')
+    return len(expired)
+
+
+def expire_appbox_command_leases(now: datetime | None = None) -> int:
+    """Terminalize only capability-negotiated AppBox commands whose worker went silent."""
+    cutoff=(now or datetime.now(timezone.utc)).isoformat()
+    expired=[]
+    message='Lease du worker AppBox expirée : exécuteur figé, arrêté ou réseau indisponible. Résultat tardif interdit.'
+    with db_lock, db() as con:
+        rows=con.execute("""SELECT * FROM agent_commands WHERE command_type='appbox_action'
+            AND status='claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?""",(cutoff,)).fetchall()
+        for row in rows:
+            if con.execute("UPDATE agent_commands SET status='failed',completed_at=?,error_text=? WHERE command_id=? AND status='claimed'",
+                           (cutoff,message,row['command_id'])).rowcount: expired.append(row)
+    for row in expired:
+        try: payload=json.loads(row['payload_json'] or '{}')
+        except Exception: payload={}
+        job_id=str(payload.get('_job_id') or '')
+        client_id=str(payload.get('client_id') or '') or None
+        action=str(payload.get('action') or '') or None
+        if job_id: _force_fail_job(job_id,message,client_id,action)
+        if client_id: save_appbox_status(client_id,'error',message)
+        if client_id and action == 'deploy':
+            update_control_plane_deployment(client_id,'failed','worker_lease_expired',100,message,terminal=True)
+        record_event(client_id,'appbox_command_lease_expired',f"Commande {row['command_id'][:8]} : {message}",'error')
     return len(expired)
 
 
@@ -4462,7 +4671,7 @@ def node_payload() -> dict[str, Any]:
     with db() as con:
         node = con.execute("SELECT * FROM nodes WHERE node_id=?", (HOSTNAME,)).fetchone()
         appbox_count = con.execute(
-            "SELECT COUNT(*) FROM appboxes WHERE node_id=? AND status!='deleted'",
+            "SELECT COUNT(*) FROM appboxes WHERE node_id=? AND status NOT IN ('deleted','generated')",
             (HOSTNAME,),
         ).fetchone()[0]
         queued = con.execute("SELECT COUNT(*) FROM jobs WHERE node_id=? AND status='queued'", (HOSTNAME,)).fetchone()[0]
@@ -5052,6 +5261,12 @@ def api_reconciliation_run(node_id: str):
 @app.get("/api/agent/v1/{node_id}/commands")
 def agent_poll_commands(node_id: str, request: Request):
     authenticate_agent(request, node_id)
+    # This endpoint is called by the serial business worker, not the heartbeat
+    # thread. A poll after an expired lease is explicit proof that the worker
+    # has resumed and may clear executor_stalled without changing agent liveness.
+    with db_lock, db() as con:
+        con.execute("UPDATE node_agents SET worker_last_poll_at=?,updated_at=? WHERE node_id=?",
+                    (now_iso(),now_iso(),node_id))
     # A polling agent is available to resume offline Reference Image purges.
     # Reconciliation is per node and idempotent; it never blocks other nodes.
     reference_deletion.reconcile_node(node_id)
@@ -5079,15 +5294,17 @@ def agent_poll_commands(node_id: str, request: Request):
             if not node or node['status'] != 'online' or not node['agent_online']:
                 return JSONResponse({'command': None, 'reason': 'node_unavailable'})
         claimed_at = now_iso()
-        lease = ((datetime.now(timezone.utc) + timedelta(seconds=REFERENCE_COMMAND_LEASE_SECONDS)).isoformat()
-                 if row['command_type'] == 'reference_build' else None)
+        lease_seconds = (REFERENCE_COMMAND_LEASE_SECONDS if row['command_type']=='reference_build' else
+                         APPBOX_COMMAND_LEASE_SECONDS if row['command_type']=='appbox_action' and node and node.get('capabilities',{}).get('appbox_command_lease') else None)
+        lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat() if lease_seconds else None
         con.execute("""
             UPDATE agent_commands
-            SET status='claimed',claimed_at=?,lease_expires_at=?
+            SET status='claimed',claimed_at=?,lease_expires_at=?,worker_activity_at=?
             WHERE command_id=? AND status='queued'
-        """, (claimed_at, lease, row["command_id"]))
+        """, (claimed_at, lease, claimed_at if lease else None, row["command_id"]))
     command = dict(row)
     command["payload"] = json.loads(command.pop("payload_json") or "{}")
+    command['lease_timeout_seconds'] = lease_seconds
     return JSONResponse({"command": command})
 
 
@@ -5100,15 +5317,41 @@ async def agent_command_progress(node_id: str, command_id: str, request: Request
     stage = str(payload.get('stage') or 'capture')[:64]
     stamp = now_iso()
     with db_lock, db() as con:
-        command = con.execute("SELECT * FROM agent_commands WHERE command_id=? AND node_id=? AND command_type='reference_build'",
+        command = con.execute("SELECT * FROM agent_commands WHERE command_id=? AND node_id=? AND command_type IN ('reference_build','appbox_action')",
                               (command_id, node_id)).fetchone()
         if not command or command['status'] != 'claimed':
-            raise HTTPException(409, 'Commande de capture inactive.')
+            raise HTTPException(409, 'Commande longue inactive.')
         if command['cancel_requested_at']:
             return JSONResponse({'status':'cancelling','cancel_requested':True})
-        data = {'stage':stage,'bytes_written':bytes_written,'estimated_payload_bytes':estimated,'reported_at':stamp}
-        con.execute("UPDATE agent_commands SET progress_json=?,lease_expires_at=? WHERE command_id=?",
-                    (json.dumps(data,ensure_ascii=False),(datetime.now(timezone.utc)+timedelta(seconds=REFERENCE_COMMAND_LEASE_SECONDS)).isoformat(),command_id))
+        percent=max(0,min(100,int(payload.get('percent') or 0)))
+        detail=str(payload.get('detail') or '')[:12000]
+        data = {'stage':stage,'percent':percent,'detail':detail,'bytes_written':bytes_written,'estimated_payload_bytes':estimated,'reported_at':stamp}
+        lease_seconds=REFERENCE_COMMAND_LEASE_SECONDS if command['command_type']=='reference_build' else APPBOX_COMMAND_LEASE_SECONDS
+        con.execute("UPDATE agent_commands SET progress_json=?,lease_expires_at=?,worker_activity_at=? WHERE command_id=?",
+                    (json.dumps(data,ensure_ascii=False),(datetime.now(timezone.utc)+timedelta(seconds=lease_seconds)).isoformat(),stamp,command_id))
+        if command['command_type']=='appbox_action':
+            try: command_payload=json.loads(command['payload_json'] or '{}')
+            except Exception: command_payload={}
+            job_id=str(command_payload.get('_job_id') or '')
+            action=str(command_payload.get('action') or 'deploy')
+            docker_step={'deploy':'docker_deploy','start':'docker_start','restart':'docker_restart',
+                         'recreate':'docker_recreate','stop':'docker_stop','delete':'docker_remove'}.get(action,'docker_deploy')
+            stage_map={'preparing':(docker_step,40),'cache_reference':('cache_reference',43),
+                'checksum_reference':('checksum_reference',48),'archive_validation':('archive_validation',55),
+                'extraction':('extraction',65),'sqlite_validation':('sqlite_validation',72),
+                'runtime_customization':('runtime_customization',78),'write_configuration':('write_configuration',82),
+                'compose_deployment':(docker_step,88),'runtime_wait':(docker_step,92)}
+            step_key,base_progress=stage_map.get(stage,(docker_step,40))
+            job=con.execute("SELECT progress,status FROM jobs WHERE job_id=?",(job_id,)).fetchone() if job_id else None
+            if job and job['status']=='running':
+                global_progress=min(95,max(int(job['progress'] or 0),base_progress+round(percent*4/100)))
+                step_status='success' if percent>=100 else 'running'
+                con.execute("UPDATE job_steps SET status=?,progress=MAX(progress,?),detail=?,started_at=COALESCE(started_at,?),finished_at=CASE WHEN ?='success' THEN ? ELSE finished_at END WHERE job_id=? AND step_key=?",
+                            (step_status,percent,detail or stage,stamp,step_status,stamp,job_id,step_key))
+                con.execute("UPDATE jobs SET progress=?,detail=?,updated_at=? WHERE job_id=? AND status='running'",(global_progress,detail or stage,stamp,job_id))
+                con.execute("UPDATE control_plane_deployments SET status='deploying',current_step=?,progress=?,detail=?,updated_at=? WHERE client_id=?",
+                            (stage,global_progress,detail or stage,stamp,command_payload.get('client_id')))
+            return JSONResponse({'status':'ok','cancel_requested':False})
         try: build_id = str(json.loads(command['payload_json'] or '{}').get('build_id') or '')
         except Exception: build_id = ''
         build = con.execute("SELECT job_id,progress FROM reference_builds WHERE build_id=?",(build_id,)).fetchone() if build_id else None
@@ -5144,7 +5387,12 @@ async def agent_command_result(node_id: str, command_id: str, request: Request):
             # The serial worker only acknowledges preparation. Only helper events
             # can confirm activation/rollback; a late result must not override it.
             return JSONResponse({'status': 'ok', 'confirmation': 'helper_required'})
-        if command['command_type'] == 'appbox_action' and command['status'] in {'success', 'failed'}:
+        if command['command_type'] == 'appbox_action' and command['status'] in COMMAND_TERMINAL_STATUSES:
+            try: late_payload=json.loads(command['payload_json'] or '{}')
+            except Exception: late_payload={}
+            con.execute("INSERT INTO events(client_id,node_id,event_type,level,message,created_at) VALUES(?,?,?,?,?,?)",
+                        (late_payload.get('client_id'),node_id,'late_agent_result_ignored','warning',
+                         f"Résultat tardif ignoré pour la commande terminale {command_id[:8]} ({command['status']}).",now_iso()))
             return JSONResponse({'status':'ok', 'ignored':'terminal_command'})
         if command['command_type'] == 'reference_build' and command['status'] in {'success','failed','cancelled'}:
             return JSONResponse({'status':'ok', 'ignored':'terminal_command'})
@@ -5475,7 +5723,7 @@ def finalize_reference_discovery_command(command: sqlite3.Row, status: str, resu
             with db_lock, db() as con:
                 con.execute("UPDATE reference_builds SET status='build_failed',current_stage='preflight',error_text=?,completed_at=?,updated_at=? WHERE build_id=?",(blocker,stamp,stamp,build_id))
                 con.execute("UPDATE job_steps SET status='skipped',progress=100,detail='Étape non exécutée après le preflight.' WHERE job_id=? AND status='pending'",(job_id,))
-                con.execute("UPDATE jobs SET status='error',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?",(blocker,stamp,stamp,job_id))
+                con.execute("UPDATE jobs SET status='failed',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?",(blocker,stamp,stamp,job_id))
             return
         try:
             queue_reference_capture(build_id, result)
@@ -5484,7 +5732,7 @@ def finalize_reference_discovery_command(command: sqlite3.Row, status: str, resu
             with db_lock, db() as con:
                 con.execute("UPDATE reference_builds SET status='build_failed',current_stage='capture',error_text=?,completed_at=?,updated_at=? WHERE build_id=?", (str(exc), failed_at, failed_at, build_id))
                 con.execute("UPDATE job_steps SET status='failed',progress=100,detail=?,started_at=COALESCE(started_at,?),finished_at=? WHERE job_id=? AND step_key='capture'", (str(exc), failed_at, failed_at, job_id))
-                con.execute("UPDATE jobs SET status='error',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?", (str(exc), failed_at, failed_at, job_id))
+                con.execute("UPDATE jobs SET status='failed',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?", (str(exc), failed_at, failed_at, job_id))
                 con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'capture','error',?,'{}',?)", (build_id, str(exc), failed_at))
     else:
         detail = error or "Échec de la découverte Plex."
@@ -5492,7 +5740,7 @@ def finalize_reference_discovery_command(command: sqlite3.Row, status: str, resu
             con.execute("UPDATE reference_builds SET status='discovery_failed',current_stage='discovering',progress=100,error_text=?,completed_at=?,updated_at=? WHERE build_id=?", (detail, stamp, stamp, build_id))
             con.execute("UPDATE job_steps SET status='failed',progress=100,detail=?,executor=?,started_at=COALESCE(started_at,?),finished_at=? WHERE job_id=? AND step_key='discover'", (detail, f"agent-{command['node_id']}", stamp, stamp, job_id))
             con.execute("UPDATE job_steps SET status='skipped',progress=100,detail='Étape non exécutée.' WHERE job_id=? AND status='pending'", (job_id,))
-            con.execute("UPDATE jobs SET status='error',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?", (detail, stamp, stamp, job_id))
+            con.execute("UPDATE jobs SET status='failed',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?", (detail, stamp, stamp, job_id))
             con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'discovering','error',?,'{}',?)", (build_id, detail, stamp))
 
 @app.post("/reference-builds/{build_id}/retry")
@@ -6284,8 +6532,13 @@ def node_detail(request: Request, node_id: str):
             "net_tx_bps": 0,
             "collected_at": payload.get("metrics_collected_at"),
         }
-        payload["running_jobs"] = 0
-        payload["queued_jobs"] = 0
+        with db() as con:
+            counts = {row['status']: int(row['count']) for row in con.execute(
+                "SELECT status,COUNT(*) AS count FROM jobs WHERE node_id=? GROUP BY status",
+                (node_id,),
+            ).fetchall()}
+        payload["running_jobs"] = counts.get('running', 0)
+        payload["queued_jobs"] = counts.get('queued', 0)
         payload["is_local"] = False
     return templates.TemplateResponse(request, "node.html", {
         "mode": APPBOX_MODE,
@@ -6393,20 +6646,16 @@ def create_appbox(
     with db_lock, db() as con:
         if con.execute("SELECT 1 FROM appboxes WHERE client_id=?", (client_id,)).fetchone():
             raise HTTPException(409, "Cette AppBox existe déjà.")
-        reserved_media = {
-            row[0] for row in con.execute(
-                "SELECT plex_port FROM appboxes WHERE node_id=? AND plex_port IS NOT NULL",
-                (selected_node_id,),
-            )
-        }
-        reserved_tautulli = {
-            row[0] for row in con.execute(
-                "SELECT tautulli_port FROM appboxes WHERE node_id=? AND tautulli_port IS NOT NULL",
-                (selected_node_id,),
-            )
-        }
-        media_port = choose_media_port(media_type, media_port_requested, port_mode, reserved_media)
-        tautulli_port = reserve_port(TAUTULLI_RANGE, reserved_tautulli) if with_tautulli else None
+        reserved = {int(row[0]) for row in con.execute(
+            "SELECT port FROM port_reservations WHERE node_id=? AND protocol='tcp' AND status='reserved'",
+            (selected_node_id,)).fetchall()}
+        check_local=selected_node_id==HOSTNAME
+        media_port = choose_media_port(media_type, media_port_requested, port_mode, reserved,check_local=check_local)
+        reserved.add(media_port)
+        tautulli_port = reserve_port(TAUTULLI_RANGE, reserved,check_local=check_local) if with_tautulli else None
+        stamp = now_iso()
+        services=[('plex' if media_type=='plex' else 'jellyfin',media_port)]
+        if tautulli_port: services.append(('tautulli',tautulli_port))
 
         appbox_dir = BASE_DIR / client_id
         appbox_dir.mkdir(parents=True, exist_ok=False)
@@ -6451,15 +6700,15 @@ def create_appbox(
         containers = [f"plex-appb-{plex_short_id(client_id)}" if media_type == "plex" else f"jellyfin-{client_id}"]
         if with_tautulli:
             containers.append(f"tautulli-{client_id}")
-        stamp = now_iso()
         con.execute("""
             INSERT INTO appboxes(
                 client_id,node_id,media_type,with_tautulli,plex_port,
                 tautulli_port,status,path,containers_json,created_at,updated_at,
                 profile_id,snapshot_id,mount_group_id,storage_mode,port_mode,
                 reference_image_id,reference_version_id,acceleration_mode,
-                placement_mode,requested_node_id,selected_node_id,placement_reason
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                placement_mode,requested_node_id,selected_node_id,placement_reason,
+                desired_state,observed_state,reconciliation_status,drift_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             client_id,selected_node_id,media_type,int(with_tautulli),media_port,
             tautulli_port,"generated",str(appbox_dir),json.dumps(containers),
@@ -6467,7 +6716,16 @@ def create_appbox(
             storage_mode,port_mode,reference_image_id,
             reference_version_id,acceleration_mode,placement_mode,
             target_node_id,selected_node_id,placement_result["reason"],
+            'not_deployed','not_deployed','in_sync','[]',
         ))
+        try:
+            # The AppBox row must exist before its FK-backed reservations. Both
+            # remain in the same transaction, so a collision rolls everything back.
+            con.executemany("""INSERT INTO port_reservations(node_id,client_id,service,port,protocol,status,reserved_at)
+                VALUES(?,?,?,?,?,'reserved',?)""",[(selected_node_id,client_id,service,port,'tcp',stamp) for service,port in services])
+        except sqlite3.IntegrityError:
+            shutil.rmtree(appbox_dir, ignore_errors=True)
+            raise HTTPException(409,'Un port vient d’être réservé sur le node sélectionné ; recommencez le provisioning.') from None
         con.executemany("""
             INSERT INTO appbox_mounts(
                 client_id,mount_id,host_path,container_path,read_only,propagation
@@ -6818,13 +7076,18 @@ def api_node_status(node_id: str):
         "docker_containers": int(payload.get("docker_containers") or 0),
         "running_containers": int(payload.get("running_containers") or 0),
     }
+    with db() as con:
+        counts={row['status']:int(row['count']) for row in con.execute("SELECT status,COUNT(*) AS count FROM jobs WHERE node_id=? GROUP BY status",(node_id,)).fetchall()}
     return JSONResponse({**{key: node[key] for key in (
         'status', 'agent_status', 'agent_online', 'last_heartbeat', 'heartbeat_age_seconds',
         'heartbeat_timeout_seconds', 'liveness_reason', 'actionable', 'provisioning_allowed',
         'provisioning_block_reason', 'provisioning_warning', 'automatic_placement_allowed',
         'automatic_placement_block_reason', 'execution_capable', 'metrics_collected_at',
-        'metrics_age_seconds', 'metrics_stale', 'metrics_fresh')},
-        "metrics": metrics, "running_jobs": 0, "queued_jobs": 0})
+        'metrics_age_seconds', 'metrics_stale', 'metrics_fresh','active_commands',
+        'oldest_claim_age_seconds','worker_last_poll_at','worker_lease_status','executor_health',
+        'active_appboxes','running_appboxes','stopped_appboxes','not_deployed_appboxes',
+        'deleted_appboxes','missing_appboxes')},
+        "metrics": metrics, "running_jobs": counts.get('running',0), "queued_jobs": counts.get('queued',0)})
 
 
 @app.get("/api/nodes/{node_id}/metrics")

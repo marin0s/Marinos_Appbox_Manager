@@ -11,7 +11,7 @@
  <div class="workflow-actions">
    <a class="button ghost" href="/api/jobs/{{job.job_id}}/export.txt">Exporter TXT</a>
    <a class="button ghost" href="/api/jobs/{{job.job_id}}/export.json">Exporter JSON</a>
-   <span class="pill {{'ok' if job.status=='success' else 'bad' if job.status=='error' else 'warn'}}">{{job.status|upper}}</span>
+   <span class="pill {{'ok' if job.status=='success' else 'bad' if job.status in ['failed','error'] else 'warn'}}">{{job.status|upper}}</span>
  </div>
 </section>
 

@@ -11,8 +11,17 @@ Les commandes AppBox doivent être claimées sous 60 s par défaut
 (`APPBOX_AGENT_CLAIM_TIMEOUT_SECONDS`, minimum 5 s). Le délai et le lien au job sont
 portés par des métadonnées du payload existant, sans migration SQL. L'API de poll et
 le waiter appliquent la même expiration, avec transition conditionnelle sous verrou.
-Après restart, les jobs running sont finalisés en erreur et leurs commandes encore
+Après restart, les jobs running sont finalisés en `failed` et leurs commandes encore
 queued annulées ; les jobs queued sont conservés. Voir [suppression et reprise](appbox-deletion-hotfix.md).
+
+Les agents annonçant `appbox_command_lease` séparent la liveness du processus et celle
+du worker métier. Le heartbeat maintient le node online mais ne renouvelle jamais ce
+bail. Seules les activités observées (checksum, validation, extraction, copie/backup
+SQLite, écritures, attente du subprocessus Compose et runtime) renouvellent
+`lease_expires_at` et `worker_activity_at`. Une commande figée devient terminale et son
+résultat tardif ne modifie plus AppBox, job ou ports. Les agents alpha.5 antérieurs ne
+reçoivent pas ce bail afin de préserver leur protocole. Voir
+[provisioning distribué alpha.5](appbox-provisioning-alpha5.md).
 
 Le runtime observé par les agents est la source de vérité pour l'état des conteneurs. La base conserve l'état désiré et les informations métier. Le moteur de réconciliation compare les deux.
 
@@ -28,7 +37,7 @@ de capture est fondée sur `bytes_written / estimated_payload_bytes`, projetée 
 monotone, puis les jalons validation/publication terminent à 100 %. Pour une nouvelle
 version, `reference_builds.image_id` désigne explicitement
 la référence cible. La publication conserve cet `image_id`, insère une nouvelle version
-et bascule `current_version_id`; l’ancienne version devient historique dans l’UX. Aucun
+et bascule `current_version_id`; l’ancienne version devient historique dans l’UX.
 Une lease sur la commande longue est renouvelée par le heartbeat indépendant. Son
 expiration échoue le build sans double exécution ni résultat tardif accepté. L’annulation
 coopérative emprunte le même heartbeat et rend build/job/commande `cancelled` après
@@ -76,7 +85,8 @@ Les samples anciens/dupliqués sont ignorés ; les dates invalides/futures sont 
 La fraîcheur des métriques est distincte de la liveness (même seuil pour ce lot).
 Les valeurs anciennes restent consultables avec `metrics_fresh`, `metrics_stale` et
 `metrics_age_seconds`, indépendamment de `status` et `heartbeat_age_seconds`.
-`execution_capable` décrit la capacité agent, indépendamment de sa disponibilité.
+`execution_capable` décrit la capacité de l’exécuteur et devient faux si un bail worker
+est déjà expiré ; le statut de l’agent reste online tant que son heartbeat est frais.
 Le placement automatique exclut les métriques expirées avec un motif explicite
 « metrics stale : capacité non fiable », sans modifier le statut online.
 Le placement manuel/deploy reste autorisé avec un avertissement `provisioning_warning`.

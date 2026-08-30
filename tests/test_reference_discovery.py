@@ -93,7 +93,7 @@ class ReferenceDiscoveryTests(unittest.TestCase):
             build = con.execute("SELECT status,error_text FROM reference_builds WHERE build_id=?", (self.build_id,)).fetchone()
             job = con.execute("SELECT status,detail FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         self.assertEqual(build, ("discovery_failed", "Instance Plex introuvable"))
-        self.assertEqual(job[0], "error")
+        self.assertEqual(job[0], "failed")
         self.assertIn("introuvable", job[1])
 
     def test_blocking_disk_preflight_never_queues_capture(self):

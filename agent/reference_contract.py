@@ -78,11 +78,18 @@ def apply_plex_runtime_preferences(config_dir, client_id, port):
         temporary.unlink(missing_ok=True)
 
 
-def sha256_file(path):
+def _progress(callback, stage, completed=0, total=0, detail=''):
+    if callback:
+        callback(stage, completed, total, detail)
+
+
+def sha256_file(path, progress_callback=None):
     digest = hashlib.sha256()
-    with Path(path).open('rb') as stream:
+    path=Path(path); total=path.stat().st_size; completed=0
+    with path.open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(block)
+            completed+=len(block); _progress(progress_callback,'checksum_reference',completed,total,'Calcul SHA-256 du cache de référence.')
     return digest.hexdigest()
 
 
@@ -111,12 +118,13 @@ def archive_member_path(member):
     return path
 
 
-def validate_archive(path, plex=False):
+def validate_archive(path, plex=False, progress_callback=None):
     # Consume gzip to EOF as tar readers may otherwise ignore a truncated trailer.
     expanded = 0
     with gzip.open(path, 'rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             expanded += len(block)
+            _progress(progress_callback,'archive_validation',expanded,0,'Lecture complète du flux gzip.')
             if expanded > 501 * 1024**3:
                 raise RuntimeError('Archive de référence trop volumineuse.')
     names = set()
@@ -164,9 +172,24 @@ def validate_archive(path, plex=False):
                     with tempfile.TemporaryDirectory(prefix='archive-sqlite-', dir=Path(path).parent) as directory:
                         database = Path(directory) / 'validation.db'
                         with archive.extractfile(member) as source, database.open('wb') as output:
-                            shutil.copyfileobj(source, output, 1024 * 1024)
+                            copied = 0
+                            while True:
+                                block = source.read(1024 * 1024)
+                                if not block:
+                                    break
+                                output.write(block)
+                                copied += len(block)
+                                _progress(progress_callback, 'archive_validation', copied, member.size,
+                                          f'Prévalidation SQLite {local.name}.')
                         connection = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
                         try:
+                            connection.set_progress_handler(
+                                lambda: (_progress(
+                                    progress_callback, 'sqlite_validation', 0, 0,
+                                    f'Quick check SQLite {local.name} en cours.'
+                                ), 0)[1],
+                                10000,
+                            )
                             try:
                                 check = connection.execute('PRAGMA quick_check').fetchone()
                                 if not check or check[0] != 'ok':
@@ -183,6 +206,8 @@ def validate_archive(path, plex=False):
                     prefs = ET.fromstring(archive.extractfile(member).read())
                     if prefs.tag != 'Preferences' or any(identity_attribute(key) for key in prefs.attrib):
                         raise RuntimeError('Archive Plex : identité source présente.')
+            if len(names) % 256 == 0:
+                _progress(progress_callback,'archive_validation',len(names),0,'Validation des membres de l’archive.')
     if not files:
         raise RuntimeError('Archive vide.')
     if plex:
@@ -194,11 +219,12 @@ def validate_archive(path, plex=False):
     return {'file_count': len(files), 'uncompressed_size_bytes': total}
 
 
-def extract_archive(path, destination):
-    validate_archive(path)
+def extract_archive(path, destination, progress_callback=None):
+    report=validate_archive(path,progress_callback=progress_callback)
     destination = Path(destination).resolve()
     # Preflight every path before writing even into staging.
     with tarfile.open(path, 'r:gz') as archive:
+        completed=0; total=max(1,int(report.get('uncompressed_size_bytes') or 1))
         for member in archive:
             target = destination.joinpath(*archive_member_path(member).parts).resolve()
             if target != destination and destination not in target.parents:
@@ -211,5 +237,9 @@ def extract_archive(path, destination):
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with archive.extractfile(member) as source, target.open('xb') as output:
-                    shutil.copyfileobj(source, output, 1024 * 1024)
+                    while True:
+                        block=source.read(1024*1024)
+                        if not block: break
+                        output.write(block); completed+=len(block)
+                        _progress(progress_callback,'extraction',completed,total,'Extraction atomique dans le staging.')
                 target.chmod((member.mode & 0o755) | 0o600)

@@ -243,7 +243,29 @@ def _close_sqlite_connections(diagnostics: dict, **connections) -> None:
         diagnostics.setdefault("connection_cleanup_errors", []).extend(errors)
 
 
-def run(command, timeout=15):
+def run(command, timeout=15, progress_callback=None):
+    if progress_callback is not None:
+        started_at = time.monotonic()
+        proc = None
+        try:
+            proc = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            while True:
+                elapsed = time.monotonic() - started_at
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    proc.kill()
+                    out, err = proc.communicate()
+                    return 1, (out or "").strip(), (err or f"Command timed out after {timeout} seconds").strip()
+                try:
+                    out, err = proc.communicate(timeout=min(1.0, remaining))
+                    return proc.returncode, (out or "").strip(), (err or "").strip()
+                except subprocess.TimeoutExpired:
+                    progress_callback(elapsed)
+        except Exception as exc:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            raise
     try:
         proc = subprocess.run(
             command,
@@ -627,7 +649,7 @@ def discover_plex_instance(config, payload):
     }
 
 
-def _python_sqlite_hot_backup(source: Path, destination: Path) -> dict:
+def _python_sqlite_hot_backup(source: Path, destination: Path, progress_callback=None) -> dict:
     """Snapshot a frozen database through private writable staging."""
     source = Path(source)
     destination = Path(destination)
@@ -693,7 +715,14 @@ def _python_sqlite_hot_backup(source: Path, destination: Path) -> dict:
             )
             for copy_source, copy_destination in copy_pairs:
                 try:
-                    shutil.copy2(copy_source, copy_destination)
+                    if progress_callback:
+                        with copy_source.open('rb') as source_stream, copy_destination.open('xb') as destination_stream:
+                            for block in iter(lambda: source_stream.read(1024 * 1024), b''):
+                                destination_stream.write(block)
+                                progress_callback()
+                        shutil.copystat(copy_source, copy_destination)
+                    else:
+                        shutil.copy2(copy_source, copy_destination)
                     copy_destination.chmod(0o600)
                 except Exception as exc:
                     reported_path = getattr(exc, "filename", None)
@@ -735,7 +764,10 @@ def _python_sqlite_hot_backup(source: Path, destination: Path) -> dict:
             try:
                 source_connection.execute("PRAGMA busy_timeout=60000")
                 destination_connection.execute("PRAGMA journal_mode=DELETE")
-                source_connection.backup(destination_connection, pages=2048, sleep=0.05)
+                backup_progress = ((lambda status, remaining, total: progress_callback())
+                                   if progress_callback else None)
+                source_connection.backup(destination_connection, pages=2048, sleep=0.05,
+                                         progress=backup_progress)
                 destination_connection.execute("PRAGMA journal_mode=DELETE")
                 stage = "quick_check"
                 try:
@@ -1544,6 +1576,8 @@ def heartbeat(config, metrics=None, active_command_id=""):
             "deployment_executor": True,
             "plex_runtime_preferences": True,
             "independent_heartbeat": True,
+            "appbox_command_lease": True,
+            "appbox_progress": True,
             "remote_upgrade": RUNTIME_IDENTITY["managed"],
         },
     }
@@ -1715,11 +1749,11 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
 
 
 
-def safe_extract_tar(archive: Path, destination: Path):
-    extract_archive(archive, destination)
+def safe_extract_tar(archive: Path, destination: Path, progress_callback=None):
+    extract_archive(archive, destination, progress_callback=progress_callback)
 
 
-def install_reference_archive(config: dict, descriptor: dict, app_dir: Path):
+def install_reference_archive(config: dict, descriptor: dict, app_dir: Path, progress_callback=None):
     path = str(descriptor.get("download_path") or "")
     expected = str(descriptor.get("sha256") or "").lower()
     target_name = str(descriptor.get("target_directory") or "")
@@ -1735,8 +1769,15 @@ def install_reference_archive(config: dict, descriptor: dict, app_dir: Path):
     cached = cache / (expected + ".tar.gz")
     temporary = cache / (expected + "." + uuid.uuid4().hex + ".partial")
     staging = app_dir / ("." + target_name + ".staging-" + uuid.uuid4().hex)
+    def report(stage,completed=0,total=0,detail=''):
+        if progress_callback:
+            percent=round(min(1,completed/total)*100) if total else 25
+            progress_callback(stage=stage,percent=percent,detail=detail,completed=completed,total=total)
     try:
-        if not cached.is_file() or sha256_file(cached) != expected:
+        report('cache_reference',0,1,'Vérification du cache local de référence.')
+        cached_valid=cached.is_file() and sha256_file(cached,progress_callback=report)==expected
+        report('cache_reference',1,1,'Cache local valide.' if cached_valid else 'Téléchargement du cache requis.')
+        if not cached_valid:
             request = urllib.request.Request(
                 config["control_plane_url"].rstrip("/") + path,
                 headers={"Authorization": f"Bearer {config['token']}", "User-Agent": f"marinos-appbox-agent/{VERSION}"},
@@ -1749,24 +1790,37 @@ def install_reference_archive(config: dict, descriptor: dict, app_dir: Path):
                         break
                     output.write(block)
                     digest.update(block)
+                    report('checksum_reference',output.tell(),int(descriptor.get('size_bytes') or 0),'Téléchargement et checksum de la référence.')
                 output.flush()
                 os.fsync(output.fileno())
             if not secrets.compare_digest(digest.hexdigest(), expected):
                 raise RuntimeError("Checksum de l’image de déploiement invalide.")
-            validate_archive(temporary, plex=target_name == "plex-config")
+            validate_archive(temporary, plex=target_name == "plex-config",progress_callback=report)
             os.replace(temporary, cached)
-        validate_archive(cached, plex=target_name == "plex-config")
+        validate_archive(cached, plex=target_name == "plex-config",progress_callback=report)
         staging.mkdir(parents=True)
-        safe_extract_tar(cached, staging)
+        safe_extract_tar(cached, staging,progress_callback=report)
         if target_name == "plex-config":
+            report('runtime_customization',25,100,'Assainissement des préférences Plex.')
             sanitize_preferences(staging / PLEX_REFERENCE_ROOT / "Preferences.xml")
             # Reuse private-copy SQLite validation; never modify cached/source DBs.
             with tempfile.TemporaryDirectory(prefix="validate-sqlite-", dir=app_dir) as checks:
-                for database in (staging / PLEX_REFERENCE_ROOT / "Plug-in Support/Databases").glob("*.db"):
-                    _python_sqlite_hot_backup(database, Path(checks) / database.name)
+                databases=list((staging / PLEX_REFERENCE_ROOT / "Plug-in Support/Databases").glob("*.db"))
+                for index,database in enumerate(databases,1):
+                    report('sqlite_validation',index-1,max(1,len(databases)),f'Validation SQLite {database.name}.')
+                    _python_sqlite_hot_backup(
+                        database,
+                        Path(checks) / database.name,
+                        progress_callback=lambda: report(
+                            'sqlite_validation', index - 1, max(1, len(databases)),
+                            f'Validation SQLite {database.name} en cours.'
+                        ),
+                    )
+                    report('sqlite_validation',index,max(1,len(databases)),f'Validation SQLite {database.name} terminée.')
         if target.exists():
             target.rmdir()  # only an empty directory can be replaced
         os.replace(staging, target)
+        report('extraction',1,1,'Référence extraite et activée dans le staging AppBox.')
         return {"status": "ready", "version_id": descriptor.get("version_id"),
                 "checksum": expected, "local_path": str(cached), "size_bytes": cached.stat().st_size}
     finally:
@@ -1951,6 +2005,10 @@ def execute_command(config, command, *, progress_callback=None, cancel_event=Non
             raise RuntimeError("Identifiant AppBox invalide.")
         if action not in {"deploy", "start", "restart", "recreate", "stop", "delete", "claim"}:
             raise RuntimeError("Action AppBox non autorisée.")
+        def report(stage,percent,detail,**extra):
+            if progress_callback:
+                progress_callback(stage=stage,percent=percent,detail=detail,**extra)
+        report('preparing',5,'Préparation de la commande AppBox.')
 
         base = Path(config.get("appbox_base_dir", "/srv/appboxes"))
         if action == 'delete':
@@ -1986,15 +2044,18 @@ def execute_command(config, command, *, progress_callback=None, cancel_event=Non
                 staging_app = base / (".restore-" + client_id + "-" + uuid.uuid4().hex)
                 staging_app.mkdir()
                 try:
-                    reference_result = install_reference_archive(config, reference_archive, staging_app)
+                    reference_result = install_reference_archive(config, reference_archive, staging_app,progress_callback=progress_callback)
                     if runtime is not None:
+                        report('runtime_customization',50,'Application du nom et du port Plex alloués.')
                         apply_plex_runtime_preferences(staging_app / "plex-config", client_id, port)
+                    report('write_configuration',25,'Écriture atomique du Compose, de .env et du manifeste.')
                     atomic_write(staging_app / "compose.yml", compose)
                     atomic_write(staging_app / ".env", env_content)
                     atomic_write(staging_app / "deployment-manifest.json", json.dumps(manifest))
                     if app_dir.exists():
                         app_dir.rmdir()
                     os.replace(staging_app, app_dir)
+                    report('write_configuration',100,'Configuration AppBox activée atomiquement.')
                 finally:
                     if staging_app.exists():
                         shutil.rmtree(staging_app)
@@ -2002,10 +2063,13 @@ def execute_command(config, command, *, progress_callback=None, cancel_event=Non
                 new_plex = not (app_dir / "plex-config" / PLEX_REFERENCE_ROOT / "Preferences.xml").exists()
                 app_dir.mkdir(parents=True, exist_ok=True)
                 if action == "deploy" and runtime is not None and new_plex:
+                    report('runtime_customization',50,'Application du nom et du port Plex alloués.')
                     apply_plex_runtime_preferences(app_dir / "plex-config", client_id, port)
+                report('write_configuration',25,'Écriture atomique du Compose, de .env et du manifeste.')
                 atomic_write(compose_path, compose)
                 atomic_write(env_path, env_content)
                 atomic_write(manifest_path, json.dumps(manifest))
+                report('write_configuration',100,'Configuration AppBox écrite.')
             for directory in payload.get("directories") or []:
                 if directory in {"plex-config", "jellyfin-config", "jellyfin-cache", "tautulli-config"}:
                     (app_dir / directory).mkdir(exist_ok=True)
@@ -2040,7 +2104,8 @@ def execute_command(config, command, *, progress_callback=None, cancel_event=Non
                 args = ["stop"]
             else:
                 args = ["down", "--remove-orphans"]
-            code, out, err = run(compose_cmd + args, timeout=300)
+            report('compose_deployment',10,f"Docker Compose {action} lancé pour {client_id}.")
+            code, out, err = run(compose_cmd + args, timeout=300,progress_callback=lambda elapsed: report('compose_deployment',min(90,10+int(elapsed)),f'Docker Compose actif depuis {int(elapsed)} s.'))
             executor = "docker-compose"
         else:
             if action in {"deploy", "start"}:
@@ -2055,15 +2120,18 @@ def execute_command(config, command, *, progress_callback=None, cancel_event=Non
         output = "\n".join(x for x in (out, err) if x)[-16000:]
         if code != 0:
             raise RuntimeError(output or f"Docker a retourné {code}")
+        report('compose_deployment',100,'Commande Docker terminée avec succès.')
 
         if action in {"deploy", "start", "restart", "recreate"}:
             if not containers:
                 raise RuntimeError("Aucun conteneur déclaré : validation running impossible.")
             for container in containers:
+                report('runtime_wait',25,f'Attente du conteneur {container}.')
                 _wait_for_container_state(container, "running", timeout=90)
             plex = next((name for name in containers if name.startswith("plex-")), None)
             if plex:
                 _wait_plex_ready(plex)
+            report('runtime_wait',100,'Runtime et santé applicative confirmés.')
 
         if compose_path.exists():
             code, psout, pserr = run(
@@ -2106,9 +2174,65 @@ def command_cycle(config, inventory_request=None, runtime=None):
     if runtime is not None:
         runtime.begin_command(command['command_id'])
         cancel_event = runtime.cancel_event
-        def progress_callback(written, estimated):
-            response=api(config,'POST',f"/api/agent/v1/{config['node_id']}/commands/{command['command_id']}/progress",
-                {'stage':'capture','bytes_written':written,'estimated_payload_bytes':estimated})
+        progress_state = {
+            'last_attempt_at': 0.0,
+            'last_success_at': time.monotonic(),
+            'last_stage': '',
+            'last_percent': -1,
+        }
+        configured_grace = max(5.0, float(config.get('command_progress_grace_seconds', 150)))
+        lease_window = max(15.0, float(command.get('lease_timeout_seconds') or 180))
+        progress_grace = min(configured_grace, max(5.0, lease_window - 10.0))
+
+        def progress_callback(*args, **kwargs):
+            now = time.monotonic()
+            stage = str(kwargs.get('stage') or 'capture')
+            percent = kwargs.get('percent')
+            if len(args) >= 2:
+                written, estimated = args[:2]
+                payload = {
+                    'stage': stage,
+                    'bytes_written': int(written or 0),
+                    'estimated_payload_bytes': int(estimated or 0),
+                }
+            else:
+                payload = {
+                    'stage': stage,
+                    'percent': max(0, min(100, int(percent or 0))),
+                    'detail': str(kwargs.get('detail') or '')[:500],
+                }
+                if kwargs.get('completed') is not None:
+                    payload['bytes_written'] = int(kwargs['completed'])
+                if kwargs.get('total') is not None:
+                    payload['estimated_payload_bytes'] = int(kwargs['total'])
+            current_percent = int(payload.get('percent', -1))
+            significant = (
+                stage != progress_state['last_stage']
+                or current_percent >= 100
+                or current_percent >= progress_state['last_percent'] + 5
+                or now - progress_state['last_attempt_at'] >= 2.0
+            )
+            if not significant:
+                return
+            progress_state['last_attempt_at'] = now
+            progress_state['last_stage'] = stage
+            progress_state['last_percent'] = max(progress_state['last_percent'], current_percent)
+            try:
+                response=api(config,'POST',f"/api/agent/v1/{config['node_id']}/commands/{command['command_id']}/progress",payload)
+            except urllib.error.HTTPError as exc:
+                if exc.code in {404, 409, 410}:
+                    cancel_event.set()
+                    raise CommandCancelled('Le Control Plane a clôturé la commande ; arrêt du worker local.') from None
+                if now - progress_state['last_success_at'] >= progress_grace:
+                    cancel_event.set()
+                    raise RuntimeError('Lease de commande non renouvelable ; arrêt avant expiration.') from None
+                return
+            except (urllib.error.URLError, TimeoutError, OSError):
+                if now - progress_state['last_success_at'] >= progress_grace:
+                    cancel_event.set()
+                    raise RuntimeError('Lease de commande non renouvelable ; arrêt avant expiration.') from None
+                return
+            progress_state['last_success_at'] = now
             if response.get('cancel_requested'):
                 cancel_event.set()
     try:

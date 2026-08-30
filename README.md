@@ -53,6 +53,7 @@ Les règles du projet sont détaillées dans [AGENTS.md](AGENTS.md) et [CONTRIBU
 - [Agents : upgrades sûrs, bootstrap et rollback](docs/agent-upgrades.md)
 - [Images de référence](docs/reference-images.md)
 - [Validation E2E et rollback alpha.5](docs/reference-images-alpha5-e2e.md)
+- [Provisioning AppBox distribué alpha.5](docs/appbox-provisioning-alpha5.md)
 - [Processus de livraison](docs/release-process.md)
 - [Roadmap](ROADMAP.md)
 - [Historique des versions](CHANGELOG.md)

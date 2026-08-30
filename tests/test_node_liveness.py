@@ -95,6 +95,24 @@ class NodeLivenessTests(unittest.TestCase):
         self.assertEqual(cronos['liveness_reason'], 'local_control_plane')
         self.assertFalse(cronos['actionable'])
 
+    def test_bare_metal_is_never_automatic_and_manual_requires_confirmation(self):
+        with main.db() as con:
+            con.execute("INSERT INTO node_tag_assignments(node_id,tag_id,assigned_at) VALUES('testnode','bare-metal',?)", (main.now_iso(),))
+        node = self.node()
+        self.assertEqual(node['status'], 'online')
+        self.assertFalse(node['automatic_placement_allowed'])
+        self.assertIn('bare-metal', node['automatic_placement_block_reason'].lower())
+        with self.assertRaises(HTTPException) as rejected:
+            main.evaluate_placement('manual', 'testnode')
+        self.assertIn('confirmation', rejected.exception.detail.lower())
+        self.assertEqual(
+            main.evaluate_placement('manual', 'testnode', allow_bare_metal_override=True)['selected']['node_id'],
+            'testnode',
+        )
+        api = json.loads(main.api_node_status('testnode').body)
+        self.assertFalse(api['automatic_placement_allowed'])
+        self.assertIn('bare-metal', api['automatic_placement_block_reason'].lower())
+
     def test_light_heartbeat_leaves_metrics_and_history_unchanged(self):
         with main.db() as con:
             before = dict(con.execute("SELECT * FROM agent_node_metrics WHERE node_id='testnode'").fetchone())

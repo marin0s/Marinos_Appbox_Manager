@@ -20,6 +20,30 @@ class AgentLoopTests(unittest.TestCase):
         payload = api.call_args.args[3]
         self.assertNotIn('metrics', payload)
         self.assertTrue(payload['capabilities']['independent_heartbeat'])
+        self.assertTrue(payload['capabilities']['appbox_command_lease'])
+        self.assertTrue(payload['capabilities']['appbox_progress'])
+
+    def test_appbox_worker_reports_real_phase_activity_before_result(self):
+        calls=[]
+        command={'command_id':'deploy-one','command_type':'appbox_action','payload':{'action':'deploy'}}
+        def api(config,method,path,payload=None):
+            calls.append((method,path,payload))
+            if method=='GET':
+                return {'command':command}
+            return {}
+        def execute(config,received,**kwargs):
+            kwargs['progress_callback'](stage='checksum_reference',percent=25,detail='checksum')
+            kwargs['progress_callback'](stage='extraction',percent=50,detail='extraction')
+            return {'state':'running'}
+        class Runtime:
+            cancel_event=threading.Event()
+            def begin_command(self,command_id): pass
+            def finish_command(self,command_id): pass
+        with patch.object(agent,'api',side_effect=api), patch.object(agent,'execute_command',side_effect=execute):
+            agent.command_cycle({'node_id':'test'},runtime=Runtime())
+        progress=[payload for method,path,payload in calls if path.endswith('/progress')]
+        self.assertEqual([item['stage'] for item in progress],['checksum_reference','extraction'])
+        self.assertEqual(calls[-1][2]['status'],'success')
 
     def test_long_command_and_blocked_telemetry_do_not_block_heartbeats(self):
         loops = agent.AgentLoops({'node_id':'test'})

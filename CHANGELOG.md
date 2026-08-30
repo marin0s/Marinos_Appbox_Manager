@@ -2,6 +2,14 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Fiabilité du provisioning AppBox distribué
+- Les commandes `appbox_action` des agents compatibles utilisent un bail worker de 180 s par défaut (`APPBOX_COMMAND_LEASE_SECONDS`) renouvelé par l’activité réelle des phases, indépendamment du heartbeat agent. Une expiration termine commande et job en `failed`; les résultats tardifs sont ignorés et audités.
+- Les phases cache, checksum, validation archive, extraction, SQLite, personnalisation runtime, fichiers de configuration, Compose et attente runtime remontent une progression persistée et monotone. Les agents alpha.5 antérieurs restent acceptés sans bail et leurs phases non observables sont signalées comme telles.
+- Les réservations Plex/Tautulli sont atomiques et rattachées au `selected_node_id`; un même port est permis sur deux nodes, jamais deux fois sur le même node/protocole. La synchronisation libère les réservations orphelines et suit un changement de node sans suppression distante implicite.
+- Le placement automatique exige explicitement `appbox-node`, exclut `bare-metal`, maintenance, CRONOS et les rôles ambigus. Le placement manuel Bare-Metal respecte l’autorisation et la confirmation configurées.
+- Les états historiques `jobs.error` migrent vers le terminal canonique `failed`. Les compteurs de jobs distants proviennent de SQLite; les AppBox generated/deleted sont distinguées de la capacité active et l’UX affiche « Configuration créée — non déployée ».
+- La réconciliation marque les lignes deleted avec un état cohérent, signale dossiers/conteneurs encore présents sans les détruire et n’invente plus de port drift pour un conteneur arrêté.
+
 ### Fiabilité et progression des Reference Builds
 - Un seul workflow global couvre désormais découverte, preflight, capture, validation et publication ; les commandes agent restent des sous-jobs techniques et ne peuvent plus afficher un faux succès à 100 %.
 - Progression de capture remontée périodiquement depuis les octets réellement écrits, persistée de façon monotone et limitée en fréquence. États, libellés et durées de l’inspecteur reflètent les données réellement disponibles.

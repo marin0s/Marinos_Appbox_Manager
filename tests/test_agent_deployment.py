@@ -319,6 +319,63 @@ class AgentDeploymentTests(unittest.TestCase):
                 result=agent.install_reference_archive({'reference_cache_dir':str(root/'cache')},descriptor,root/'second-appbox')
             self.assertEqual(result['status'],'ready')
 
+    def test_cached_reference_reports_checksum_validation_extraction_and_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); data=reference_archive(root).read_bytes()
+            self.install(root,data)
+            descriptor={'version_id':'v1','download_path':'/api/agent/v1/test/archive',
+                        'sha256':hashlib.sha256(data).hexdigest(),
+                        'size_bytes':len(data),'target_directory':'plex-config'}
+            progress=[]
+            with patch.object(agent.urllib.request,'urlopen',side_effect=AssertionError('cache must be reused')):
+                result=agent.install_reference_archive(
+                    {'reference_cache_dir':str(root/'cache')},descriptor,root/'progress-appbox',
+                    progress_callback=lambda **payload: progress.append(payload),
+                )
+            stages={item['stage'] for item in progress}
+            self.assertEqual(result['status'],'ready')
+            self.assertTrue({'cache_reference','checksum_reference','archive_validation',
+                             'extraction','sqlite_validation','runtime_customization'} <= stages)
+            for stage in stages:
+                values=[item['percent'] for item in progress if item['stage']==stage]
+                self.assertTrue(all(0 <= value <= 100 for value in values),stage)
+
+    def test_large_checksum_reports_incremental_worker_activity(self):
+        from agent.reference_contract import sha256_file
+        with tempfile.TemporaryDirectory() as tmp:
+            target=Path(tmp)/'large-reference.tar.gz'
+            target.write_bytes(b'a'*(3*1024*1024+17))
+            reports=[]
+            checksum=sha256_file(target,progress_callback=lambda *args: reports.append(args))
+        self.assertEqual(checksum,hashlib.sha256(b'a'*(3*1024*1024+17)).hexdigest())
+        self.assertGreaterEqual(len(reports),4)
+        self.assertEqual(reports[-1][0],'checksum_reference')
+        self.assertEqual(reports[-1][1],reports[-1][2])
+        self.assertEqual(reports[-1][2],3*1024*1024+17)
+
+    def test_deploy_never_operates_an_unrelated_existing_plex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands=[]
+            def docker(command,timeout=15,progress_callback=None):
+                commands.append(list(command))
+                if progress_callback:
+                    progress_callback(1)
+                return 0,'',''
+            compose=main.compose_for('jdmry','plex',32448,None)
+            manifest=main.build_deployment_manifest({'client_id':'jdmry','type':'plex','plex_port':32448},compose,'')
+            payload={'client_id':'jdmry','action':'deploy','compose':compose,'env':'',
+                     'manifest':manifest,'containers':['plex-appb-jdmry']}
+            with patch.object(agent,'run',side_effect=docker), \
+                 patch.object(agent,'_wait_for_container_state'), \
+                 patch.object(agent,'_wait_plex_ready',return_value={'claimed':False}):
+                agent.execute_command({'appbox_base_dir':tmp},{'command_type':'appbox_action','payload':payload},
+                                      progress_callback=lambda **kwargs: None)
+            flattened=[' '.join(command) for command in commands]
+            self.assertTrue(any('-p jdmry' in command for command in flattened))
+            self.assertFalse(any('plex-appb-34ah' in command for command in flattened))
+            self.assertFalse(any((' stop ' in f' {command} ' or ' restart ' in f' {command} ')
+                                 for command in flattened))
+
     def test_archive_with_corrupt_sqlite_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); reference_archive(root)

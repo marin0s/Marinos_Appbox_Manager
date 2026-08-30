@@ -44,7 +44,7 @@
 <div class="grid metrics">
  <div class="card"><div class="metric-label">RDAD</div><div class="metric-value {{'ok' if node.rdad_ok else 'bad'}}">{{'INCONNU' if node.metrics_stale and not node.is_local else ('ONLINE' if node.rdad_ok else 'OFFLINE')}}</div></div>
  <div class="card"><div class="metric-label">GPU /dev/dri</div><div class="metric-value {{'ok' if node.gpu_ok else 'warn'}}">{{'PRÉSENT' if node.gpu_ok else 'ABSENT'}}</div></div>
- <div class="card"><div class="metric-label">AppBox</div><div class="metric-value">{{node.appbox_count}}</div></div>
+ <div class="card"><div class="metric-label">AppBox actives</div><div class="metric-value">{{node.active_appboxes|default(node.appbox_count, true)}}</div><div class="metric-sub">{{node.running_appboxes|default(0,true)}} running · {{node.stopped_appboxes|default(0,true)}} stopped · {{node.not_deployed_appboxes|default(0,true)}} non déployée(s) · {{node.deleted_appboxes|default(0,true)}} historique(s)</div></div>
  <div class="card"><div class="metric-label">État agent</div><div class="metric-value" data-node-liveness="{{node.node_id}}" style="font-size:22px">{{node.status|upper}}</div></div>
 </div>
 

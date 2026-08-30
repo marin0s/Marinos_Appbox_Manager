@@ -72,7 +72,7 @@ def test_expired_lease_fails_orphan_and_late_success_is_ignored(reliable_build):
     assert json.loads(response.body)['ignored']=='terminal_command'
     with main.db() as con:
         assert con.execute("SELECT status FROM reference_builds WHERE build_id=?",(reliable_build.build_id,)).fetchone()[0]=='build_failed'
-        assert con.execute("SELECT status FROM jobs WHERE job_id=?",(reliable_build.job_id,)).fetchone()[0]=='error'
+        assert con.execute("SELECT status FROM jobs WHERE job_id=?",(reliable_build.job_id,)).fetchone()[0]=='failed'
 
 
 def test_cancel_claimed_build_requests_cooperative_stop(reliable_build):

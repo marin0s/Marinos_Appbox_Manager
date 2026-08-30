@@ -185,7 +185,7 @@ def test_unclaimed_timeout_fails_job_and_rejects_late_claim_result(job_database,
     with main.db() as con:
         result=con.execute('SELECT * FROM jobs WHERE job_id=?',(job_id,)).fetchone()
         command=con.execute("SELECT * FROM agent_commands WHERE node_id='orion'").fetchone()
-        assert result['status']=='error' and result['progress']==100
+        assert result['status']=='failed' and result['progress']==100
         assert main.CLAIM_TIMEOUT_MESSAGE in result['detail']
         assert command['status']=='failed' and command['claimed_at'] is None
     assert all(s['status'] in {'success','failed','skipped'} for s in main.step_rows(job_id))
@@ -195,7 +195,7 @@ def test_unclaimed_timeout_fails_job_and_rejects_late_claim_result(job_database,
         assert json.loads(response.body)['ignored']=='terminal_command'
     with main.db() as con:
         assert con.execute('SELECT status FROM agent_commands WHERE command_id=?',(command['command_id'],)).fetchone()[0]=='failed'
-        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(job_id,)).fetchone()[0]=='error'
+        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(job_id,)).fetchone()[0]=='failed'
 
 
 def test_poll_expires_old_unclaimed_without_waiter(job_database):
@@ -221,7 +221,7 @@ def test_restart_finalizes_legacy_running_and_cancels_command_preserving_queued_
     assert main.recover_interrupted_jobs()==1
     assert main.recover_interrupted_jobs()==0
     with main.db() as con:
-        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(interrupted,)).fetchone()[0]=='error'
+        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(interrupted,)).fetchone()[0]=='failed'
         assert con.execute('SELECT status FROM jobs WHERE job_id=?',(queued,)).fetchone()[0]=='queued'
         assert con.execute('SELECT status FROM agent_commands WHERE command_id=?',(command_id,)).fetchone()[0]=='failed'
 
@@ -262,9 +262,9 @@ def test_blocked_orion_does_not_block_artemis_and_each_node_stays_sequential(job
         deadline=time.monotonic()+3
         while time.monotonic()<deadline:
             with main.db() as con: statuses=dict(con.execute('SELECT job_id,status FROM jobs').fetchall())
-            if all(statuses[j] in {'success','error'} for j in (first,second,third)): break
+            if all(statuses[j] in {'success','failed'} for j in (first,second,third)): break
             time.sleep(.01)
-        assert statuses[first]=='error' and statuses[second]==statuses[third]=='success'
+        assert statuses[first]=='failed' and statuses[second]==statuses[third]=='success'
     finally:
         release_artemis.set(); main.worker_stop.set(); main.worker_wakeup.set(); dispatcher.join(3)
         assert not dispatcher.is_alive()
@@ -276,7 +276,7 @@ def test_offline_node_refused_before_queueing(job_database,monkeypatch):
     with main.db() as con: job=dict(con.execute('SELECT * FROM jobs WHERE job_id=?',(job_id,)).fetchone())
     main.execute_job(job)
     with main.db() as con:
-        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(job_id,)).fetchone()[0]=='error'
+        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(job_id,)).fetchone()[0]=='failed'
         assert con.execute('SELECT COUNT(*) FROM agent_commands').fetchone()[0]==0
 
 
@@ -315,7 +315,7 @@ def test_mock_embedded_cleanup_never_runs_docker(job_database,monkeypatch):
     with patch.object(main,'embedded_deletion_executor') as cleanup:
         main.execute_job(job)
         cleanup.assert_not_called()
-    with main.db() as con: assert con.execute('SELECT status FROM jobs WHERE job_id=?',(job_id,)).fetchone()[0]=='error'
+    with main.db() as con: assert con.execute('SELECT status FROM jobs WHERE job_id=?',(job_id,)).fetchone()[0]=='failed'
 
 
 def test_queue_continues_on_same_node_after_worker_exception(job_database,monkeypatch):
@@ -331,7 +331,7 @@ def test_queue_continues_on_same_node_after_worker_exception(job_database,monkey
     try:
         assert done.wait(3)
         with main.db() as con:
-            assert con.execute('SELECT status FROM jobs WHERE job_id=?',(first,)).fetchone()[0]=='error'
+            assert con.execute('SELECT status FROM jobs WHERE job_id=?',(first,)).fetchone()[0]=='failed'
             assert con.execute('SELECT status FROM jobs WHERE job_id=?',(second,)).fetchone()[0]=='success'
     finally:
         main.worker_stop.set(); main.worker_wakeup.set(); dispatcher.join(3)
@@ -366,7 +366,7 @@ def test_delete_missing_runtime_proof_never_commits_inventory(job_database,monke
     with main.db() as con: job=dict(con.execute('SELECT * FROM jobs WHERE job_id=?',(job_id,)).fetchone())
     main.execute_job(job)
     with main.db() as con:
-        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(job_id,)).fetchone()[0]=='error'
+        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(job_id,)).fetchone()[0]=='failed'
         assert con.execute("SELECT 1 FROM appboxes WHERE client_id='ab40ah'").fetchone()
 
 
@@ -389,3 +389,164 @@ def test_repeated_delete_api_returns_verified_job_without_new_execution(job_data
     with pytest.raises(main.HTTPException) as error:
         main.delete_appbox(request,'unknown',mode,'SUPPRIMER')
     assert error.value.status_code==404
+
+
+def _create_remote_appbox(base, *, client_id, node='artemis', placement='manual',
+                          port='32448', tautulli=False):
+    return main.create_appbox(
+        client_id=client_id, media_type='plex', profile_id='', deployment_image_id='',
+        mount_group_id='', snapshot_id='', reference_version_id='', port_mode='manual',
+        media_port_requested=port, acceleration_mode='disabled', placement_mode=placement,
+        target_node_id=node, bare_metal_override=False, with_tautulli=tautulli,
+        deploy_now=False,
+    )
+
+
+def test_manual_create_reserves_plex_and_tautulli_on_selected_node(job_database,monkeypatch):
+    monkeypatch.setattr(main, 'BASE_DIR', job_database/'appboxes')
+    response = _create_remote_appbox(job_database, client_id='jdmry', tautulli=True)
+    assert response.status_code == 303
+    with main.db() as con:
+        item = con.execute("SELECT node_id,selected_node_id,status,desired_state,observed_state FROM appboxes WHERE client_id='jdmry'").fetchone()
+        reservations = con.execute("SELECT node_id,service,status FROM port_reservations WHERE client_id='jdmry' ORDER BY service").fetchall()
+    assert tuple(item) == ('artemis','artemis','generated','not_deployed','not_deployed')
+    assert [(row['node_id'],row['service'],row['status']) for row in reservations] == [
+        ('artemis','plex','reserved'), ('artemis','tautulli','reserved')]
+    with main.db() as con:
+        row=con.execute("SELECT * FROM appboxes WHERE client_id='jdmry'").fetchone()
+    generated=main.row_to_appbox(row)
+    assert generated['ux_state']=='ready_to_deploy'
+    rendered=main.templates.env.get_template('command_center.html').render(
+        appboxes=[{**generated,'runtime':{'status':'absent'}}],recent_jobs=[],
+        running=0,claimed=0,stopped=0,hostname='cronos',
+        node={'running_jobs':0,'queued_jobs':0,'rdad_ok':False,
+              'metrics':{'cpu_percent':0,'ram_percent':0,'disk_percent':0,
+                         'running_containers':0,'docker_containers':0}})
+    assert 'CONFIGURATION CRÉÉE — NON DÉPLOYÉE' in rendered
+
+
+def test_automatic_create_uses_eligible_appbox_node_for_port(job_database,monkeypatch):
+    monkeypatch.setattr(main, 'BASE_DIR', job_database/'automatic')
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("UPDATE nodes SET rdad_ok=1 WHERE node_id='artemis'")
+        con.execute("INSERT INTO node_tag_assignments(node_id,tag_id,assigned_at) VALUES('artemis','appbox-node',?)",(stamp,))
+        main.store_agent_metrics(con,'artemis',{'rdad_present':True,'docker_ok':True},'test',stamp)
+    _create_remote_appbox(job_database,client_id='auto01',placement='automatic',node='orion',port='32449')
+    with main.db() as con:
+        appbox=con.execute("SELECT selected_node_id FROM appboxes WHERE client_id='auto01'").fetchone()[0]
+        reservation=con.execute("SELECT node_id FROM port_reservations WHERE client_id='auto01'").fetchone()[0]
+    assert appbox == reservation == 'artemis'
+
+
+def test_port_reservation_reconciliation_handles_move_retry_delete_and_node_scope(job_database):
+    stamp=main.now_iso()
+    with main.db() as con:
+        for client,node,port in (('same01','artemis',32455),('same02','orion',32455),('move01','artemis',32456)):
+            con.execute("""INSERT INTO appboxes(client_id,node_id,selected_node_id,path,containers_json,status,plex_port,created_at,updated_at)
+                VALUES(?,?,?,?,'[]','generated',?, ?,?)""",(client,node,node,str(job_database/client),port,stamp,stamp))
+    assert main.sync_port_reservations() >= 3
+    assert main.sync_port_reservations() >= 3
+    with main.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM port_reservations WHERE port=32455 AND status='reserved'").fetchone()[0] == 2
+        con.execute("UPDATE appboxes SET node_id='orion',selected_node_id='orion' WHERE client_id='move01'")
+        con.execute("UPDATE appboxes SET status='deleted' WHERE client_id='same01'")
+    main.sync_port_reservations()
+    with main.db() as con:
+        assert con.execute("SELECT status FROM port_reservations WHERE client_id='same01' ORDER BY reservation_id DESC LIMIT 1").fetchone()[0]=='released'
+        assert tuple(con.execute("SELECT node_id,status FROM port_reservations WHERE client_id='move01' ORDER BY reservation_id DESC LIMIT 1").fetchone())==('orion','reserved')
+        assert con.execute("SELECT COUNT(*) FROM port_reservations WHERE node_id='artemis' AND port=32456 AND status='reserved'").fetchone()[0]==0
+
+
+def test_same_node_port_collision_and_creation_rollback(job_database,monkeypatch):
+    monkeypatch.setattr(main,'BASE_DIR',job_database/'collisions')
+    _create_remote_appbox(job_database,client_id='first01',port='32460')
+    with pytest.raises(main.HTTPException) as collision:
+        _create_remote_appbox(job_database,client_id='second01',port='32460')
+    assert collision.value.status_code==409
+    with main.db() as con:
+        assert not con.execute("SELECT 1 FROM appboxes WHERE client_id='second01'").fetchone()
+        assert not con.execute("SELECT 1 FROM port_reservations WHERE client_id='second01'").fetchone()
+    assert not (job_database/'collisions'/'second01').exists()
+
+
+def test_appbox_lease_progress_expiry_late_result_and_restart_are_terminal(job_database):
+    job_id=main.create_job('ab40ah','deploy','lease',node_id='artemis')
+    main.update_job(job_id,'running',10,'started')
+    with main.db() as con:
+        con.execute("UPDATE node_agents SET capabilities_json=? WHERE node_id='artemis'",(json.dumps({'deployment_executor':True,'appbox_command_lease':True}),))
+        con.execute("""INSERT INTO control_plane_deployments(deployment_id,client_id,node_id,status,progress,created_at,updated_at)
+            VALUES('lease-deployment','ab40ah','artemis','prepared',0,?,?)""",(main.now_iso(),main.now_iso()))
+    command_id=main.queue_agent_command('artemis','appbox_action',{'_job_id':job_id,'client_id':'ab40ah','action':'deploy'})
+    with patch.object(main,'authenticate_agent'):
+        claimed=json.loads(main.agent_poll_commands('artemis',AgentResultRequest({})).body)['command']
+        assert claimed['command_id']==command_id
+        asyncio.run(main.agent_command_progress('artemis',command_id,AgentResultRequest({'stage':'checksum_reference','percent':63,'detail':'checksum'})))
+        asyncio.run(main.agent_command_progress('artemis',command_id,AgentResultRequest({'stage':'checksum_reference','percent':20,'detail':'old'})))
+    with main.db() as con:
+        command=con.execute("SELECT lease_expires_at,worker_activity_at,progress_json FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+        step=con.execute("SELECT progress FROM job_steps WHERE job_id=? AND step_key='checksum_reference'",(job_id,)).fetchone()[0]
+        assert command['lease_expires_at'] and command['worker_activity_at'] and step==63
+        con.execute("UPDATE agent_commands SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE command_id=?",(command_id,))
+    assert main.expire_appbox_command_leases()==1
+    stalled=next(item for item in main.list_control_nodes() if item['node_id']=='artemis')
+    assert stalled['status']=='online' and stalled['executor_health']=='stalled' and not stalled['execution_capable']
+    with main.db() as con:
+        before=tuple(con.execute("SELECT status,last_message FROM appboxes WHERE client_id='ab40ah'").fetchone())
+    with patch.object(main,'authenticate_agent'):
+        response=asyncio.run(main.agent_command_result('artemis',command_id,AgentResultRequest({'status':'success','result':{'state':'running'}})))
+        assert json.loads(response.body)['ignored']=='terminal_command'
+        assert json.loads(main.agent_poll_commands('artemis',AgentResultRequest({})).body)['command'] is None
+    recovered=next(item for item in main.list_control_nodes() if item['node_id']=='artemis')
+    assert recovered['executor_health']=='healthy' and recovered['execution_capable']
+    with main.db() as con:
+        assert con.execute("SELECT status FROM jobs WHERE job_id=?",(job_id,)).fetchone()[0]=='failed'
+        assert con.execute("SELECT status FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()[0]=='failed'
+        assert con.execute("SELECT status FROM control_plane_deployments WHERE deployment_id='lease-deployment'").fetchone()[0]=='failed'
+        assert tuple(con.execute("SELECT status,last_message FROM appboxes WHERE client_id='ab40ah'").fetchone())==before
+        assert con.execute("SELECT COUNT(*) FROM events WHERE event_type='late_agent_result_ignored'").fetchone()[0]==1
+
+
+def test_executor_health_is_distinct_from_agent_liveness(job_database):
+    with main.db() as con:
+        con.execute("UPDATE node_agents SET capabilities_json=? WHERE node_id='artemis'",(json.dumps({'deployment_executor':True,'appbox_command_lease':True}),))
+    command=main.queue_agent_command('artemis','appbox_action',{'action':'deploy'})
+    with main.db() as con:
+        con.execute("UPDATE agent_commands SET status='claimed',claimed_at=?,lease_expires_at='2000-01-01T00:00:00+00:00' WHERE command_id=?",(main.now_iso(),command))
+    node=next(item for item in main.list_control_nodes() if item['node_id']=='artemis')
+    assert node['status']=='online' and node['agent_online']
+    assert node['executor_health']=='stalled' and node['worker_lease_status']=='stalled'
+    assert not node['execution_capable'] and not node['actionable']
+
+
+def test_generated_deleted_capacity_remote_job_counts_and_legacy_error_migration(job_database):
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("INSERT INTO appboxes(client_id,node_id,path,containers_json,status,desired_state,observed_state,created_at,updated_at) VALUES('generated01','artemis','x','[]','generated','not_deployed','not_deployed',?,?)",(stamp,stamp))
+        con.execute("INSERT INTO appboxes(client_id,node_id,path,containers_json,status,desired_state,observed_state,created_at,updated_at) VALUES('deleted01','artemis','x','[]','deleted','deleted','missing',?,?)",(stamp,stamp))
+        for index,status in enumerate(('running','queued','success','failed','error','cancelled')):
+            con.execute("INSERT INTO jobs(job_id,node_id,action,title,status,progress,detail,created_at,updated_at) VALUES(?,?,'x','x',?,0,'',?,?)",(f'count-{index}','artemis',status,stamp,stamp))
+    node=next(item for item in main.list_control_nodes() if item['node_id']=='artemis')
+    assert node['not_deployed_appboxes']==1 and node['deleted_appboxes']==1
+    assert node['appbox_count']==2  # two legacy active fixture rows; history/generated excluded
+    status=json.loads(main.api_node_status('artemis').body)
+    assert status['running_jobs']==1 and status['queued_jobs']==1
+    main.init_database()
+    with main.db() as con:
+        assert con.execute("SELECT status FROM jobs WHERE job_id='count-4'").fetchone()[0]=='failed'
+    assert main.active_job_for('generated01') is None
+
+
+def test_reconciliation_stopped_has_no_port_drift_and_deleted_is_non_destructive(job_database):
+    stamp=main.now_iso(); deleted_path=job_database/'deleted-present'; deleted_path.mkdir()
+    with main.db() as con:
+        con.execute("UPDATE appboxes SET status='stopped',desired_state='stopped',observed_state='stopped',plex_port=32448,containers_json='[\"plex-appb-40ah\"]' WHERE client_id='ab40ah'")
+        con.execute("""INSERT INTO containers(container_id,node_id,appbox_id,name,state,ports_json,labels_json,mounts_json,networks_json,last_seen,updated_at)
+            VALUES('c-stopped','artemis','ab40ah','plex-appb-40ah','exited','[]','{}','[]','[]',?,?)""",(stamp,stamp))
+        con.execute("UPDATE appboxes SET status='deleted',desired_state='running',observed_state='unknown',path=? WHERE client_id='ab37ah'",(str(deleted_path),))
+    main.reconcile_node('artemis')
+    with main.db() as con:
+        stopped=con.execute("SELECT reconciliation_status,drift_json FROM appboxes WHERE client_id='ab40ah'").fetchone()
+        deleted=con.execute("SELECT desired_state,observed_state,reconciliation_status FROM appboxes WHERE client_id='ab37ah'").fetchone()
+    assert stopped['reconciliation_status']=='in_sync' and 'port_drift' not in stopped['drift_json']
+    assert tuple(deleted)==('deleted','present','cleanup_required') and deleted_path.exists()
