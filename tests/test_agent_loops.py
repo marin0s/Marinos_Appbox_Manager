@@ -54,7 +54,7 @@ class AgentLoopTests(unittest.TestCase):
                 return {'command':{'command_id':'one', 'command_type':'reference_build'}}
             return {}
 
-        def execute(config, command):
+        def execute(config, command, **_kwargs):
             calls['executions'] += 1
             command_entered.set()
             if not release.wait(5):

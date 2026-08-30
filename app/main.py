@@ -48,6 +48,7 @@ METRICS_INTERVAL = max(5, int(os.getenv("APPBOX_METRICS_INTERVAL", "10")))
 JOB_TIMEOUT_SECONDS = max(60, int(os.getenv("APPBOX_JOB_TIMEOUT_SECONDS", "900")))
 AGENT_CLAIM_TIMEOUT_SECONDS = max(5, int(os.getenv("APPBOX_AGENT_CLAIM_TIMEOUT_SECONDS", "60")))
 JOB_WATCHDOG_INTERVAL = max(15, int(os.getenv("APPBOX_JOB_WATCHDOG_INTERVAL", "30")))
+REFERENCE_COMMAND_LEASE_SECONDS = max(30, int(os.getenv("APPBOX_REFERENCE_COMMAND_LEASE_SECONDS", "180")))
 REFERENCE_ROOT = Path(os.getenv("APPBOX_REFERENCE_ROOT", "/srv/appbox-manager/reference-images"))
 PLEX_RANGE = range(int(os.getenv("APPBOX_PLEX_PORT_START", "32435")), int(os.getenv("APPBOX_PLEX_PORT_END", "32499")) + 1)
 TAUTULLI_RANGE = range(int(os.getenv("APPBOX_TAUTULLI_PORT_START", "8182")), int(os.getenv("APPBOX_TAUTULLI_PORT_END", "8249")) + 1)
@@ -1131,6 +1132,23 @@ def init_database() -> None:
         job_columns = {row["name"] for row in con.execute("PRAGMA table_info(jobs)").fetchall()}
         if "options_json" not in job_columns:
             con.execute("ALTER TABLE jobs ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}'")
+
+        command_columns = {row["name"] for row in con.execute("PRAGMA table_info(agent_commands)").fetchall()}
+        for column, definition in {
+            "lease_expires_at": "TEXT",
+            "cancel_requested_at": "TEXT",
+            "progress_json": "TEXT NOT NULL DEFAULT '{}'",
+        }.items():
+            if column not in command_columns:
+                con.execute(f"ALTER TABLE agent_commands ADD COLUMN {column} {definition}")
+
+        build_columns = {row["name"] for row in con.execute("PRAGMA table_info(reference_builds)").fetchall()}
+        for column, definition in {
+            "cancel_requested_at": "TEXT",
+            "cancelled_at": "TEXT",
+        }.items():
+            if column not in build_columns:
+                con.execute(f"ALTER TABLE reference_builds ADD COLUMN {column} {definition}")
 
         profile_columns = {
             row["name"] for row in con.execute(
@@ -2718,7 +2736,11 @@ def queue_reference_capture(build_id: str, discovery: dict[str, Any]) -> str:
     command_id = queue_agent_command(build["source_node_id"], "reference_build", payload)
     stamp = now_iso()
     with db_lock, db() as con:
-        con.execute("UPDATE reference_builds SET status='building',current_stage='capture',progress=55,completed_at=NULL,updated_at=? WHERE build_id=?", (stamp, build_id))
+        con.execute("UPDATE reference_builds SET status='building',current_stage='capture',progress=25,completed_at=NULL,updated_at=? WHERE build_id=?", (stamp, build_id))
+        if build["job_id"]:
+            con.execute("UPDATE job_steps SET status='running',progress=0,detail='Capture distante en attente du worker.',executor=?,started_at=COALESCE(started_at,?) WHERE job_id=? AND step_key='capture'",
+                        (f"agent-{build['source_node_id']}", stamp, build["job_id"]))
+            con.execute("UPDATE jobs SET status='running',progress=25,detail='Capture Plex en attente du worker.',updated_at=?,finished_at=NULL WHERE job_id=?", (stamp, build["job_id"]))
         con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'capture','info',?,'{}',?)", (build_id, "Capture Plex assainie mise en file sur le node source.", stamp))
     return command_id
 
@@ -2738,10 +2760,27 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
     if existing and existing["status"] == "published":
         return
     stamp = now_iso()
+    if status == 'cancelled':
+        detail = error or 'Capture annulée par l’opérateur.'
+        with db_lock, db() as con:
+            build = con.execute("SELECT job_id FROM reference_builds WHERE build_id=?",(build_id,)).fetchone()
+            con.execute("UPDATE reference_builds SET status='cancelled',current_stage='cancelled',error_text=?,cancelled_at=?,completed_at=?,updated_at=? WHERE build_id=?",
+                        (detail,stamp,stamp,stamp,build_id))
+            if build and build['job_id']:
+                con.execute("UPDATE job_steps SET status='cancelled',detail=?,finished_at=? WHERE job_id=? AND status='running'",(detail,stamp,build['job_id']))
+                con.execute("UPDATE job_steps SET status='skipped',progress=100,detail='Étape non exécutée après annulation.' WHERE job_id=? AND status='pending'",(build['job_id'],))
+                con.execute("UPDATE jobs SET status='cancelled',detail=?,updated_at=?,finished_at=? WHERE job_id=?",(detail,stamp,stamp,build['job_id']))
+            con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'cancelled','warning',?,'{}',?)",(build_id,detail,stamp))
+        return
     if status != "success":
         detail = error or "Échec de la capture Plex."
         with db_lock, db() as con:
+            build = con.execute("SELECT job_id FROM reference_builds WHERE build_id=?",(build_id,)).fetchone()
             con.execute("UPDATE reference_builds SET status='build_failed',current_stage='capture',progress=100,error_text=?,completed_at=?,updated_at=? WHERE build_id=?", (detail, stamp, stamp, build_id))
+            if build and build['job_id']:
+                con.execute("UPDATE job_steps SET status='failed',progress=100,detail=?,finished_at=? WHERE job_id=? AND step_key='capture'",(detail,stamp,build['job_id']))
+                con.execute("UPDATE job_steps SET status='skipped',progress=100,detail='Étape non exécutée.' WHERE job_id=? AND status='pending'",(build['job_id'],))
+                con.execute("UPDATE jobs SET status='error',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?",(detail,stamp,stamp,build['job_id']))
             con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'capture','error',?,'{}',?)", (build_id, detail, stamp))
         return
     with db() as con:
@@ -2760,6 +2799,15 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
         finalize_reference_build_command(command, "failed", {}, "Archive de référence invalide après téléversement.")
         return
     result = {**result, "uncompressed_size_bytes": validated["uncompressed_size_bytes"]}
+    with db_lock, db() as con:
+        con.execute("UPDATE reference_builds SET current_stage='validation',progress=MAX(progress,85),updated_at=? WHERE build_id=?",(now_iso(),build_id))
+    if build["job_id"]:
+        update_step(build["job_id"], "capture", "success", "Archive capturée et téléversée.", 100, f"agent-{build['source_node_id']}")
+        update_step(build["job_id"], "sanitize", "success", "Données d’identité assainies par l’agent.", 100, f"agent-{build['source_node_id']}")
+        update_step(build["job_id"], "package", "success", "Archive et checksum produits.", 100, f"agent-{build['source_node_id']}")
+        update_step(build["job_id"], "transfer", "success", "Archive reçue par le Control Plane.", 100, f"agent-{build['source_node_id']}")
+        update_step(build["job_id"], "validate_reference", "success", "Archive et SQLite validés.", 100)
+        update_job(build["job_id"], "running", 90, "Validation terminée, publication en cours.")
     target_image_id = str(build["image_id"] or "").strip()
     with db() as con:
         target_image = con.execute(
@@ -2816,6 +2864,9 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
                     (image_id,version_id,json.dumps({**result,'manifest':manifest},ensure_ascii=False),stamp,stamp,build_id))
         con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'published','success',?,?,?)",
                     (build_id,f"Image {image_id} version {version_label} publiée.",json.dumps({'image_id':image_id,'version_id':version_id,'sha256':checksum},ensure_ascii=False),stamp))
+    if build["job_id"]:
+        update_step(build["job_id"], "publish", "success", f"Version {version_label} publiée.", 100)
+        update_job(build["job_id"], "success", 100, f"Référence {image_name} publiée.")
 
 
 def deployment_images(media_type: str | None = None) -> list[dict[str, Any]]:
@@ -3485,10 +3536,10 @@ def step_rows(job_id: str) -> list[dict[str, Any]]:
 
 def workflow_statistics(steps: list[dict[str, Any]]) -> dict[str, Any]:
     groups = {
-        "validation": {"duration": 0.0, "steps": 0},
-        "docker": {"duration": 0.0, "steps": 0},
-        "healthcheck": {"duration": 0.0, "steps": 0},
-        "integration": {"duration": 0.0, "steps": 0},
+        "validation": {"duration": 0.0, "steps": 0, "duration_known": False},
+        "docker": {"duration": 0.0, "steps": 0, "duration_known": False},
+        "healthcheck": {"duration": 0.0, "steps": 0, "duration_known": False},
+        "integration": {"duration": 0.0, "steps": 0, "duration_known": False},
     }
     for step in steps:
         key = step.get("step_key", "")
@@ -3503,8 +3554,9 @@ def workflow_statistics(steps: list[dict[str, Any]]) -> dict[str, Any]:
             group = "integration"
         groups[group]["duration"] = round(groups[group]["duration"] + duration, 3)
         groups[group]["steps"] += 1
+        groups[group]["duration_known"] = groups[group]["duration_known"] or step.get("duration_seconds") is not None
 
-    completed = [step for step in steps if step.get("status") in {"success", "warning", "failed", "skipped"}]
+    completed = [step for step in steps if step.get("status") in {"success", "warning", "failed", "skipped", "cancelled"}]
     return {
         "total_steps": len(steps),
         "completed_steps": len(completed),
@@ -4290,6 +4342,7 @@ def job_watchdog_loop() -> None:
     while not worker_stop.wait(JOB_WATCHDOG_INTERVAL):
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=JOB_TIMEOUT_SECONDS)).isoformat()
         try:
+            expire_reference_command_leases()
             with db_lock, db() as con:
                 rows = con.execute("""
                     SELECT job_id,client_id,action,updated_at FROM jobs
@@ -4304,6 +4357,23 @@ def job_watchdog_loop() -> None:
                 )
         except Exception as exc:
             print(f"[watchdog] erreur: {exc}", flush=True)
+
+
+def expire_reference_command_leases(now: datetime | None = None) -> int:
+    """Fail orphaned long captures once their independently renewed lease expires."""
+    cutoff = (now or datetime.now(timezone.utc)).isoformat()
+    expired: list[sqlite3.Row] = []
+    with db_lock, db() as con:
+        rows = con.execute("""SELECT * FROM agent_commands
+            WHERE command_type='reference_build' AND status='claimed'
+              AND lease_expires_at IS NOT NULL AND lease_expires_at<=?""",(cutoff,)).fetchall()
+        for row in rows:
+            changed = con.execute("UPDATE agent_commands SET status='failed',completed_at=?,error_text=? WHERE command_id=? AND status='claimed'",
+                                  (cutoff,'Lease de capture expirée : worker ou agent indisponible.',row['command_id'])).rowcount
+            if changed: expired.append(row)
+    for row in expired:
+        finalize_reference_build_command(row,'failed',{},'Lease de capture expirée : worker ou agent indisponible.')
+    return len(expired)
 
 
 def docker_counts() -> tuple[int, int]:
@@ -4862,6 +4932,8 @@ async def agent_heartbeat(node_id: str, request: Request):
     metrics = payload.get("metrics") or {}
     agent_version = str(payload.get("agent_version") or "unknown")
     endpoint = str(payload.get("endpoint") or "")
+    active_command_id = str(payload.get("active_command_id") or "")
+    cancel_requested = False
     with db_lock, db() as con:
         node = con.execute(
             "SELECT node_id FROM nodes WHERE node_id=?",
@@ -4899,10 +4971,19 @@ async def agent_heartbeat(node_id: str, request: Request):
         if metrics:
             store_agent_metrics(con, node_id, metrics, agent_version,
                                 payload.get('metrics_collected_at') or stamp)
+        if active_command_id:
+            command = con.execute("SELECT command_type,status,cancel_requested_at FROM agent_commands WHERE command_id=? AND node_id=?",
+                                  (active_command_id, node_id)).fetchone()
+            if command and command['command_type'] == 'reference_build' and command['status'] == 'claimed':
+                cancel_requested = bool(command['cancel_requested_at'])
+                if not cancel_requested:
+                    lease = (datetime.now(timezone.utc) + timedelta(seconds=REFERENCE_COMMAND_LEASE_SECONDS)).isoformat()
+                    con.execute("UPDATE agent_commands SET lease_expires_at=? WHERE command_id=?", (lease, active_command_id))
     return JSONResponse({
         "status": "ok",
         "server_version": VERSION,
         "heartbeat_interval": min(60, AGENT_ONLINE_SECONDS // 3),
+        "cancel_active_command": cancel_requested,
     })
 
 
@@ -4997,14 +5078,52 @@ def agent_poll_commands(node_id: str, request: Request):
         if row['command_type'] in {'reference_discovery', 'reference_build'}:
             if not node or node['status'] != 'online' or not node['agent_online']:
                 return JSONResponse({'command': None, 'reason': 'node_unavailable'})
+        claimed_at = now_iso()
+        lease = ((datetime.now(timezone.utc) + timedelta(seconds=REFERENCE_COMMAND_LEASE_SECONDS)).isoformat()
+                 if row['command_type'] == 'reference_build' else None)
         con.execute("""
             UPDATE agent_commands
-            SET status='claimed',claimed_at=?
+            SET status='claimed',claimed_at=?,lease_expires_at=?
             WHERE command_id=? AND status='queued'
-        """, (now_iso(), row["command_id"]))
+        """, (claimed_at, lease, row["command_id"]))
     command = dict(row)
     command["payload"] = json.loads(command.pop("payload_json") or "{}")
     return JSONResponse({"command": command})
+
+
+@app.post("/api/agent/v1/{node_id}/commands/{command_id}/progress")
+async def agent_command_progress(node_id: str, command_id: str, request: Request):
+    authenticate_agent(request, node_id)
+    payload = await request.json()
+    bytes_written = max(0, int(payload.get('bytes_written') or 0))
+    estimated = max(1, int(payload.get('estimated_payload_bytes') or 1))
+    stage = str(payload.get('stage') or 'capture')[:64]
+    stamp = now_iso()
+    with db_lock, db() as con:
+        command = con.execute("SELECT * FROM agent_commands WHERE command_id=? AND node_id=? AND command_type='reference_build'",
+                              (command_id, node_id)).fetchone()
+        if not command or command['status'] != 'claimed':
+            raise HTTPException(409, 'Commande de capture inactive.')
+        if command['cancel_requested_at']:
+            return JSONResponse({'status':'cancelling','cancel_requested':True})
+        data = {'stage':stage,'bytes_written':bytes_written,'estimated_payload_bytes':estimated,'reported_at':stamp}
+        con.execute("UPDATE agent_commands SET progress_json=?,lease_expires_at=? WHERE command_id=?",
+                    (json.dumps(data,ensure_ascii=False),(datetime.now(timezone.utc)+timedelta(seconds=REFERENCE_COMMAND_LEASE_SECONDS)).isoformat(),command_id))
+        try: build_id = str(json.loads(command['payload_json'] or '{}').get('build_id') or '')
+        except Exception: build_id = ''
+        build = con.execute("SELECT job_id,progress FROM reference_builds WHERE build_id=?",(build_id,)).fetchone() if build_id else None
+        if build:
+            ratio = min(1.0, bytes_written / estimated)
+            global_progress = max(int(build['progress'] or 0), 25 + round(ratio * 50))
+            detail = f"Capture en cours : {bytes_written} / {estimated} octets estimés."
+            con.execute("UPDATE reference_builds SET progress=?,current_stage=?,updated_at=? WHERE build_id=?",
+                        (global_progress,stage,stamp,build_id))
+            if build['job_id']:
+                con.execute("UPDATE job_steps SET status='running',progress=MAX(progress,?),detail=? WHERE job_id=? AND step_key='capture'",
+                            (round(ratio*100),detail,build['job_id']))
+                con.execute("UPDATE jobs SET status='running',progress=?,detail=?,updated_at=? WHERE job_id=?",
+                            (global_progress,detail,stamp,build['job_id']))
+    return JSONResponse({'status':'ok','cancel_requested':False})
 
 
 @app.post("/api/agent/v1/{node_id}/commands/{command_id}/result")
@@ -5012,7 +5131,7 @@ async def agent_command_result(node_id: str, command_id: str, request: Request):
     authenticate_agent(request, node_id)
     payload = redact_result(await request.json())
     status = payload.get("status")
-    if status not in {"success", "failed"}:
+    if status not in {"success", "failed", "cancelled"}:
         raise HTTPException(400, "Statut de commande invalide.")
     with db_lock, db() as con:
         command = con.execute("""
@@ -5026,6 +5145,8 @@ async def agent_command_result(node_id: str, command_id: str, request: Request):
             # can confirm activation/rollback; a late result must not override it.
             return JSONResponse({'status': 'ok', 'confirmation': 'helper_required'})
         if command['command_type'] == 'appbox_action' and command['status'] in {'success', 'failed'}:
+            return JSONResponse({'status':'ok', 'ignored':'terminal_command'})
+        if command['command_type'] == 'reference_build' and command['status'] in {'success','failed','cancelled'}:
             return JSONResponse({'status':'ok', 'ignored':'terminal_command'})
         con.execute("""
             UPDATE agent_commands
@@ -5296,18 +5417,18 @@ def launch_reference_discovery(build_id: str, source_instance: str = "") -> tupl
         raise HTTPException(409, "L’agent doit être mis à jour en version 1.5.1 ou ultérieure pour analyser Plex.")
     job_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     stamp = now_iso()
-    steps = workflow_definition("reference_discovery")
+    # One user action owns one durable workflow through publication. Discovery
+    # and capture remain technical agent commands under this global job.
+    steps = workflow_definition("reference_build")
     with db_lock, db() as con:
         agent_upgrades.require_idle(con, build["source_node_id"])
         con.execute("""INSERT INTO jobs(job_id,client_id,node_id,action,title,status,progress,detail,created_at,updated_at,started_at,options_json)
-                       VALUES(?,NULL,?,'reference_discovery',?,'running',5,?,?,?,?,'{}')""",
-                    (job_id, build["source_node_id"], f"Analyse Plex — {build['display_name']}", "Commande de découverte en préparation.", stamp, stamp, stamp))
+                       VALUES(?,NULL,?,'reference_build',?,'running',2,?,?,?,?,'{}')""",
+                    (job_id, build["source_node_id"], f"Création de référence — {build['display_name']}", "Découverte de la source en préparation.", stamp, stamp, stamp))
         con.executemany("""INSERT INTO job_steps(job_id,step_key,title,status,progress,detail,executor,resources_json)
                            VALUES(?,?,?,'pending',0,'','control-plane','{}')""", [(job_id,k,t) for k,t in steps])
-        con.execute("UPDATE job_steps SET status='success',progress=100,detail=?,executor=? WHERE job_id=? AND step_key='connecting'",
+        con.execute("UPDATE job_steps SET status='running',progress=20,detail=?,executor=? WHERE job_id=? AND step_key='discover'",
                     (f"Agent {build['source_node_id']} en ligne.", f"agent-{build['source_node_id']}", job_id))
-        con.execute("UPDATE job_steps SET status='running',progress=20,detail=?,executor=? WHERE job_id=? AND step_key='discovering'",
-                    ("Commande de découverte distante envoyée.", f"agent-{build['source_node_id']}", job_id))
         con.execute("UPDATE reference_builds SET job_id=?,status='analyzing',current_stage='discovering',progress=10,started_at=COALESCE(started_at,?),updated_at=?,source_instance=? WHERE build_id=?",
                     (job_id, stamp, stamp, source_instance.strip() or None, build_id))
         con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'discovering','info',?,'{}',?)",
@@ -5329,6 +5450,10 @@ def finalize_reference_discovery_command(command: sqlite3.Row, status: str, resu
     job_id = str(command_payload.get("job_id") or "")
     if not build_id or not job_id:
         return
+    with db() as con:
+        build_state = con.execute("SELECT status FROM reference_builds WHERE build_id=?",(build_id,)).fetchone()
+    if build_state and build_state['status'] in {'cancelling','cancelled'}:
+        return
     stamp = now_iso()
     if status == "success":
         preflight = result.get("preflight") or {}
@@ -5336,25 +5461,37 @@ def finalize_reference_discovery_command(command: sqlite3.Row, status: str, resu
         totals = result.get("totals") or {}
         detail = f"Analyse terminée : {len(result.get('libraries') or [])} bibliothèque(s), {totals.get('movies',0)} film(s), {totals.get('shows',0)} série(s), compatibilité {score}/5."
         with db_lock, db() as con:
-            con.execute("UPDATE reference_builds SET status='discovered',current_stage='completed',progress=100,source_report_json=?,preflight_report_json=?,error_text=NULL,completed_at=?,updated_at=? WHERE build_id=?",
-                        (json.dumps(result,ensure_ascii=False), json.dumps(preflight,ensure_ascii=False), stamp, stamp, build_id))
-            for key in ("connecting","discovering","collecting_metadata","compatibility_check","completed"):
-                con.execute("UPDATE job_steps SET status='success',progress=100,detail=?,executor=? WHERE job_id=? AND step_key=?", (detail, f"agent-{command['node_id']}", job_id, key))
-            con.execute("UPDATE jobs SET status='success',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?", (detail, stamp, stamp, job_id))
+            con.execute("UPDATE reference_builds SET status='discovered',current_stage='preflight',progress=20,source_report_json=?,preflight_report_json=?,error_text=NULL,completed_at=NULL,updated_at=? WHERE build_id=?",
+                        (json.dumps(result,ensure_ascii=False), json.dumps(preflight,ensure_ascii=False), stamp, build_id))
+            con.execute("UPDATE job_steps SET status='success',progress=100,detail=?,executor=?,started_at=COALESCE(started_at,?),finished_at=? WHERE job_id=? AND step_key='discover'",
+                        (detail, f"agent-{command['node_id']}", stamp, stamp, job_id))
+            con.execute("UPDATE job_steps SET status=?,progress=100,detail=?,executor='control-plane',started_at=COALESCE(started_at,?),finished_at=? WHERE job_id=? AND step_key='preflight'",
+                        ('success' if preflight.get('can_build') else 'failed', 'Pré-validation autorisée.' if preflight.get('can_build') else '; '.join(preflight.get('blockers') or ['Pré-validation refusée.']), stamp, stamp, job_id))
+            con.execute("UPDATE jobs SET status='running',progress=20,detail=?,updated_at=?,finished_at=NULL WHERE job_id=?", (detail, stamp, job_id))
             con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'completed','success',?,?,?)",
                         (build_id, detail, json.dumps({"score":score},ensure_ascii=False), stamp))
+        if not preflight.get('can_build'):
+            blocker='; '.join(preflight.get('blockers') or ['Pré-validation disque refusée.'])
+            with db_lock, db() as con:
+                con.execute("UPDATE reference_builds SET status='build_failed',current_stage='preflight',error_text=?,completed_at=?,updated_at=? WHERE build_id=?",(blocker,stamp,stamp,build_id))
+                con.execute("UPDATE job_steps SET status='skipped',progress=100,detail='Étape non exécutée après le preflight.' WHERE job_id=? AND status='pending'",(job_id,))
+                con.execute("UPDATE jobs SET status='error',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?",(blocker,stamp,stamp,job_id))
+            return
         try:
             queue_reference_capture(build_id, result)
         except Exception as exc:
             failed_at = now_iso()
             with db_lock, db() as con:
                 con.execute("UPDATE reference_builds SET status='build_failed',current_stage='capture',error_text=?,completed_at=?,updated_at=? WHERE build_id=?", (str(exc), failed_at, failed_at, build_id))
+                con.execute("UPDATE job_steps SET status='failed',progress=100,detail=?,started_at=COALESCE(started_at,?),finished_at=? WHERE job_id=? AND step_key='capture'", (str(exc), failed_at, failed_at, job_id))
+                con.execute("UPDATE jobs SET status='error',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?", (str(exc), failed_at, failed_at, job_id))
                 con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'capture','error',?,'{}',?)", (build_id, str(exc), failed_at))
     else:
         detail = error or "Échec de la découverte Plex."
         with db_lock, db() as con:
             con.execute("UPDATE reference_builds SET status='discovery_failed',current_stage='discovering',progress=100,error_text=?,completed_at=?,updated_at=? WHERE build_id=?", (detail, stamp, stamp, build_id))
-            con.execute("UPDATE job_steps SET status='failed',progress=100,detail=?,executor=? WHERE job_id=? AND step_key='discovering'", (detail, f"agent-{command['node_id']}", job_id))
+            con.execute("UPDATE job_steps SET status='failed',progress=100,detail=?,executor=?,started_at=COALESCE(started_at,?),finished_at=? WHERE job_id=? AND step_key='discover'", (detail, f"agent-{command['node_id']}", stamp, stamp, job_id))
+            con.execute("UPDATE job_steps SET status='skipped',progress=100,detail='Étape non exécutée.' WHERE job_id=? AND status='pending'", (job_id,))
             con.execute("UPDATE jobs SET status='error',progress=100,detail=?,updated_at=?,finished_at=? WHERE job_id=?", (detail, stamp, stamp, job_id))
             con.execute("INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at) VALUES(?,'discovering','error',?,'{}',?)", (build_id, detail, stamp))
 
@@ -5381,6 +5518,47 @@ def retry_reference_build(build_id: str):
     return RedirectResponse("/reference-images", status_code=303)
 
 
+@app.post("/reference-builds/{build_id}/cancel")
+def cancel_reference_build(build_id: str):
+    stamp = now_iso()
+    immediate: sqlite3.Row | None = None
+    with db_lock, db() as con:
+        build = con.execute("SELECT * FROM reference_builds WHERE build_id=?",(build_id,)).fetchone()
+        if not build:
+            raise HTTPException(404,"Build de référence introuvable.")
+        if build['status'] in {'published','build_failed','discovery_failed','cancelled'}:
+            if build['status'] == 'cancelled':
+                return RedirectResponse(f"/reference-builds/{build_id}",status_code=303)
+            raise HTTPException(409,"Ce build est déjà terminé.")
+        command = con.execute("""SELECT * FROM agent_commands WHERE command_type='reference_build'
+            AND json_extract(payload_json,'$.build_id')=? AND status IN ('queued','claimed')
+            ORDER BY created_at DESC LIMIT 1""",(build_id,)).fetchone()
+        con.execute("UPDATE reference_builds SET status='cancelling',current_stage='cancelling',cancel_requested_at=?,updated_at=? WHERE build_id=?",
+                    (stamp,stamp,build_id))
+        if command:
+            if command['status'] == 'queued':
+                con.execute("UPDATE agent_commands SET status='cancelled',cancel_requested_at=?,completed_at=? WHERE command_id=?",
+                            (stamp,stamp,command['command_id']))
+                immediate = command
+            else:
+                con.execute("UPDATE agent_commands SET cancel_requested_at=? WHERE command_id=?",(stamp,command['command_id']))
+        else:
+            # Discovery may still be active; its result will observe the terminal build.
+            con.execute("UPDATE reference_builds SET status='cancelled',current_stage='cancelled',cancelled_at=?,completed_at=? WHERE build_id=?",
+                        (stamp,stamp,build_id))
+            if build['job_id']:
+                con.execute("UPDATE jobs SET status='cancelled',detail='Annulé par l’opérateur.',updated_at=?,finished_at=? WHERE job_id=?",
+                            (stamp,stamp,build['job_id']))
+    if immediate:
+        finalize_reference_build_command(immediate,'cancelled',{},'Capture annulée avant exécution.')
+    storage = (REFERENCE_ROOT / 'builds' / slugify_identifier(build_id)).resolve()
+    expected = (REFERENCE_ROOT / 'builds').resolve()
+    if storage.parent == expected and storage.exists():
+        for partial in storage.glob('*.uploading'):
+            partial.unlink(missing_ok=True)
+    return RedirectResponse(f"/reference-builds/{build_id}",status_code=303)
+
+
 @app.get("/api/reference-images")
 def api_reference_images():
     return JSONResponse({"images": list_reference_images(), "builds": list_reference_builds()})
@@ -5396,8 +5574,9 @@ def api_reference_build_detail(build_id: str):
     with db() as con:
         row=con.execute("SELECT * FROM reference_builds WHERE build_id=?",(build_id,)).fetchone()
         logs=[dict(item) for item in con.execute("SELECT * FROM reference_build_logs WHERE build_id=? ORDER BY log_id",(build_id,)).fetchall()]
+        commands=[dict(item) for item in con.execute("SELECT command_id,command_type,status,created_at,claimed_at,completed_at,progress_json FROM agent_commands WHERE json_extract(payload_json,'$.build_id')=? ORDER BY created_at",(build_id,)).fetchall()]
     if not row: raise HTTPException(404,"Build de référence introuvable.")
-    return JSONResponse({"build":dict(row),"logs":logs})
+    return JSONResponse({"build":dict(row),"logs":logs,"commands":commands})
 
 
 @app.post("/reference-builds/draft")
@@ -5501,11 +5680,15 @@ def reference_build_page(request: Request, build_id: str):
         logs=[dict(row) for row in con.execute(
             "SELECT * FROM reference_build_logs WHERE build_id=? ORDER BY log_id", (build_id,)
         ).fetchall()]
+        job_row=con.execute("SELECT * FROM jobs WHERE job_id=?",(build.get('job_id'),)).fetchone() if build.get('job_id') else None
+        commands=[dict(row) for row in con.execute("SELECT command_id,command_type,status,created_at,claimed_at,completed_at,progress_json FROM agent_commands WHERE json_extract(payload_json,'$.build_id')=? ORDER BY created_at",(build_id,)).fetchall()]
     return templates.TemplateResponse(request, "reference_build_detail.html", {
         "mode": APPBOX_MODE,
         "hostname": HOSTNAME,
         "build": build,
         "logs": logs,
+        "job": job_dict(job_row,include_steps=True) if job_row else None,
+        "commands": commands,
         "image": get_reference_image(build.get("image_id")) if build.get("image_id") else None,
         "active_page": "reference_images",
     })
@@ -5715,6 +5898,8 @@ async def upload_reference_build_archive(node_id: str, build_id: str, request: R
     final = storage / "reference.tar.gz"
     if build["status"] == "published":
         raise HTTPException(409, "Version publiée immuable.")
+    if build["status"] in {"cancelling","cancelled","build_failed"}:
+        raise HTTPException(409, "Ce build n’accepte plus de téléversement.")
     temporary = storage / ("reference." + uuid.uuid4().hex + ".uploading")
     upload_lock = storage / ".upload.lock"
     try:
@@ -5729,6 +5914,11 @@ async def upload_reference_build_archive(node_id: str, build_id: str, request: R
                 if not chunk:
                     continue
                 handle.write(chunk); digest.update(chunk); size += len(chunk)
+                if size % (64 * 1024 * 1024) < len(chunk):
+                    with db() as con:
+                        state=con.execute("SELECT status FROM reference_builds WHERE build_id=?",(build_id,)).fetchone()
+                    if not state or state['status'] in {'cancelling','cancelled','build_failed'}:
+                        raise HTTPException(409,"Téléversement interrompu par l’annulation du build.")
                 if size > 500 * 1024 * 1024 * 1024:
                     raise HTTPException(413, "Archive de référence trop volumineuse.")
             handle.flush()

@@ -163,7 +163,7 @@ class PlexSourceCaptureTests(unittest.TestCase):
             "databases": {"size_bytes": 0, "file_count": 0, "names": []},
         }
 
-        def fake_archive(_config_path, _overlay, archive):
+        def fake_archive(_config_path, _overlay, archive, *_args):
             archive.parent.mkdir(parents=True, exist_ok=True)
             archive.write_bytes(b"archive")
             return archive_report

@@ -2,6 +2,14 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Fiabilité et progression des Reference Builds
+- Un seul workflow global couvre désormais découverte, preflight, capture, validation et publication ; les commandes agent restent des sous-jobs techniques et ne peuvent plus afficher un faux succès à 100 %.
+- Progression de capture remontée périodiquement depuis les octets réellement écrits, persistée de façon monotone et limitée en fréquence. États, libellés et durées de l’inspecteur reflètent les données réellement disponibles.
+- Preflight du filesystem temporaire bloquant avec besoin `payload estimé + max(5 GiB, 10 %)`, marge configurable et second contrôle juste avant la capture.
+- Annulation coopérative et état `cancelled` : signal par heartbeat indépendant, interruption de l’écriture/transfert, nettoyage des temporaires et terminaison cohérente du build, job et de la commande.
+- Lease configurable de 180 s par défaut sur les captures longues, renouvelée par heartbeat ; une commande orpheline devient failed et un résultat tardif ne relance ni publication ni second worker.
+- Migration SQLite additive des champs de lease, progression et annulation. La capture Plex live reste non intrusive et ne stoppe/redémarre jamais la source.
+
 ### Compatibilité du bootstrap legacy monolithique
 - Bootstrap des agents alpha.4 monolithiques sans `reference_contract.py`, ainsi que des installations modulaires : agent principal obligatoire, contrats/client optionnels uniquement s'ils sont absents. Fichiers présents invalides ou illisibles refusés avant réservation/activation.
 - Snapshot des seuls fichiers runtime réellement installés, sans copie de modules de la candidate ; identité déterministe calculée sur leurs octets. Lecture statique de la déclaration historique `VERSION`, sans changer le contrat des packages managed.

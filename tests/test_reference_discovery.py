@@ -37,10 +37,10 @@ class ReferenceDiscoveryTests(unittest.TestCase):
         with main.db() as con:
             con.execute(
                 """INSERT INTO jobs(job_id,client_id,node_id,action,title,status,progress,detail,created_at,updated_at,started_at,options_json)
-                   VALUES(?,NULL,'ouranos','reference_discovery','Discovery','running',10,'',?,?,?,'{}')""",
+                   VALUES(?,NULL,'ouranos','reference_build','Reference build','running',10,'',?,?,?,'{}')""",
                 (job_id, stamp, stamp, stamp),
             )
-            for key, title in main.workflow_definition("reference_discovery"):
+            for key, title in main.workflow_definition("reference_build"):
                 con.execute(
                     """INSERT INTO job_steps(job_id,step_key,title,status,progress,detail,executor,resources_json)
                        VALUES(?,?,?,'pending',0,'','control-plane','{}')""",
@@ -77,12 +77,13 @@ class ReferenceDiscoveryTests(unittest.TestCase):
                 (self.build_id,),
             ).fetchone()
             job = con.execute("SELECT status,progress FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-            steps = con.execute("SELECT status FROM job_steps WHERE job_id=?", (job_id,)).fetchall()
+            steps = con.execute("SELECT status FROM job_steps WHERE job_id=? ORDER BY step_id", (job_id,)).fetchall()
             capture = con.execute("SELECT command_type,status FROM agent_commands WHERE command_type='reference_build' AND node_id='ouranos'").fetchone()
-        self.assertEqual(build[:3], ("building", "capture", 55))
+        self.assertEqual(build[:3], ("building", "capture", 25))
         self.assertTrue(json.loads(build[3])["read_only"])
-        self.assertEqual(job, ("success", 100))
-        self.assertTrue(all(row[0] == "success" for row in steps))
+        self.assertEqual(job, ("running", 25))
+        self.assertEqual([row[0] for row in steps[:3]], ["success", "success", "running"])
+        self.assertTrue(all(row[0] == "pending" for row in steps[3:]))
         self.assertEqual(capture, ("reference_build", "queued"))
 
     def test_failed_result_is_persisted(self):
@@ -94,6 +95,18 @@ class ReferenceDiscoveryTests(unittest.TestCase):
         self.assertEqual(build, ("discovery_failed", "Instance Plex introuvable"))
         self.assertEqual(job[0], "error")
         self.assertIn("introuvable", job[1])
+
+    def test_blocking_disk_preflight_never_queues_capture(self):
+        job_id, command = self._seed_command_and_job()
+        result={"libraries":[],"totals":{},"preflight":{"compatibility_score":1,"can_build":False,
+            "estimated_payload_bytes":35,"required_free_bytes":40,"temporary_free_bytes":34,
+            "missing_free_bytes":6,"warnings":[],"blockers":["Espace temporaire insuffisant."]}}
+        main.finalize_reference_discovery_command(command,"success",result,None)
+        with main.db() as con:
+            build=con.execute("SELECT status,current_stage,error_text FROM reference_builds WHERE build_id=?",(self.build_id,)).fetchone()
+            captures=con.execute("SELECT COUNT(*) FROM agent_commands WHERE command_type='reference_build'").fetchone()[0]
+        self.assertEqual(tuple(build),("build_failed","preflight","Espace temporaire insuffisant."))
+        self.assertEqual(captures,0)
 
 
 if __name__ == "__main__":

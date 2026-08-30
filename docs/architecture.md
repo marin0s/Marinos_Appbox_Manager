@@ -21,11 +21,19 @@ Les communications sont initiées par les agents vers le Control Plane. Aucun ac
 ## Cycle de vie des références
 
 La bibliothèque et la fiche ne possèdent aucun moteur métier propre. Le wizard crée un
-`reference_build`, puis réutilise découverte, preflight, capture, upload, validation et
-publication. Pour une nouvelle version, `reference_builds.image_id` désigne explicitement
+`reference_build` et un job global durable, puis réutilise découverte, preflight, capture,
+upload, validation et publication. Le job global est la source de vérité ; les deux
+`agent_commands` discovery/build sont des sous-jobs et ne le terminent pas. La progression
+de capture est fondée sur `bytes_written / estimated_payload_bytes`, projetée de façon
+monotone, puis les jalons validation/publication terminent à 100 %. Pour une nouvelle
+version, `reference_builds.image_id` désigne explicitement
 la référence cible. La publication conserve cet `image_id`, insère une nouvelle version
 et bascule `current_version_id`; l’ancienne version devient historique dans l’UX. Aucun
-schéma supplémentaire ni changement agent n’est requis. Voir
+Une lease sur la commande longue est renouvelée par le heartbeat indépendant. Son
+expiration échoue le build sans double exécution ni résultat tardif accepté. L’annulation
+coopérative emprunte le même heartbeat et rend build/job/commande `cancelled` après
+nettoyage agent. Le preflight disque est rejoué avant capture avec réserve configurable.
+La migration ajoute uniquement des colonnes nullable/default aux tables existantes. Voir
 [le cycle de vie UX](reference-lifecycle.md).
 
 ## Suppression des Reference Images

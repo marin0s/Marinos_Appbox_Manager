@@ -20,9 +20,29 @@ AppBox existante. Ces deux choix utilisent le même moteur : l’AppBox est simp
 instance conteneur explicitement désignée. Jellyfin et l’import d’une archive depuis le
 navigateur sont affichés comme indisponibles tant que leurs moteurs ne sont pas livrés.
 
-À la validation, le Control Plane crée un `reference_build`, lance la découverte, puis le
-préflight, la capture live non intrusive, l’upload, la validation et la publication déjà
-existants. `/reference-builds/{build_id}` rend la progression et les logs observables.
+À la validation, le Control Plane crée un `reference_build` et un unique job global qui
+reste actif pendant découverte, preflight, capture live non intrusive, upload, validation
+et publication. Les commandes agent de découverte et de capture apparaissent comme
+sous-jobs techniques. Leur succès ne clôt jamais le workflow utilisateur.
+`/reference-builds/{build_id}` affiche progression globale, étape courante, preflight,
+sous-jobs et logs. La capture remonte les octets écrits ; le Control Plane les projette
+dans la plage de progression réservée à la capture sans jamais faire régresser la valeur.
+
+Le preflight porte données estimées, espace temporaire requis/disponible/manquant et
+bloque avant enqueue si `disponible < estimé + max(5 GiB, estimé × 10 %)`. Les deux
+composantes de marge sont configurables sur l’agent. Le même calcul est rejoué sur le
+filesystem temporaire juste avant la création de l’archive.
+
+Clés `agent.json` facultatives : `reference_build_reserve_bytes` (défaut
+`5368709120`) et `reference_build_reserve_ratio` (défaut `0.10`). Le Control Plane
+utilise `APPBOX_REFERENCE_COMMAND_LEASE_SECONDS` (défaut `180`, minimum `30`) pour la
+lease. Ces réglages ne modifient ni l’enrôlement ni les secrets de l’agent.
+
+Un build actif peut être annulé depuis sa fiche. Le heartbeat léger transmet le signal au
+worker séquentiel, qui interrompt au prochain point d’écriture/transfert sûr et supprime son
+répertoire temporaire. Une lease de commande longue renouvelée par heartbeat empêche un
+état `claimed` éternel ; son expiration abandonne explicitement le build, sans reprise
+automatique ni acceptation d’un résultat tardif.
 
 ## Créer une nouvelle version
 
@@ -52,8 +72,9 @@ danger de la fiche et conserve la confirmation forte par nom.
 3. Cliquer **Créer une nouvelle version**.
 4. Choisir **AppBox existante**, node **ARTEMIS**, instance `plex-appb-34ah`.
 5. Parcourir la validation et lancer la capture.
-6. Sur le suivi, vérifier découverte, préflight, capture, validation et publication sans
-   arrêt/restart du conteneur source.
+6. Sur le suivi, vérifier que le workflow global reste running après la découverte, que
+   la progression augmente pendant la croissance de l’archive, puis validation et
+   publication sans arrêt/restart du conteneur source.
 7. Revenir à la fiche : la nouvelle version doit être `ACTIVE` et
    `2026-08-27-114` doit être `HISTORIQUE`.
 8. Vérifier que l’AppBox source est toujours running, avec le même RestartCount.

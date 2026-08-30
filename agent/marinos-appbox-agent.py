@@ -527,6 +527,18 @@ def _plex_library_report(database: Path) -> tuple[list[dict], dict]:
     return libraries, totals
 
 
+def _reference_storage_requirement(config: dict, estimated_payload: int, temp_parent: Path) -> dict:
+    estimated_payload = max(0,int(estimated_payload or 0))
+    free = shutil.disk_usage(temp_parent).free
+    fixed = max(0,int(config.get('reference_build_reserve_bytes',5*1024**3)))
+    ratio = max(0.0,float(config.get('reference_build_reserve_ratio',0.10)))
+    margin=max(fixed,int(estimated_payload*ratio))
+    required=estimated_payload+margin
+    return {'estimated_payload_bytes':estimated_payload,'temporary_free_bytes':free,
+            'safety_margin_bytes':margin,'required_free_bytes':required,
+            'missing_free_bytes':max(0,required-free),'can_build':free>=required}
+
+
 def discover_plex_instance(config, payload):
     requested = str((payload or {}).get("source_instance") or "").strip()
     code, raw, error = run(["docker", "ps", "-aq"], timeout=30)
@@ -586,14 +598,23 @@ def discover_plex_instance(config, payload):
         "cache": _directory_size(plex_root / "Cache"),
         "logs": _directory_size(plex_root / "Logs"),
     }
-    free_source = shutil.disk_usage(config_path).free
     estimated_payload = sizes["metadata"] + sizes["media"] + (database.stat().st_size if database.exists() else 0)
+    configured_temp = str(config.get("reference_build_temp_dir") or "").strip()
+    temp_parent = Path(configured_temp) if configured_temp else (
+        Path("/var/lib/marinos-appbox-agent/reference-builds") if os.name == "posix" else Path(tempfile.gettempdir()))
+    temp_parent.mkdir(parents=True,exist_ok=True)
+    storage = _reference_storage_requirement(config, estimated_payload, temp_parent)
+    free_source = storage['temporary_free_bytes']
+    safety_margin = storage['safety_margin_bytes']
+    required_free = storage['required_free_bytes']
+    missing_free = storage['missing_free_bytes']
     warnings = []
     if state.get("Status") != "running": warnings.append("Le conteneur Plex n'est pas en cours d'exécution.")
     if not database.exists(): warnings.append("La base Plex principale est introuvable ou inaccessible.")
     if not preferences.exists(): warnings.append("Preferences.xml est introuvable.")
-    if free_source < estimated_payload: warnings.append("Espace libre local inférieur à la taille estimée de la référence.")
-    blockers = [w for w in warnings if "base Plex" in w or "montage" in w]
+    if free_source < required_free:
+        warnings.append("Espace temporaire insuffisant pour la capture et sa marge de sécurité.")
+    blockers = [w for w in warnings if "base Plex" in w or "montage" in w or "Espace temporaire insuffisant" in w]
     score = max(1, 5 - len(warnings) - len(blockers))
     return {
         "schema_version": 1, "read_only": True, "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -601,7 +622,7 @@ def discover_plex_instance(config, payload):
         "instance": {"container_name": name, "container_id": item.get("Id"), "state": state.get("Status"), "image": cfg.get("Image"), "created_at": item.get("Created"), "plex_version": identity.get("version"), "claimed": identity.get("claimed") == "1" if identity else None},
         "configuration": {"config_path": str(config_path), "database_path": str(database), "preferences_path": str(preferences), "config_readable": os.access(config_path, os.R_OK), "uid_gid": cfg.get("User") or "image-default"},
         "libraries": libraries, "totals": totals, "mounts": paths, "sizes": sizes,
-        "preflight": {"docker_ok": True, "config_accessible": config_path.exists() and os.access(config_path, os.R_OK), "database_accessible": database.exists() and os.access(database, os.R_OK), "source_free_bytes": free_source, "estimated_payload_bytes": estimated_payload, "warnings": warnings, "blockers": blockers, "compatibility_score": score, "can_build": not blockers},
+        "preflight": {"docker_ok": True, "config_accessible": config_path.exists() and os.access(config_path, os.R_OK), "database_accessible": database.exists() and os.access(database, os.R_OK), "source_free_bytes": free_source, "temporary_free_bytes": free_source, "estimated_payload_bytes": estimated_payload, "required_free_bytes": required_free, "safety_margin_bytes": safety_margin, "missing_free_bytes": missing_free, "warnings": warnings, "blockers": blockers, "compatibility_score": score, "can_build": not blockers},
         "inclusion_policy": {"included": ["Metadata", "Media", "Plug-in Support/Databases", "bibliothèques", "collections", "affiches", "chemins médias"], "excluded": ["MachineIdentifier", "claim token", "sessions", "cache", "logs", "transcode", "PID", "fichiers temporaires"]},
     }
 
@@ -1060,16 +1081,52 @@ def _inspect_plex_reference_archive(archive: Path) -> dict:
     }
 
 
-def _archive_plex_reference(config_path: Path, overlay: Path, archive: Path) -> dict:
+class CommandCancelled(RuntimeError):
+    pass
+
+
+class _CaptureWriter:
+    def __init__(self, path, estimated, progress_callback=None, cancel_event=None):
+        self.handle = Path(path).open('wb')
+        self.estimated = max(1, int(estimated or 1))
+        self.progress_callback = progress_callback
+        self.cancel_event = cancel_event
+        self.last_reported_at = 0.0
+        self.last_reported_bytes = 0
+
+    def write(self, data):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise CommandCancelled('Capture annulée par le Control Plane.')
+        written = self.handle.write(data)
+        current = self.handle.tell()
+        now = time.monotonic()
+        if self.progress_callback and (now-self.last_reported_at >= 2 or current-self.last_reported_bytes >= 64*1024*1024):
+            self.progress_callback(current,self.estimated)
+            self.last_reported_at,self.last_reported_bytes=now,current
+        return written
+
+    def tell(self): return self.handle.tell()
+    def flush(self): return self.handle.flush()
+    def close(self): return self.handle.close()
+
+
+def _archive_plex_reference(config_path: Path, overlay: Path, archive: Path,
+                            estimated_payload_bytes=0, progress_callback=None, cancel_event=None) -> dict:
     source_plex = config_path / PLEX_REFERENCE_ROOT
     overlay_plex = overlay / PLEX_REFERENCE_ROOT
-    with tarfile.open(archive, "w:gz", compresslevel=3, dereference=False) as tar:
-        for directory in PLEX_REFERENCE_INCLUDED_DIRECTORIES:
-            source = overlay_plex / directory if directory == "Plug-in Support/Databases" else source_plex / directory
-            _tar_tree(tar, source, f"{PLEX_REFERENCE_ROOT.as_posix()}/{directory}")
-        preferences = overlay_plex / "Preferences.xml"
-        if preferences.exists():
-            tar.add(preferences, arcname=f"{PLEX_REFERENCE_ROOT.as_posix()}/Preferences.xml", recursive=False)
+    writer = _CaptureWriter(archive,estimated_payload_bytes,progress_callback,cancel_event)
+    try:
+        with tarfile.open(fileobj=writer, mode="w:gz", compresslevel=3, dereference=False) as tar:
+            for directory in PLEX_REFERENCE_INCLUDED_DIRECTORIES:
+                source = overlay_plex / directory if directory == "Plug-in Support/Databases" else source_plex / directory
+                _tar_tree(tar, source, f"{PLEX_REFERENCE_ROOT.as_posix()}/{directory}")
+            preferences = overlay_plex / "Preferences.xml"
+            if preferences.exists():
+                tar.add(preferences, arcname=f"{PLEX_REFERENCE_ROOT.as_posix()}/Preferences.xml", recursive=False)
+        if progress_callback:
+            progress_callback(writer.tell(), max(1,int(estimated_payload_bytes or 1)))
+    finally:
+        writer.close()
     validate_archive(archive, plex=True)
     return _inspect_plex_reference_archive(archive)
 
@@ -1188,7 +1245,8 @@ def _restart_plex_after_capture(container_name: str) -> tuple[dict, dict]:
     return ({"success": True, "output": output.strip(), "confirmed_state": final_state}, identity)
 
 
-def _capture_plex_reference(config_path: Path, workdir: Path, container_name: str) -> dict:
+def _capture_plex_reference(config_path: Path, workdir: Path, container_name: str, *,
+                            estimated_payload_bytes=0, progress_callback=None, cancel_event=None) -> dict:
     archive = workdir / "reference.tar.gz"
     initial_state = _docker_container_state(container_name)
     if initial_state not in {"running", "exited", "created"}:
@@ -1217,7 +1275,8 @@ def _capture_plex_reference(config_path: Path, workdir: Path, container_name: st
             workdir,
             snapshot_container,
         )
-        archive_report = _archive_plex_reference(config_path, overlay, archive)
+        archive_report = _archive_plex_reference(config_path, overlay, archive,
+            estimated_payload_bytes, progress_callback, cancel_event)
         digest = hashlib.sha256()
         with archive.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -1278,7 +1337,7 @@ def _reference_build_temp_parent(config: dict) -> Path:
     return parent
 
 
-def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
+def build_and_upload_plex_reference(config: dict, payload: dict, *, progress_callback=None, cancel_event=None) -> dict:
     discovery = discover_plex_instance(config, payload)
     preflight = discovery.get("preflight") or {}
     if not preflight.get("can_build", False):
@@ -1321,7 +1380,19 @@ def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
         container_name = str((discovery.get("instance") or {}).get("container_name") or payload.get("source_instance") or "")
         if not container_name:
             raise RuntimeError("Nom du conteneur Plex source introuvable.")
-        capture = _capture_plex_reference(config_path, workdir, container_name)
+        # Discovery data may be minutes old; repeat the storage safety check on
+        # the actual temporary filesystem immediately before archive creation.
+        expected = int(preflight.get('estimated_payload_bytes') or 0)
+        current_storage = _reference_storage_requirement(config, expected, temp_parent)
+        required = current_storage['required_free_bytes']
+        free_now = current_storage['temporary_free_bytes']
+        if not current_storage['can_build']:
+            raise RuntimeError(f"Espace temporaire devenu insuffisant avant capture : requis={required}, disponible={free_now}, manquant={current_storage['missing_free_bytes']}.")
+        if cancel_event is not None and cancel_event.is_set():
+            raise CommandCancelled('Capture annulée avant création de l’archive.')
+        capture = _capture_plex_reference(config_path, workdir, container_name,
+            estimated_payload_bytes=expected, progress_callback=progress_callback,
+            cancel_event=cancel_event)
         archive = capture.pop("archive")
         checksum = capture.pop("sha256")
         archive_report = capture.pop("archive_report")
@@ -1340,6 +1411,8 @@ def build_and_upload_plex_reference(config: dict, payload: dict) -> dict:
             connection.endheaders()
             with archive.open("rb") as stream:
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise CommandCancelled('Capture annulée pendant le transfert.')
                     connection.send(block)
             response = connection.getresponse()
             body = response.read().decode("utf-8", errors="replace")
@@ -1446,13 +1519,14 @@ def api(config, method, path, payload=None):
         return json.loads(raw.decode("utf-8")) if raw else {}
 
 
-def heartbeat(config, metrics=None):
+def heartbeat(config, metrics=None, active_command_id=""):
     metrics = metrics or {}
     payload = {
         "agent_id": config.get("agent_id", f"agent-{config['node_id']}"),
         "agent_version": VERSION,
         "runtime": RUNTIME_IDENTITY,
         "endpoint": config.get("endpoint", ""),
+        "active_command_id": active_command_id or None,
         "capabilities": {
             "docker": bool(metrics.get("docker_ok")),
             "compose": metrics.get("compose_version") is not None,
@@ -1847,7 +1921,7 @@ def claim_plex(app_dir, client_id, containers, claim_code):
             "lifecycle": ["container_running", "http_available", "identity_generated", "claimed", "association_confirmed"]}
 
 
-def execute_command(config, command):
+def execute_command(config, command, *, progress_callback=None, cancel_event=None):
     command_type = command["command_type"]
     if command_type == "agent_upgrade":
         if not RUNTIME_IDENTITY["managed"]:
@@ -1862,7 +1936,8 @@ def execute_command(config, command):
     if command_type == "reference_discovery":
         return discover_plex_instance(config, command.get("payload") or {})
     if command_type == "reference_build":
-        return build_and_upload_plex_reference(config, command.get("payload") or {})
+        return build_and_upload_plex_reference(config, command.get("payload") or {},
+            progress_callback=progress_callback,cancel_event=cancel_event)
     if command_type == "reference_cache_delete":
         return delete_reference_cache(config, command.get('payload') or {})
     if command_type == "appbox_action":
@@ -2017,7 +2092,7 @@ def execute_command(config, command):
     raise RuntimeError(f"Commande non supportée : {command_type}")
 
 
-def command_cycle(config, inventory_request=None):
+def command_cycle(config, inventory_request=None, runtime=None):
     response = api(
         config,
         "GET",
@@ -2026,12 +2101,22 @@ def command_cycle(config, inventory_request=None):
     command = response.get("command")
     if not command:
         return
+    progress_callback = None
+    cancel_event = None
+    if runtime is not None:
+        runtime.begin_command(command['command_id'])
+        cancel_event = runtime.cancel_event
+        def progress_callback(written, estimated):
+            response=api(config,'POST',f"/api/agent/v1/{config['node_id']}/commands/{command['command_id']}/progress",
+                {'stage':'capture','bytes_written':written,'estimated_payload_bytes':estimated})
+            if response.get('cancel_requested'):
+                cancel_event.set()
     try:
         if command.get('command_type') == 'inventory' and inventory_request is not None:
             inventory_request.set()
             result = {'inventory_refresh': 'scheduled'}
         else:
-            result = execute_command(config, command)
+            result = execute_command(config, command,progress_callback=progress_callback,cancel_event=cancel_event)
         if command.get('command_type') == 'appbox_action' and inventory_request is not None:
             inventory_request.set()
             result['inventory_sync'] = 'scheduled'
@@ -2041,16 +2126,17 @@ def command_cycle(config, inventory_request=None):
             except Exception as inventory_exc:
                 result["inventory_warning"] = str(inventory_exc)
         payload = {"status": "success", "result": _sanitize_diagnostics(result)}
+    except CommandCancelled as exc:
+        payload = {"status":"cancelled","error":str(exc),"result":{"temporary_cleanup":"completed"}}
     except Exception as exc:
         diagnostics = getattr(exc, "diagnostics", None)
         result = {"diagnostics": _sanitize_diagnostics(diagnostics)} if isinstance(diagnostics, dict) else {}
         payload = {"status": "failed", "error": _sanitize_diagnostic_text(str(exc)), "result": result}
-    api(
-        config,
-        "POST",
-        f"/api/agent/v1/{config['node_id']}/commands/{command['command_id']}/result",
-        payload,
-    )
+    try:
+        api(config,"POST",f"/api/agent/v1/{config['node_id']}/commands/{command['command_id']}/result",payload)
+    finally:
+        if runtime is not None:
+            runtime.finish_command(command['command_id'])
 
 
 class AgentLoops:
@@ -2061,6 +2147,8 @@ class AgentLoops:
         self.inventory_request = Event()
         self.lock = Lock()
         self.metrics = {}
+        self.active_command_id = ""
+        self.cancel_event = Event()
         self.heartbeat_interval = min(60, max(1, float(config.get('heartbeat_interval', 60))))
         self.inventory_interval = max(1, float(config.get('inventory_interval', 30)))
         self.command_interval = max(0.1, float(config.get('command_poll_interval', 2)))
@@ -2074,7 +2162,10 @@ class AgentLoops:
             try:
                 with self.lock:
                     metrics = dict(self.metrics)
-                response = heartbeat(self.config, metrics)
+                    active_command_id = self.active_command_id
+                response = heartbeat(self.config, metrics, active_command_id)
+                if active_command_id and response.get('cancel_active_command'):
+                    self.cancel_event.set()
                 recommended = response.get('heartbeat_interval')
                 if recommended is not None:
                     self.heartbeat_interval = min(self.heartbeat_interval, max(1, float(recommended)))
@@ -2104,10 +2195,21 @@ class AgentLoops:
     def command_loop(self):
         while not self.stop.is_set():
             try:
-                command_cycle(self.config, self.inventory_request)
+                command_cycle(self.config, self.inventory_request, self)
             except Exception as exc:
                 self.report_error('command', exc)
             self.stop.wait(self.command_interval)
+
+    def begin_command(self, command_id):
+        with self.lock:
+            self.active_command_id = str(command_id)
+            self.cancel_event = Event()
+
+    def finish_command(self, command_id):
+        with self.lock:
+            if self.active_command_id == str(command_id):
+                self.active_command_id = ""
+                self.cancel_event = Event()
 
     def run(self):
         workers = [Thread(target=target, name=name, daemon=True) for name, target in (

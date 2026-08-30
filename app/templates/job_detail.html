@@ -18,10 +18,10 @@
 <div class="grid metrics workflow-kpis">
  <div class="card metric-card"><div class="metric-label">Progression</div><div class="metric-value">{{job.progress}} %</div><small>{{job.statistics.completed_steps}} / {{job.statistics.total_steps}} étapes</small></div>
  <div class="card metric-card"><div class="metric-label">Durée totale</div><div class="metric-value">{{'%.2f s'|format(job.duration_seconds) if job.duration_seconds is not none else '—'}}</div><small>{{job.started_at or 'En attente'}}</small></div>
- <div class="card metric-card"><div class="metric-label">Validation</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.validation.duration)}}</div><small>{{job.statistics.groups.validation.steps}} étape(s)</small></div>
- <div class="card metric-card"><div class="metric-label">Docker</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.docker.duration)}}</div><small>{{job.statistics.groups.docker.steps}} étape(s)</small></div>
- <div class="card metric-card"><div class="metric-label">Healthcheck</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.healthcheck.duration)}}</div><small>{{job.statistics.failed_steps}} échec(s)</small></div>
- <div class="card metric-card"><div class="metric-label">Intégrations</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.integration.duration)}}</div><small>{{job.statistics.skipped_steps}} ignorée(s)</small></div>
+ <div class="card metric-card"><div class="metric-label">Validation</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.validation.duration) if job.statistics.groups.validation.duration_known else '—'}}</div><small>{{job.statistics.groups.validation.steps}} étape(s)</small></div>
+ <div class="card metric-card"><div class="metric-label">Docker</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.docker.duration) if job.statistics.groups.docker.duration_known else '—'}}</div><small>{{job.statistics.groups.docker.steps}} étape(s)</small></div>
+ <div class="card metric-card"><div class="metric-label">Healthcheck</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.healthcheck.duration) if job.statistics.groups.healthcheck.duration_known else '—'}}</div><small>{{job.statistics.failed_steps}} échec(s)</small></div>
+ <div class="card metric-card"><div class="metric-label">Intégrations</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.integration.duration) if job.statistics.groups.integration.duration_known else '—'}}</div><small>{{job.statistics.skipped_steps}} ignorée(s)</small></div>
 </div>
 
 <div class="section-head"><div><h2>Timeline d’exécution</h2><p>Chronologie persistante enregistrée dans SQLite</p></div></div>
@@ -34,7 +34,7 @@
        <div>
          <h3>{{step.title}}</h3>
          <div class="timeline-meta">
-           <span>{{step.started_at or 'Non démarrée'}}</span>
+           <span>{{step.started_at or ('Terminée' if step.status in ['success','warning','skipped'] else 'Échouée' if step.status=='failed' else 'Annulée' if step.status=='cancelled' else 'En cours' if step.status=='running' else 'En attente')}}</span>
            <span>Exécuteur : {{step.executor or 'control-plane'}}</span>
            <span>{{'%.2f s'|format(step.duration_seconds) if step.duration_seconds is not none else '—'}}</span>
          </div>
