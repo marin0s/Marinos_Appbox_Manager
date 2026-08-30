@@ -39,6 +39,43 @@ class ReferenceBuildOrchestrationTests(unittest.TestCase):
         self.assertEqual(version['builder_version'], '1.6.0-alpha.5-phase1')
         self.assertEqual(json.loads(version['manifest_json'])['metadata'], {'file_count':1})
 
+    def test_new_version_build_keeps_image_identity_and_existing_appbox(self):
+        def publish(build_id, command):
+            archive=main._reference_build_storage(build_id)/'reference.tar.gz'
+            archive.write_bytes(reference_archive(Path(self.tmp.name)).read_bytes())
+            sha=main.sha256_file(archive)
+            main.finalize_reference_build_command(command,'success',{
+                'sha256':sha,'uncompressed_size_bytes':100,'sanitization':{'source_unchanged':True},
+                'builder_version':'1.6.0-alpha.5-phase1','manifest':{'metadata':{'file_count':1}}},None)
+
+        publish(self.build_id,self.command)
+        stamp=main.now_iso()
+        with main.db() as con:
+            image=con.execute("SELECT * FROM reference_images").fetchone()
+            first_version=image['current_version_id']
+            con.execute("INSERT INTO appboxes(client_id,node_id,path,containers_json,status,created_at,updated_at,reference_image_id,reference_version_id) VALUES('ab-keep','ouranos','/unchanged','[]','running',?,?,?,?)",
+                        (stamp,stamp,image['image_id'],first_version))
+            before=dict(con.execute("SELECT * FROM appboxes WHERE client_id='ab-keep'").fetchone())
+        second=main.create_reference_build_draft(source_node_id='ouranos',display_name='A different name',
+                                                 target_image_id=image['image_id'])
+        with main.db() as con:
+            con.execute("UPDATE reference_builds SET source_report_json=?,preflight_report_json=?,source_instance='plex-appb-34ah' WHERE build_id=?",
+                        (json.dumps(self.discovery),json.dumps(self.discovery['preflight']),second))
+            con.execute("INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,created_at) VALUES('capture-2','ouranos','reference_build',?,'claimed',?)",
+                        (json.dumps({'build_id':second}),stamp))
+            command=con.execute("SELECT * FROM agent_commands WHERE command_id='capture-2'").fetchone()
+        publish(second,command)
+        with main.db() as con:
+            images=con.execute("SELECT * FROM reference_images").fetchall()
+            versions=con.execute("SELECT * FROM reference_image_versions WHERE image_id=? ORDER BY created_at",(image['image_id'],)).fetchall()
+            after=dict(con.execute("SELECT * FROM appboxes WHERE client_id='ab-keep'").fetchone())
+        self.assertEqual(len(images),1)
+        self.assertEqual(len(versions),2)
+        self.assertEqual(images[0]['image_id'],image['image_id'])
+        self.assertNotEqual(images[0]['current_version_id'],first_version)
+        self.assertIn(first_version,{version['version_id'] for version in versions})
+        self.assertEqual(after,before)
+
     def test_invalid_result_never_publishes(self):
         archive=main._reference_build_storage(self.build_id)/'reference.tar.gz'; archive.write_bytes(b'bad')
         main.finalize_reference_build_command(self.command,'success',{'sha256':main.sha256_file(archive)},None)

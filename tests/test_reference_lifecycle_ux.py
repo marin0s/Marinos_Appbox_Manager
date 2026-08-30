@@ -1,0 +1,148 @@
+import json
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app import main
+
+
+@pytest.fixture
+def lifecycle(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_FILE", tmp_path / "lifecycle.db")
+    monkeypatch.setattr(main, "REFERENCE_ROOT", tmp_path / "references")
+    main.REFERENCE_ROOT.mkdir()
+    main.init_database()
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("INSERT INTO nodes(node_id,name,mode,status,created_at,updated_at) VALUES('uxnode','UXNODE','remote','online',?,?)",(stamp,stamp))
+    def image(image_id="plex-one", name="Plex One", versions=("v1",), active="v1"):
+        stamp=main.now_iso()
+        with main.db() as con:
+            con.execute("INSERT INTO reference_images(image_id,name,media_type,description,status,current_version_id,created_at,updated_at,source_node_id) VALUES(?,?,'plex','Test UX','published',NULL,?,?, 'uxnode')",(image_id,name,stamp,stamp))
+        ids=[]
+        for index,label in enumerate(versions,1):
+            source=main.REFERENCE_ROOT/image_id/label; source.mkdir(parents=True)
+            snapshot=f"{image_id}-{label}-snapshot"; version_id=f"{image_id}-{label}"; ids.append(version_id)
+            with main.db() as con:
+                con.execute("INSERT INTO catalog_snapshots(snapshot_id,name,media_type,version,source_path,status,created_at,updated_at) VALUES(?,?,'plex',?,?,'ready',?,?)",(snapshot,label,label,str(source),stamp,stamp))
+                con.execute("INSERT INTO reference_image_versions(version_id,image_id,version,snapshot_id,application_version,size_bytes,state,created_at,published_at) VALUES(?,?,?,?, '1.40',1024,'published',?,?)",(version_id,image_id,label,snapshot,stamp,stamp))
+        current=ids[list(versions).index(active)] if active in versions else None
+        with main.db() as con:
+            con.execute("UPDATE reference_images SET current_version_id=? WHERE image_id=?",(current,image_id))
+        return ids
+    return TestClient(main.app), image
+
+
+def test_library_multiple_images_has_only_manage_and_deploy(lifecycle):
+    client,make=lifecycle; make(); make('plex-two','Plex Two',('r1','r2'),'r2')
+    html=client.get('/reference-images').text
+    assert html.count('reference-library-card')==2
+    assert 'Gérer' in html and 'Déployer' in html and 'Supprimer la référence complète' not in html
+    assert '2 référence(s)' in html
+
+
+def test_detail_distinguishes_active_and_historical_versions(lifecycle):
+    client,make=lifecycle; versions=make(versions=('2026-08-27-114','2026-08-30-001'),active='2026-08-30-001')
+    html=client.get('/reference-images/plex-one').text
+    assert 'ACTIVE' in html and 'HISTORIQUE' in html
+    assert 'Créer une nouvelle version' in html
+    assert 'Créez ou activez une autre version avant de supprimer celle-ci.' in html
+    assert f'/versions/{versions[0]}/delete' in html
+    assert 'Zone de danger' in html and 'Supprimer la référence complète' in html
+
+
+def test_active_blocker_links_to_new_version_workflow(lifecycle):
+    client,make=lifecycle; versions=make()
+    detail=client.get('/reference-images/plex-one').text
+    assert '1 version(s)' in detail and 'ACTIVE' in detail
+    html=client.get(f'/reference-images/plex-one/versions/{versions[0]}/delete').text
+    assert 'Version active/default' in html
+    assert 'href="/reference-images/plex-one/new-version"' in html
+
+
+def test_job_blocker_links_to_job_detail(lifecycle):
+    client,make=lifecycle; versions=make(versions=('old','active'),active='active')
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("INSERT INTO jobs(job_id,node_id,action,title,status,progress,detail,created_at,updated_at,options_json) VALUES('job-ref','uxnode','deploy','Reference use','running',10,'',?,?,?)",
+                    (stamp,stamp,json.dumps({'reference_version_id':versions[0]})))
+    html=client.get(f'/reference-images/plex-one/versions/{versions[0]}/delete').text
+    assert 'Job actif' in html and 'href="/jobs/job-ref"' in html
+
+
+def test_contextual_wizard_keeps_target_image_id(lifecycle,monkeypatch):
+    client,make=lifecycle; make()
+    wizard=client.get('/reference-images/plex-one/new-version').text
+    assert 'value="plex-one"' in wizard and 'La capture créera une version de cette référence' in wizard
+    launched=[]
+    monkeypatch.setattr(main,'launch_reference_discovery',lambda build_id,source: launched.append((build_id,source)))
+    response=client.post('/reference-images/wizard',data={
+        'target_image_id':'plex-one','source_node_id':'uxnode','source_instance':'plex-appb-34ah',
+        'source_type':'appbox','application':'plex','name':'Ignored','description':'Ignored'},follow_redirects=False)
+    assert response.status_code==303 and response.headers['location'].startswith('/reference-builds/')
+    with main.db() as con:
+        build=con.execute("SELECT * FROM reference_builds ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert build['image_id']=='plex-one' and build['display_name']=='Plex One'
+    assert launched==[(build['build_id'],'plex-appb-34ah')]
+
+
+def test_new_reference_wizard_creates_an_unbound_build(lifecycle,monkeypatch):
+    client,_=lifecycle; launched=[]
+    monkeypatch.setattr(main,'launch_reference_discovery',lambda build_id,source: launched.append(build_id))
+    response=client.post('/reference-images/wizard',data={
+        'target_image_id':'','source_node_id':'uxnode','source_instance':'plex-source',
+        'source_type':'server','application':'plex','name':'My New Reference','description':'Guided'},
+        follow_redirects=False)
+    assert response.status_code==303
+    with main.db() as con:
+        build=con.execute("SELECT * FROM reference_builds ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert build['image_id'] is None and build['display_name']=='My New Reference'
+    assert launched==[build['build_id']]
+
+
+def test_new_reference_never_silently_becomes_a_version(lifecycle,monkeypatch):
+    client,make=lifecycle; make(image_id='plex-plex-one',name='Plex One')
+    monkeypatch.setattr(main,'launch_reference_discovery',lambda *_: None)
+    response=client.post('/reference-images/wizard',data={
+        'target_image_id':'','source_node_id':'uxnode','source_instance':'plex-source',
+        'source_type':'server','application':'plex','name':'Plex One','description':'Duplicate'})
+    assert response.status_code==409
+    assert 'Créer une nouvelle version' in response.text
+    with main.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM reference_builds").fetchone()[0]==0
+
+
+def test_historical_version_can_be_reactivated_with_confirmation(lifecycle):
+    client,make=lifecycle; versions=make(versions=('old','active'),active='active')
+    assert client.post(f'/reference-images/plex-one/publish/{versions[0]}',data={}).status_code==400
+    response=client.post(f'/reference-images/plex-one/publish/{versions[0]}',data={'confirmed':'true'},follow_redirects=False)
+    assert response.status_code==303
+    with main.db() as con:
+        assert con.execute("SELECT current_version_id FROM reference_images WHERE image_id='plex-one'").fetchone()[0]==versions[0]
+
+
+def test_metadata_and_deploy_preselection(lifecycle):
+    client,make=lifecycle; versions=make()
+    response=client.post('/reference-images/plex-one/metadata',data={'name':'Plex Renamed','description':'Updated'},follow_redirects=False)
+    assert response.status_code==303
+    assert 'Plex Renamed' in client.get('/reference-images/plex-one').text
+    html=client.get(f'/appboxes?deployment_image_id=reference:{versions[0]}').text
+    assert f'value="reference:{versions[0]}"' in html
+    assert f'value="reference:{versions[0]}" data-type="plex" selected' in html
+
+
+def test_reference_routes_are_unique():
+    signatures=[]
+    for route in main.app.routes:
+        if getattr(route,'path','').startswith('/reference-images') or getattr(route,'path','').startswith('/reference-builds'):
+            for method in getattr(route,'methods',set()):
+                signatures.append((method,route.path))
+    assert len(signatures)==len(set(signatures))
+
+
+def test_reference_layout_has_mobile_breakpoint():
+    css=(Path(__file__).parents[1]/'app/static/app.css').read_text(encoding='utf-8')
+    js=(Path(__file__).parents[1]/'app/static/app.js').read_text(encoding='utf-8')
+    assert '@media(max-width:620px)' in css
+    assert 'data-reference-wizard' in js and 'reportValidity' in js

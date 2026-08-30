@@ -1,16 +1,16 @@
 {% extends "base.html" %}
 {% block title %}Supprimer une référence — Marinos AppBox{% endblock %}
-{% block page_title %}Suppression de Reference Image{% endblock %}
+{% block page_title %}Suppression d’une référence{% endblock %}
 {% block content %}
 {% if deletion.state in ['running','purge_pending'] %}<meta http-equiv="refresh" content="5">{% endif %}
-<section class="hero"><div><div class="eyebrow">Images de référence · {{deletion.target_type|upper}}</div><h1>{{deletion.target_label}}</h1><p>{{deletion.version_count}} version(s) · {{'%.2f Go'|format((deletion.size_bytes or 0)/1073741824)}} · {{deletion.node_count}} node(s)</p></div></section>
+<section class="hero"><div><div class="eyebrow">RÉFÉRENCES · {{'VERSION' if deletion.target_type=='version' else 'RÉFÉRENCE'}}</div><h1>{{deletion.target_label}}</h1><p>{{deletion.version_count}} version(s) · {{'%.2f Go'|format((deletion.size_bytes or 0)/1073741824)}} · {{deletion.node_count}} node(s)</p></div></section>
 <div class="card grid reference-delete-plan">
  {% if error %}<div class="reference-blocked" role="alert">{{error}}</div>{% endif %}
  <div class="reference-current compact"><div><span>Statut</span><strong>{{deletion.state|upper}}</strong></div><div><span>Phase</span><strong>{{deletion.phase}}</strong></div><div><span>Progression</span><strong>{{deletion.progress or 0}} %</strong></div></div>
  {% if deletion.detail %}<p>{{deletion.detail}}</p>{% endif %}
  {% if deletion.blockers %}
  <div class="reference-blocked"><strong>Suppression impossible</strong><span>Terminez ou détachez les dépendances actives suivantes.</span></div>
- <ul data-deletion-blockers>{% for blocker in deletion.blockers %}<li>{{blocker}}</li>{% endfor %}</ul>
+ <ul data-deletion-blockers>{% for blocker in deletion.blockers %}<li><span>{{blocker}}</span>{% if blocker.startswith('Version active') or blocker.startswith('Image active') %}<a class="button secondary" href="/reference-images/{{deletion.image_id}}/new-version">Créer une nouvelle version</a>{% elif blocker.startswith('Profil de provisioning') %}<a class="button secondary" href="/storage">Gérer les profils</a>{% elif blocker.startswith('Job actif') %}<a class="button secondary" href="/jobs/{{blocker.split(': ',1)[1].split(' ',1)[0]}}">Voir le job</a>{% elif blocker.startswith('Déploiement') %}<a class="button secondary" href="/deployments">Voir les déploiements</a>{% elif blocker.startswith('Distribution active') %}<a class="button secondary" href="/reference-images/{{deletion.image_id}}">Voir les distributions</a>{% endif %}</li>{% endfor %}</ul>
  {% else %}
   {% if deletion.state == 'deleted' %}<div class="reference-ready"><strong>Suppression terminée</strong><span>Catalogue, archive centrale et caches connus confirmés absents.</span></div>
   {% elif deletion.state == 'purge_pending' %}<div class="reference-ready pending"><strong>Purge distante en attente</strong><span>Un node offline sera repris automatiquement à son retour.</span></div>

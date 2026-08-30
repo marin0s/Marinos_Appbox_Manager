@@ -16,7 +16,7 @@
   <label>Image de déploiement
    <select name="deployment_image_id" data-profile-select required>
     {% for image in deployment_images %}
-    <option value="{{image.deployment_image_id}}" data-type="{{image.media_type}}" {{'disabled' if not image.available else ''}}>
+    <option value="{{image.deployment_image_id}}" data-type="{{image.media_type}}" {{'selected' if selected_deployment_image==image.deployment_image_id else ''}} {{'disabled' if not image.available else ''}}>
      {{image.name}}{% if image.version %} · {{image.version}}{% endif %}{% if not image.available %} · Indisponible{% endif %}
     </option>
     {% endfor %}

@@ -26,8 +26,8 @@ reprenable/en cours bloque.
 
 ## Prévisualisation et refus
 
-Depuis **Images de référence**, une ancienne version éligible propose **Supprimer**.
-L’image complète possède une action séparée. La page affiche la cible, les versions, la
+Depuis la fiche **Référence**, une ancienne version éligible propose **Supprimer cette
+version**. L’image complète se trouve uniquement dans la zone de danger. Le plan affiche la cible, les versions, la
 taille connue, les archives, les caches et nodes, les éléments conservés, ainsi que tous
 les motifs de refus. La version courante/default et une image publiée/active sont
 refusées; alpha.5 ne promeut jamais implicitement une autre version.

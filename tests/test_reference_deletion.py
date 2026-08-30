@@ -178,7 +178,8 @@ def test_partial_io_failure_durable_resume_and_ui(catalogue, monkeypatch):
     assert response.status_code == 202 and response.json()['state'] == 'partial'
     assert archive.exists() and not cache.exists() and not marker.exists()
     assert 'Reprendre la purge' in client.get('/reference-images/image/delete').text
-    assert 'Nettoyage en attente : Plex Test' in client.get('/reference-images').text
+    listing=client.get('/reference-images').text
+    assert 'Suppression à reprendre' in listing and 'Plex Test' in listing
     with main.db() as con:
         assert con.execute('PRAGMA foreign_key_check').fetchall() == []
         assert con.execute('SELECT COUNT(*) FROM reference_images').fetchone()[0] == 1
@@ -288,8 +289,11 @@ def test_ui_confirmation_form_and_delete_button(catalogue):
     catalogue(1)
     client = TestClient(main.app)
     listing=client.get('/reference-images').text
-    assert 'href="/reference-images/image/delete">Supprimer l’image' in listing
-    assert 'href="/reference-images/image/versions/v1/delete">Supprimer' in listing
+    assert 'href="/reference-images/image">Gérer' in listing
+    assert 'Supprimer l’image' not in listing
+    detail=client.get('/reference-images/image').text
+    assert 'Zone de danger' in detail and 'Supprimer la référence complète' in detail
+    assert 'href="/reference-images/image/versions/v1/delete">Supprimer cette version' in detail
     preview = deletion.preview('image')
     html = client.get('/reference-images/image/delete').text
     assert 'Supprimer définitivement' in html and 'Plex Test' in html
@@ -301,9 +305,9 @@ def test_delete_old_version_only_and_active_default_refused(catalogue):
     first=catalogue(1); second=catalogue(2)
     with main.db() as con:
         con.execute("UPDATE reference_images SET status='published',current_version_id='v2' WHERE image_id='image'")
-    listing=TestClient(main.app).get('/reference-images').text
-    assert 'disabled title="Version active/default' in listing
-    assert 'disabled title="Image active/publiée' in listing
+    detail=TestClient(main.app).get('/reference-images/image').text
+    assert 'Créez ou activez une autre version avant de supprimer celle-ci.' in detail
+    assert 'Créer une nouvelle version' in detail
     old=deletion.preview('image','v1')
     assert not old['blockers'] and old['version_count']==1
     result=deletion.delete('image',old['confirmation'],'v1')

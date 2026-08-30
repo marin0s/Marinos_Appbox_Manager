@@ -2,6 +2,14 @@
 
 Une image de référence est une capture assainie d'une instance multimédia servant à créer de nouvelles AppBox déjà préparées.
 
+## Parcours opérateur alpha.5
+
+La bibliothèque, la fiche, le wizard de création et le workflow **Créer une nouvelle
+version** sont décrits dans [Cycle de vie UX des références](reference-lifecycle.md).
+Le builder automatisé peut cibler explicitement une image existante via
+`reference_builds.image_id`; la publication ajoute alors une version au même catalogue
+et bascule `current_version_id` sans modifier les AppBox déjà créées.
+
 ## Plex
 
 Le protocole de validation terrain et le rollback sont décrits dans [le runbook alpha.5](reference-images-alpha5-e2e.md). Une publication technique de référence ne constitue pas une validation terrain ni une livraison de production.

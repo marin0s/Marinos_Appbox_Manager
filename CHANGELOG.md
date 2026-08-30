@@ -28,6 +28,13 @@
 - Espacement vertical des rangées métriques et Système/Agent via la grille existante, sans modification des breakpoints ni du layout local.
 - Critères E2E du lot 2 documentés, dont extinction physique du node et rafraîchissement UI sans restart CP ; aucun changement de liveness.
 
+### Cycle de vie UX des références
+- Bibliothèque simplifiée : nom, application, disponibilité, version active, taille, mise à jour et nombre de versions ; seules les actions Gérer et Déployer restent sur les cards.
+- Fiche par référence avec métadonnées, source initiale, usages, distributions, historique et labels ACTIVE/HISTORIQUE/EN CONSTRUCTION/EN SUPPRESSION/ERREUR. Les identifiants techniques sont repliés.
+- Wizard unique en cinq étapes pour une nouvelle référence ou une nouvelle version. Plex depuis node/serveur ou AppBox utilise le builder existant ; Jellyfin et l’upload navigateur sont annoncés indisponibles sans faux workflow.
+- `reference_builds.image_id` cible explicitement une référence existante : publication d’une nouvelle version sous le même image_id, bascule de current_version_id et AppBox existantes inchangées.
+- Suppressions déplacées dans l’historique et la zone de danger ; blockers assortis d’actions vers nouvelle version, profil, job, déploiement ou distributions. Recette : `docs/reference-lifecycle.md`.
+
 ### Suppression des images de référence
 - Suppression UI/API d’une ancienne version ou d’une image inactive, avec plan détaillé, confirmation liée à l’état et saisie du nom pour l’image ; aucune suppression forcée ou promotion implicite.
 - Refus des versions active/default, images publiées, provisioning, opérations/déploiements/jobs/builds/distributions actifs et ressources partagées ; AppBox restaurées autonomes préservées avec détachement du lien catalogue.

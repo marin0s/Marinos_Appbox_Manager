@@ -226,7 +226,7 @@ def _plan(con, image_id, version_id=None):
         ('control_plane_deployments', 'deployment_id', f"reference_version_id IN ({placeholders}) AND status IN ('planned','queued','preparing','prepared','running','restoring','awaiting_claim')", 'Déploiement actif'),
         ('snapshot_deployments', 'deployment_id', f"snapshot_id IN ({snapshot_placeholders}) AND status IN ('planned','queued','running','restoring','restored_unclaimed')", 'Déploiement snapshot actif'),
         ('reference_builds', 'build_id', f"(image_id=? OR version_id IN ({placeholders})) AND status NOT IN ('published','completed','failed','build_failed','discovery_failed')", 'Build actif'),
-        ('reference_image_distribution', 'distribution_id', f"version_id IN ({placeholders}) AND status='transferring'", 'Distribution active'),
+        ('reference_image_distribution', 'node_id', f"version_id IN ({placeholders}) AND status='transferring'", 'Distribution active sur le node'),
     ):
         params = ((image_id, *version_ids) if table == 'reference_builds' else
                   tuple(snapshots) if table == 'snapshot_deployments' else tuple(version_ids))

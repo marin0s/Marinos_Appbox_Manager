@@ -438,3 +438,24 @@ for(const id of new Set([...$$('[data-node-liveness]'),...$$('[data-node-placeme
  }
  if (panels.length) setInterval(() => panels.forEach(refresh), 5000);
 })();
+
+// Guided Reference lifecycle: one progressive form for creation and new versions.
+(() => {
+ const shell=document.querySelector('[data-reference-wizard]');
+ if(!shell)return;
+ const steps=[...shell.querySelectorAll('[data-wizard-step]')], progress=[...shell.querySelectorAll('.wizard-progress li')];
+ const back=shell.querySelector('[data-wizard-back]'), next=shell.querySelector('[data-wizard-next]'), submit=shell.querySelector('[data-wizard-submit]');
+ let index=0;
+ function show(){
+  steps.forEach((step,i)=>step.classList.toggle('active',i===index));
+  progress.forEach((item,i)=>{item.classList.toggle('active',i===index);item.classList.toggle('done',i<index)});
+  back.hidden=index===0;next.hidden=index===steps.length-1;submit.hidden=index!==steps.length-1;
+ }
+ next.addEventListener('click',()=>{
+  const fields=[...steps[index].querySelectorAll('input,select,textarea')].filter(field=>!field.disabled);
+  if(fields.some(field=>!field.checkValidity())){fields.find(field=>!field.checkValidity())?.reportValidity();return;}
+  index=Math.min(steps.length-1,index+1);show();
+ });
+ back.addEventListener('click',()=>{index=Math.max(0,index-1);show()});
+ show();
+})();

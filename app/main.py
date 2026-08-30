@@ -2498,12 +2498,21 @@ def list_reference_images(media_type: str | None = None) -> list[dict[str, Any]]
                v.state AS version_state,
                v.snapshot_id,
                v.checksum,
-               s.source_path
+               s.source_path,
+               n.name AS source_node_name,
+               (SELECT COUNT(*) FROM reference_image_versions versions
+                WHERE versions.image_id=i.image_id) AS version_count,
+               (SELECT COUNT(*) FROM appboxes boxes
+                WHERE boxes.reference_image_id=i.image_id OR boxes.reference_version_id IN
+                    (SELECT versions.version_id FROM reference_image_versions versions
+                     WHERE versions.image_id=i.image_id)) AS usage_count
         FROM reference_images i
         LEFT JOIN reference_image_versions v
           ON v.version_id=i.current_version_id
         LEFT JOIN catalog_snapshots s
           ON s.snapshot_id=v.snapshot_id
+        LEFT JOIN nodes n
+          ON n.node_id=i.source_node_id
     """
     params: tuple[Any, ...] = ()
     if media_type:
@@ -2555,6 +2564,10 @@ def list_reference_versions(media_type: str | None = None) -> list[dict[str, Any
             row.get("source_path") and Path(row["source_path"]).exists()
         )
     return rows
+
+
+def get_reference_image(image_id: str) -> dict[str, Any] | None:
+    return next((image for image in list_reference_images() if image["image_id"] == image_id), None)
 
 
 def get_reference_version(version_id: str | None) -> dict[str, Any] | None:
@@ -2747,7 +2760,23 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
         finalize_reference_build_command(command, "failed", {}, "Archive de référence invalide après téléversement.")
         return
     result = {**result, "uncompressed_size_bytes": validated["uncompressed_size_bytes"]}
-    image_id = slugify_identifier(f"plex-{build['display_name']}")
+    target_image_id = str(build["image_id"] or "").strip()
+    with db() as con:
+        target_image = con.execute(
+            "SELECT * FROM reference_images WHERE image_id=?", (target_image_id,)
+        ).fetchone() if target_image_id else None
+    if target_image_id and not target_image:
+        finalize_reference_build_command(command, "failed", {}, "Référence cible supprimée avant publication.")
+        return
+    image_id = target_image_id or slugify_identifier(f"plex-{build['display_name']}")
+    image_name = target_image["name"] if target_image else build["display_name"]
+    if not target_image_id:
+        with db() as con:
+            collision=con.execute("SELECT 1 FROM reference_images WHERE image_id=?",(image_id,)).fetchone()
+        if collision:
+            finalize_reference_build_command(command,"failed",{},
+                "Une référence de même nom existe déjà ; relancez depuis Créer une nouvelle version.")
+            return
     version_label = datetime.now().strftime("%Y.%m.%d-%H%M%S") + "-" + build_id[-8:]
     version_id = slugify_identifier(f"{image_id}-{version_label}")
     snapshot_id = slugify_identifier(f"{version_id}-snapshot")
@@ -2770,13 +2799,16 @@ def finalize_reference_build_command(command: sqlite3.Row, status: str, result: 
         current = con.execute("SELECT status FROM reference_builds WHERE build_id=?", (build_id,)).fetchone()
         if current and current["status"] == "published":
             return
-        con.execute("""INSERT INTO reference_images(image_id,name,media_type,description,status,current_version_id,created_at,updated_at,source_node_id)
-                       VALUES(?,?, 'plex',?,'published',?,?,?,?)
-                       ON CONFLICT(image_id) DO UPDATE SET name=excluded.name,description=excluded.description,status='published',current_version_id=excluded.current_version_id,updated_at=excluded.updated_at,source_node_id=excluded.source_node_id""",
-                    (image_id, build["display_name"], build["description"] or "", version_id, stamp, stamp, build["source_node_id"]))
+        if target_image:
+            con.execute("""UPDATE reference_images SET status='published',current_version_id=?,updated_at=?
+                           WHERE image_id=?""", (version_id, stamp, image_id))
+        else:
+            con.execute("""INSERT INTO reference_images(image_id,name,media_type,description,status,current_version_id,created_at,updated_at,source_node_id)
+                           VALUES(?,?, 'plex',?,'published',?,?,?,?)""",
+                        (image_id, image_name, build["description"] or "", version_id, stamp, stamp, build["source_node_id"]))
         con.execute("""INSERT INTO catalog_snapshots(snapshot_id,name,media_type,version,source_path,checksum,size_bytes,status,expected_paths_json,notes,created_at,updated_at)
                        VALUES(?,?, 'plex',?,?,?,?, 'ready',?, ?,?,?)""",
-                    (snapshot_id, f"{build['display_name']} {version_label}", version_label, str(source_dir), checksum, int(result.get("uncompressed_size_bytes") or 0), json.dumps(["Library/Application Support/Plex Media Server"], ensure_ascii=False), "Generated automatically by Reference Builder", stamp, stamp))
+                    (snapshot_id, f"{image_name} {version_label}", version_label, str(source_dir), checksum, int(result.get("uncompressed_size_bytes") or 0), json.dumps(["Library/Application Support/Plex Media Server"], ensure_ascii=False), "Generated automatically by Reference Builder", stamp, stamp))
         con.execute("""INSERT INTO reference_image_versions(version_id,image_id,version,snapshot_id,application_version,checksum,size_bytes,catalog_items,state,created_at,published_at,notes,archive_path,archive_format,manifest_json,source_report_json,sanitization_report_json,builder_version,compressed_size_bytes,metadata_size_bytes,compatibility_json)
                        VALUES(?,?,?,?,?,?,?,?, 'published',?,?,?,?, 'tar.gz',?,?,?,?,?,?,?)""",
                     (version_id,image_id,version_label,snapshot_id,str((discovery.get('instance') or {}).get('plex_version') or ''),checksum,int(result.get('uncompressed_size_bytes') or 0),len(discovery.get('libraries') or []),stamp,stamp,'Generated automatically from reference build',str(archive_path),json.dumps(manifest,ensure_ascii=False),json.dumps(discovery,ensure_ascii=False),json.dumps(result.get('sanitization') or {},ensure_ascii=False),str(result.get('builder_version') or 'unknown'),archive_path.stat().st_size,int((discovery.get('sizes') or {}).get('metadata') or 0),json.dumps(preflight,ensure_ascii=False)))
@@ -4455,6 +4487,7 @@ def appboxes_page(request: Request):
         "reference_versions": list_reference_versions(),
         "nodes": list_control_nodes(),
         "placement": placement_config(),
+        "selected_deployment_image": request.query_params.get("deployment_image_id", ""),
         "mode": APPBOX_MODE,
         "hostname": HOSTNAME,
         "active_page": "appboxes",
@@ -5202,31 +5235,49 @@ def list_reference_builds(limit: int = 50) -> list[dict[str, Any]]:
     return result
 
 
-def create_reference_build_draft(*, source_node_id: str, display_name: str, description: str = "", application: str = "plex") -> str:
+def create_reference_build_draft(*, source_node_id: str, display_name: str,
+                                 description: str = "", application: str = "plex",
+                                 target_image_id: str | None = None) -> str:
     application=application.strip().lower()
     if application != "plex":
         raise HTTPException(400, "La phase 1.5.0 active uniquement la fondation Plex.")
     name=display_name.strip()
     if not name:
         raise HTTPException(400, "Le nom de la référence est obligatoire.")
+    target_image_id=(target_image_id or "").strip() or None
     with db() as con:
         node=con.execute("SELECT node_id FROM nodes WHERE node_id=?",(source_node_id,)).fetchone()
+        target=con.execute("SELECT * FROM reference_images WHERE image_id=?",(target_image_id,)).fetchone() if target_image_id else None
+        deleting=con.execute("SELECT 1 FROM reference_image_deletions WHERE image_id=? AND state!='deleted'",(target_image_id,)).fetchone() if target_image_id else None
+        duplicate=con.execute("SELECT image_id FROM reference_images WHERE image_id=?",
+                              (slugify_identifier(f"{application}-{name}"),)).fetchone() if not target_image_id else None
     if not node:
         raise HTTPException(404,"Node source introuvable.")
+    if target_image_id and not target:
+        raise HTTPException(404,"Référence cible introuvable.")
+    if target and target["media_type"] != application:
+        raise HTTPException(409,"La source ne correspond pas au type de la référence.")
+    if deleting:
+        raise HTTPException(409,"Cette référence est en cours de suppression.")
+    if duplicate:
+        raise HTTPException(409,"Une référence porte déjà ce nom. Ouvrez-la puis choisissez Créer une nouvelle version.")
+    if target:
+        name=target["name"]
+        description=target["description"] or description
     build_id=f"refbuild-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     stamp=now_iso()
     with db_lock, db() as con:
         con.execute("""
             INSERT INTO reference_builds(
-                build_id,application,source_node_id,display_name,description,status,
+                build_id,image_id,application,source_node_id,display_name,description,status,
                 current_stage,progress,builder_name,builder_version,manifest_schema,
                 requested_by,created_at,updated_at
-            ) VALUES(?,?,?,?,?,'draft','foundation',0,'plex','1.0',1,'admin',?,?)
-        """,(build_id,application,source_node_id,name,description.strip(),stamp,stamp))
+            ) VALUES(?,?,?,?,?,?,'draft','foundation',0,'plex','1.0',1,'admin',?,?)
+        """,(build_id,target_image_id,application,source_node_id,name,description.strip(),stamp,stamp))
         con.execute("""
             INSERT INTO reference_build_logs(build_id,stage,level,message,details_json,created_at)
             VALUES(?, 'foundation','info', ?, '{}', ?)
-        """,(build_id,"Projet de référence créé. Aucune action intrusive n'a été lancée sur le node source.",stamp))
+        """,(build_id,"Nouvelle version préparée pour la référence existante." if target_image_id else "Projet de référence créé. Aucune action intrusive n'a été lancée sur le node source.",stamp))
     return build_id
 
 
@@ -5384,6 +5435,134 @@ def reference_images_page(request: Request):
     })
 
 
+def _reference_wizard_page(request: Request, image: dict[str, Any] | None = None):
+    return templates.TemplateResponse(request, "reference_wizard.html", {
+        "mode": APPBOX_MODE,
+        "hostname": HOSTNAME,
+        "image": image,
+        "capable_nodes": reference_capable_nodes("plex"),
+        "active_page": "reference_images",
+    })
+
+
+@app.get("/reference-images/new", response_class=HTMLResponse)
+def new_reference_wizard(request: Request):
+    return _reference_wizard_page(request)
+
+
+@app.get("/reference-images/{image_id}/new-version", response_class=HTMLResponse)
+def new_reference_version_wizard(request: Request, image_id: str):
+    image=get_reference_image(image_id)
+    if not image:
+        raise HTTPException(404, "Référence introuvable.")
+    return _reference_wizard_page(request, image)
+
+
+@app.post("/reference-images/wizard")
+def submit_reference_wizard(
+    source_node_id: str = Form(...),
+    source_instance: str = Form(""),
+    source_type: str = Form("server"),
+    application: str = Form("plex"),
+    name: str = Form(""),
+    description: str = Form(""),
+    target_image_id: str = Form(""),
+):
+    if application != "plex":
+        raise HTTPException(409, "La capture Jellyfin n’est pas encore disponible.")
+    if source_type not in {"server", "appbox"}:
+        raise HTTPException(409, "L’import d’archive sera activé dans une version ultérieure.")
+    target=get_reference_image(target_image_id) if target_image_id else None
+    if target_image_id and not target:
+        raise HTTPException(404, "Référence cible introuvable.")
+    display_name=target["name"] if target else name.strip()
+    if not display_name:
+        raise HTTPException(400, "Le nom de la référence est obligatoire.")
+    build_id=create_reference_build_draft(
+        source_node_id=source_node_id,
+        display_name=display_name,
+        description=target["description"] if target else description,
+        application=application,
+        target_image_id=target_image_id or None,
+    )
+    launch_reference_discovery(build_id, source_instance)
+    record_event(None, "reference_version_workflow_started" if target else "reference_creation_workflow_started",
+                 f"Capture guidée {build_id} lancée sur {source_node_id}.", "progress")
+    return RedirectResponse(f"/reference-builds/{build_id}", status_code=303)
+
+
+@app.get("/reference-builds/{build_id}", response_class=HTMLResponse)
+def reference_build_page(request: Request, build_id: str):
+    builds={item["build_id"]:item for item in list_reference_builds(200)}
+    build=builds.get(build_id)
+    if not build:
+        raise HTTPException(404, "Capture de référence introuvable.")
+    with db() as con:
+        logs=[dict(row) for row in con.execute(
+            "SELECT * FROM reference_build_logs WHERE build_id=? ORDER BY log_id", (build_id,)
+        ).fetchall()]
+    return templates.TemplateResponse(request, "reference_build_detail.html", {
+        "mode": APPBOX_MODE,
+        "hostname": HOSTNAME,
+        "build": build,
+        "logs": logs,
+        "image": get_reference_image(build.get("image_id")) if build.get("image_id") else None,
+        "active_page": "reference_images",
+    })
+
+
+@app.get("/reference-images/{image_id}", response_class=HTMLResponse)
+def reference_image_detail_page(request: Request, image_id: str):
+    image=get_reference_image(image_id)
+    if not image:
+        raise HTTPException(404, "Référence introuvable.")
+    versions=image["versions"]
+    with db() as con:
+        cache_rows=[dict(row) for row in con.execute("""SELECT c.*,d.status AS distribution_status
+            FROM node_reference_cache c LEFT JOIN reference_image_distribution d
+            ON d.version_id=c.version_id AND d.node_id=c.node_id
+            WHERE c.version_id IN (SELECT version_id FROM reference_image_versions WHERE image_id=?)
+            ORDER BY c.version_id,c.node_id""", (image_id,)).fetchall()]
+        appboxes=[dict(row) for row in con.execute("""SELECT client_id,status FROM appboxes
+            WHERE reference_image_id=? OR reference_version_id IN
+            (SELECT version_id FROM reference_image_versions WHERE image_id=?) ORDER BY client_id""",
+            (image_id,image_id)).fetchall()]
+        profiles=[dict(row) for row in con.execute("SELECT profile_id,name FROM provisioning_profiles WHERE reference_image_id=?",(image_id,)).fetchall()]
+    by_version={version["version_id"]:[] for version in versions}
+    for cache in cache_rows:
+        by_version.setdefault(cache["version_id"],[]).append(cache)
+    for version in versions:
+        version["caches"]=by_version.get(version["version_id"],[])
+        version["ux_status"]=("ACTIVE" if version["version_id"]==image["current_version_id"] else
+                              "EN SUPPRESSION" if version["state"]=="deleting" else
+                              "ERREUR" if version["state"] in {"failed","error"} else
+                              "EN CONSTRUCTION" if version["state"] in {"draft","building"} else "HISTORIQUE")
+    builds=[build for build in list_reference_builds(200) if build.get("image_id")==image_id]
+    return templates.TemplateResponse(request, "reference_image_detail.html", {
+        "mode": APPBOX_MODE,
+        "hostname": HOSTNAME,
+        "image": image,
+        "versions": versions,
+        "builds": builds,
+        "appboxes": appboxes,
+        "profiles": profiles,
+        "active_page": "reference_images",
+    })
+
+
+@app.post("/reference-images/{image_id}/metadata")
+def update_reference_image_metadata(image_id: str, name: str = Form(...), description: str = Form("")):
+    if not name.strip():
+        raise HTTPException(400, "Le nom est obligatoire.")
+    with db_lock, db() as con:
+        changed=con.execute("UPDATE reference_images SET name=?,description=?,updated_at=? WHERE image_id=?",
+                            (name.strip(),description.strip(),now_iso(),image_id)).rowcount
+    if not changed:
+        raise HTTPException(404, "Référence introuvable.")
+    record_event(None,"reference_metadata_updated",f"Métadonnées de {image_id} mises à jour.","success")
+    return RedirectResponse(f"/reference-images/{image_id}",status_code=303)
+
+
 @app.post("/reference-images")
 def create_reference_image(
     name: str = Form(...),
@@ -5486,7 +5665,9 @@ def create_reference_image_version(
 
 
 @app.post("/reference-images/{image_id}/publish/{version_id}")
-def publish_reference_image_version(image_id: str, version_id: str):
+def publish_reference_image_version(image_id: str, version_id: str, confirmed: bool = Form(False)):
+    if not confirmed:
+        raise HTTPException(400, "Confirmez la bascule de version active.")
     stamp = now_iso()
     with db_lock, db() as con:
         version = con.execute("""
@@ -5515,7 +5696,7 @@ def publish_reference_image_version(image_id: str, version_id: str):
         f"{image_id} utilise maintenant {version_id}.",
         "success",
     )
-    return RedirectResponse("/reference-images", status_code=303)
+    return RedirectResponse(f"/reference-images/{image_id}", status_code=303)
 
 
 

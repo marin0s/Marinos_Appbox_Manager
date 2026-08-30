@@ -18,6 +18,16 @@ Le runtime observé par les agents est la source de vérité pour l'état des co
 
 Les communications sont initiées par les agents vers le Control Plane. Aucun accès Docker distant direct depuis CRONOS n'est requis.
 
+## Cycle de vie des références
+
+La bibliothèque et la fiche ne possèdent aucun moteur métier propre. Le wizard crée un
+`reference_build`, puis réutilise découverte, preflight, capture, upload, validation et
+publication. Pour une nouvelle version, `reference_builds.image_id` désigne explicitement
+la référence cible. La publication conserve cet `image_id`, insère une nouvelle version
+et bascule `current_version_id`; l’ancienne version devient historique dans l’UX. Aucun
+schéma supplémentaire ni changement agent n’est requis. Voir
+[le cycle de vie UX](reference-lifecycle.md).
+
 ## Suppression des Reference Images
 
 Le Control Plane pilote une opération persistante par image/version. Il verrouille
