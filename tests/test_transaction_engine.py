@@ -481,13 +481,43 @@ def test_appbox_lease_progress_expiry_late_result_and_restart_are_terminal(job_d
     with patch.object(main,'authenticate_agent'):
         claimed=json.loads(main.agent_poll_commands('artemis',AgentResultRequest({})).body)['command']
         assert claimed['command_id']==command_id
+        assert claimed['command_deadline_at']
+        asyncio.run(main.agent_command_progress('artemis',command_id,AgentResultRequest({'stage':'preparing','percent':5,'detail':'preparing'})))
         asyncio.run(main.agent_command_progress('artemis',command_id,AgentResultRequest({'stage':'checksum_reference','percent':63,'detail':'checksum'})))
         asyncio.run(main.agent_command_progress('artemis',command_id,AgentResultRequest({'stage':'checksum_reference','percent':20,'detail':'old'})))
     with main.db() as con:
-        command=con.execute("SELECT lease_expires_at,worker_activity_at,progress_json FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+        command=con.execute("SELECT lease_expires_at,worker_activity_at,progress_json,command_deadline_at FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+        claimed_lease=command['lease_expires_at']; claimed_activity=command['worker_activity_at']
         step=con.execute("SELECT progress FROM job_steps WHERE job_id=? AND step_key='checksum_reference'",(job_id,)).fetchone()[0]
-        assert command['lease_expires_at'] and command['worker_activity_at'] and step==63
-        con.execute("UPDATE agent_commands SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE command_id=?",(command_id,))
+        docker=con.execute("SELECT status FROM job_steps WHERE job_id=? AND step_key='docker_deploy'",(job_id,)).fetchone()[0]
+        assert command['lease_expires_at'] and command['worker_activity_at'] and command['command_deadline_at'] and step==63
+        assert docker == 'pending'
+    # UX progress cannot renew ownership. A heartbeat from the runtime that owns
+    # this exact command does, without changing functional progress.
+    with patch.object(main,'authenticate_agent'):
+        heartbeat_response=asyncio.run(main.agent_heartbeat('artemis',AgentResultRequest({
+            'agent_version':'test','active_command_id':command_id,
+            'capabilities':{'deployment_executor':True,'appbox_command_lease':True},
+        })))
+        heartbeat=json.loads(heartbeat_response.body)
+        assert heartbeat['status']=='ok'
+    with main.db() as con:
+        renewed=con.execute("SELECT lease_expires_at,worker_activity_at,progress_json FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+        assert renewed['lease_expires_at'] >= claimed_lease
+        assert renewed['worker_activity_at'] >= claimed_activity
+        assert json.loads(renewed['progress_json'])['percent']==20
+    with patch.object(main,'authenticate_agent'):
+        asyncio.run(main.agent_command_progress('artemis',command_id,AgentResultRequest({'stage':'compose_deployment','percent':10,'detail':'compose'})))
+    with main.db() as con:
+        assert con.execute("SELECT status FROM job_steps WHERE job_id=? AND step_key='docker_deploy'",(job_id,)).fetchone()[0]=='running'
+        con.execute("UPDATE agent_commands SET lease_expires_at='2000-01-01T00:00:00+00:00',command_deadline_at='2000-01-01T00:00:00+00:00' WHERE command_id=?",(command_id,))
+    with patch.object(main,'authenticate_agent'):
+        asyncio.run(main.agent_heartbeat('artemis',AgentResultRequest({
+            'agent_version':'test','active_command_id':command_id,
+            'capabilities':{'deployment_executor':True,'appbox_command_lease':True},
+        })))
+    with main.db() as con:
+        assert con.execute("SELECT lease_expires_at FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()[0]=='2000-01-01T00:00:00+00:00'
     assert main.expire_appbox_command_leases()==1
     stalled=next(item for item in main.list_control_nodes() if item['node_id']=='artemis')
     assert stalled['status']=='online' and stalled['executor_health']=='stalled' and not stalled['execution_capable']

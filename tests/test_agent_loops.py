@@ -3,6 +3,7 @@ import unittest
 import asyncio
 import json
 import tempfile
+import urllib.error
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,12 +27,13 @@ class AgentLoopTests(unittest.TestCase):
     def test_appbox_worker_reports_real_phase_activity_before_result(self):
         calls=[]
         command={'command_id':'deploy-one','command_type':'appbox_action','payload':{'action':'deploy'}}
-        def api(config,method,path,payload=None):
+        def api(config,method,path,payload=None,**_kwargs):
             calls.append((method,path,payload))
             if method=='GET':
                 return {'command':command}
             return {}
         def execute(config,received,**kwargs):
+            kwargs['progress_callback'](stage='preparing',percent=5,detail='preparing')
             kwargs['progress_callback'](stage='checksum_reference',percent=25,detail='checksum')
             kwargs['progress_callback'](stage='extraction',percent=50,detail='extraction')
             return {'state':'running'}
@@ -42,8 +44,38 @@ class AgentLoopTests(unittest.TestCase):
         with patch.object(agent,'api',side_effect=api), patch.object(agent,'execute_command',side_effect=execute):
             agent.command_cycle({'node_id':'test'},runtime=Runtime())
         progress=[payload for method,path,payload in calls if path.endswith('/progress')]
-        self.assertEqual([item['stage'] for item in progress],['checksum_reference','extraction'])
+        self.assertEqual([item['stage'] for item in progress],['preparing','checksum_reference','extraction'])
         self.assertEqual(calls[-1][2]['status'],'success')
+
+    def test_progress_outage_is_non_blocking_and_does_not_duplicate_worker(self):
+        calls=[]
+        command={'command_id':'deploy-retry','command_type':'appbox_action','payload':{'action':'deploy'}}
+        progress_attempts=[0]
+        executions=[0]
+        def api(config,method,path,payload=None,**_kwargs):
+            calls.append((method,path,payload))
+            if method=='GET':
+                return {'command':command}
+            if path.endswith('/progress'):
+                progress_attempts[0] += 1
+                if progress_attempts[0] == 1:
+                    raise urllib.error.URLError('temporary outage')
+            return {}
+        def execute(config,received,**kwargs):
+            executions[0] += 1
+            kwargs['progress_callback'](stage='preparing',percent=5,detail='preparing')
+            kwargs['progress_callback'](stage='cache_reference',percent=10,detail='cache')
+            kwargs['progress_callback'](stage='checksum_reference',percent=20,detail='checksum')
+            return {'state':'running'}
+        class Runtime:
+            cancel_event=threading.Event()
+            def begin_command(self,command_id): pass
+            def finish_command(self,command_id): pass
+        with patch.object(agent,'api',side_effect=api), patch.object(agent,'execute_command',side_effect=execute):
+            agent.command_cycle({'node_id':'test','command_progress_timeout_seconds':1},runtime=Runtime())
+        self.assertEqual(executions, [1])
+        self.assertGreaterEqual(progress_attempts[0], 2)
+        self.assertEqual(sum(1 for method,path,_ in calls if path.endswith('/result')), 1)
 
     def test_long_command_and_blocked_telemetry_do_not_block_heartbeats(self):
         loops = agent.AgentLoops({'node_id':'test'})

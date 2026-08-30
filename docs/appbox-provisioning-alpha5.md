@@ -21,15 +21,18 @@ un état métier historique possible d’une AppBox, pas un état actif de job.
 
 Un nouvel agent annonce `appbox_command_lease` et `appbox_progress`. Au claim, le CP
 crée un bail de 180 secondes par défaut, configurable par
-`APPBOX_COMMAND_LEASE_SECONDS` (minimum 30). Le heartbeat agent ne le renouvelle pas.
-Le code métier renouvelle le bail lors d’une activité réelle : cache/checksum,
-validation gzip/tar, extraction, copie et backup SQLite, personnalisation, écriture de
-configuration, polling de Docker Compose et attente runtime.
+`APPBOX_COMMAND_LEASE_SECONDS` (minimum 30). Le heartbeat léger transmet
+`active_command_id` et renouvelle le bail uniquement si cette commande est encore
+claimed sur ce node. Cette preuve d'ownership met à jour `worker_activity_at` sans
+changer le stage, le détail ou le pourcentage. Le renouvellement ne dépasse jamais
+`command_deadline_at`, calculé une fois au claim avec
+`APPBOX_COMMAND_MAX_RUNTIME_SECONDS` (7200 s par défaut).
 
-Une perte réseau temporaire est tolérée pendant
-`command_progress_grace_seconds` (150 s par défaut côté agent). Une clôture explicite
-du CP arrête immédiatement le travail local; une absence prolongée d’ACK arrête le
-worker avant l’expiration normale. Si le process ou le worker disparaît, le bail expire,
+Le canal progress est distinct et best effort. Il utilise un reporter asynchrone avec
+timeout court (`command_progress_timeout_seconds`, 5 s par défaut), coalescence et logs
+tentative/résultat/durée. Une panne de ce canal ne bloque pas checksum/extraction et ne
+renouvelle pas le bail. Les réponses 404/409/410 ou l'annulation renvoyée déclenchent
+l'arrêt coopératif au prochain callback. Si le process ou le worker disparaît, le bail expire,
 commande et job passent `failed` et la relance doit être décidée après inspection du
 runtime. Un résultat après expiration est accepté au niveau transport mais ignoré avec
 un événement `late_agent_result_ignored`. Après restart, l’agent ne reçoit que les
@@ -44,10 +47,11 @@ requise pour détecter un worker figé avec heartbeat encore sain.
 
 ## Progression
 
-Le workflow deploy persiste les phases validation node/stockage/manifeste, cache,
+Le workflow deploy persiste les phases validation node/stockage/manifeste, préparation neutre, cache,
 checksum, validation archive, extraction, SQLite, personnalisation runtime, fichiers,
 Compose, attente runtime/health, refresh, watchdog et notification. Les pourcentages
-de phase et du job ne diminuent pas. Un résultat final peut confirmer une phase déjà
+de phase et du job ne diminuent pas. `preparing` ne démarre aucune étape Docker et
+`docker_deploy` ne passe running qu'au report `compose_deployment`. Un résultat final peut confirmer une phase déjà
 running; une phase non applicable ou non observable est `skipped`, jamais déclarée
 faussement exécutée. Le job global n’atteint 100 % qu’à son état terminal.
 
@@ -85,11 +89,14 @@ orphelines sont libérées sans campagne de nettoyage distante.
    et les réservations Plex/Tautulli sur ARTEMIS, pas CRONOS.
 4. Déployer. Observer dans le job les phases cache, checksum, archive, extraction,
    SQLite, runtime, configuration, Compose et santé. Vérifier une progression monotone,
-   `worker_activity_at` et le renouvellement du bail pendant les phases longues.
-5. Sur une AppBox jetable, suspendre uniquement le worker ou simuler une phase sans
-   activité au-delà du timeout en gardant le heartbeat. Attendre `failed`, node toujours
-   ONLINE mais exécuteur stalled jusqu’à réconciliation. Ne pas refaire ce test sur
-   `ab34ah`.
+   `worker_activity_at` et le renouvellement du bail par heartbeat pendant les phases longues,
+   même si le canal progress est momentanément indisponible.
+5. Sur une AppBox jetable, arrêter réellement l'agent et attendre l'expiration du bail :
+   commande/job deviennent `failed` et le node devient OFFLINE au timeout heartbeat.
+   Dans un second essai jetable, réduire `APPBOX_COMMAND_MAX_RUNTIME_SECONDS` en gardant
+   heartbeat et ownership actifs : au deadline, commande/job deviennent `failed`, le node
+   reste ONLINE mais son exécuteur est stalled jusqu’à reprise du poll. Ne pas faire ces
+   essais sur `ab34ah`.
 6. Envoyer/simuler le résultat tardif de cette commande : commande/job restent failed,
    AppBox et ports inchangés, événement explicite présent. Redémarrer l’agent et vérifier
    que cette commande n’est pas redistribuée.

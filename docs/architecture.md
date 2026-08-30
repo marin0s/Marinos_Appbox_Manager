@@ -15,10 +15,12 @@ Après restart, les jobs running sont finalisés en `failed` et leurs commandes 
 queued annulées ; les jobs queued sont conservés. Voir [suppression et reprise](appbox-deletion-hotfix.md).
 
 Les agents annonçant `appbox_command_lease` séparent la liveness du processus et celle
-du worker métier. Le heartbeat maintient le node online mais ne renouvelle jamais ce
-bail. Seules les activités observées (checksum, validation, extraction, copie/backup
-SQLite, écritures, attente du subprocessus Compose et runtime) renouvellent
-`lease_expires_at` et `worker_activity_at`. Une commande figée devient terminale et son
+du worker métier. Le heartbeat maintient le node online et, lorsque le runtime déclare
+l'identifiant exact de la commande qu'il possède, renouvelle son ownership sans inventer
+de progression fonctionnelle. Le renouvellement reste borné par
+`command_deadline_at`. Le canal progress est une télémétrie UX best effort indépendante :
+il ne renouvelle ni `lease_expires_at` ni `worker_activity_at`. Une commande sans
+heartbeat propriétaire, ou arrivée à son deadline global, devient terminale et son
 résultat tardif ne modifie plus AppBox, job ou ports. Les agents alpha.5 antérieurs ne
 reçoivent pas ce bail afin de préserver leur protocole. Voir
 [provisioning distribué alpha.5](appbox-provisioning-alpha5.md).

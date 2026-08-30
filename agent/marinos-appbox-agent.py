@@ -15,6 +15,7 @@ import tarfile
 import tempfile
 import time
 from threading import Event, Lock, Thread
+from queue import Empty, Full, Queue
 import uuid
 import urllib.error
 import urllib.request
@@ -1533,7 +1534,7 @@ def send_inventory(config):
     return api(config, "POST", f"/api/agent/v1/{config['node_id']}/inventory", payload)
 
 
-def api(config, method, path, payload=None):
+def api(config, method, path, payload=None, *, timeout=None):
     base = config["control_plane_url"].rstrip("/")
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -1546,7 +1547,7 @@ def api(config, method, path, payload=None):
             "User-Agent": f"marinos-appbox-agent/{VERSION}",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=20 if timeout is None else timeout) as response:
         raw = response.read()
         return json.loads(raw.decode("utf-8")) if raw else {}
 
@@ -2160,6 +2161,126 @@ def execute_command(config, command, *, progress_callback=None, cancel_event=Non
     raise RuntimeError(f"Commande non supportée : {command_type}")
 
 
+class CommandProgressReporter:
+    """Best-effort UX telemetry that never owns or renews a command lease."""
+
+    def __init__(self, config, command_id, cancel_event):
+        self.config = config
+        self.command_id = str(command_id)
+        self.cancel_event = cancel_event
+        self.timeout = min(30.0, max(1.0, float(config.get('command_progress_timeout_seconds', 5))))
+        self.pending = Queue(maxsize=16)
+        self.last_attempt_at = 0.0
+        self.last_stage = ''
+        self.last_percent = -1
+        self.thread = Thread(target=self._send_loop, name='agent-command-progress', daemon=True)
+        self.thread.start()
+
+    def __call__(self, *args, **kwargs):
+        if self.cancel_event.is_set():
+            raise CommandCancelled('Commande annulée pendant une opération longue.')
+        now = time.monotonic()
+        stage = str(kwargs.get('stage') or 'capture')
+        percent = kwargs.get('percent')
+        if len(args) >= 2:
+            written, estimated = args[:2]
+            total = max(0, int(estimated or 0))
+            completed = max(0, int(written or 0))
+            payload = {
+                'stage': stage,
+                'percent': max(0, min(100, round(completed * 100 / total))) if total else 0,
+                'bytes_written': completed,
+                'estimated_payload_bytes': total,
+                'detail': str(kwargs.get('detail') or '')[:500],
+            }
+        else:
+            payload = {
+                'stage': stage,
+                'percent': max(0, min(100, int(percent or 0))),
+                'detail': str(kwargs.get('detail') or '')[:500],
+            }
+            if kwargs.get('completed') is not None:
+                payload['bytes_written'] = int(kwargs['completed'])
+            if kwargs.get('total') is not None:
+                payload['estimated_payload_bytes'] = int(kwargs['total'])
+        current_percent = int(payload.get('percent', -1))
+        stage_changed = stage != self.last_stage
+        if stage_changed:
+            self.last_percent = -1
+        significant = (
+            stage_changed
+            or current_percent >= 100
+            or current_percent >= self.last_percent + 5
+            or now - self.last_attempt_at >= 2.0
+        )
+        if not significant:
+            return
+        self.last_attempt_at = now
+        self.last_stage = stage
+        self.last_percent = max(self.last_percent, current_percent)
+        try:
+            self.pending.put_nowait(payload)
+        except Full:
+            # Coalesce old UX samples; ownership continues through heartbeat.
+            try:
+                self.pending.get_nowait()
+                self.pending.task_done()
+            except Empty:
+                pass
+            self.pending.put_nowait(payload)
+
+    def _send_loop(self):
+        while True:
+            payload = self.pending.get()
+            if payload is None:
+                self.pending.task_done()
+                return
+            stage = payload.get('stage', '')
+            percent = payload.get('percent', 0)
+            started = time.monotonic()
+            print(f"Agent progress: event=attempt command={self.command_id[:12]} stage={stage} percent={percent}", flush=True)
+            outcome = 'success'
+            try:
+                response = api(
+                    self.config, 'POST',
+                    f"/api/agent/v1/{self.config['node_id']}/commands/{self.command_id}/progress",
+                    payload, timeout=self.timeout,
+                )
+                if response.get('cancel_requested'):
+                    self.cancel_event.set()
+                    outcome = 'cancel_requested'
+            except urllib.error.HTTPError as exc:
+                outcome = f'http_{exc.code}'
+                if exc.code in {404, 409, 410}:
+                    self.cancel_event.set()
+            except (urllib.error.URLError, TimeoutError, OSError):
+                outcome = 'timeout_or_network_error'
+            except Exception:
+                outcome = 'unexpected_error'
+            finally:
+                duration_ms = round((time.monotonic() - started) * 1000, 1)
+                print(f"Agent progress: event=completed command={self.command_id[:12]} stage={stage} percent={percent} result={outcome} duration_ms={duration_ms}", flush=True)
+                self.pending.task_done()
+
+    def close(self):
+        # Give a healthy endpoint a short opportunity to flush stage transitions,
+        # but never make the business result wait for an unavailable UX channel.
+        drain_until = time.monotonic() + 0.5
+        while self.pending.unfinished_tasks and time.monotonic() < drain_until:
+            time.sleep(0.01)
+        while True:
+            try:
+                self.pending.get_nowait()
+                self.pending.task_done()
+            except Empty:
+                break
+        try:
+            self.pending.put_nowait(None)
+        except Full:
+            return
+        self.thread.join(0.1)
+
+
 def command_cycle(config, inventory_request=None, runtime=None):
     response = api(
         config,
@@ -2170,71 +2291,13 @@ def command_cycle(config, inventory_request=None, runtime=None):
     if not command:
         return
     progress_callback = None
+    progress_reporter = None
     cancel_event = None
     if runtime is not None:
         runtime.begin_command(command['command_id'])
         cancel_event = runtime.cancel_event
-        progress_state = {
-            'last_attempt_at': 0.0,
-            'last_success_at': time.monotonic(),
-            'last_stage': '',
-            'last_percent': -1,
-        }
-        configured_grace = max(5.0, float(config.get('command_progress_grace_seconds', 150)))
-        lease_window = max(15.0, float(command.get('lease_timeout_seconds') or 180))
-        progress_grace = min(configured_grace, max(5.0, lease_window - 10.0))
-
-        def progress_callback(*args, **kwargs):
-            now = time.monotonic()
-            stage = str(kwargs.get('stage') or 'capture')
-            percent = kwargs.get('percent')
-            if len(args) >= 2:
-                written, estimated = args[:2]
-                payload = {
-                    'stage': stage,
-                    'bytes_written': int(written or 0),
-                    'estimated_payload_bytes': int(estimated or 0),
-                }
-            else:
-                payload = {
-                    'stage': stage,
-                    'percent': max(0, min(100, int(percent or 0))),
-                    'detail': str(kwargs.get('detail') or '')[:500],
-                }
-                if kwargs.get('completed') is not None:
-                    payload['bytes_written'] = int(kwargs['completed'])
-                if kwargs.get('total') is not None:
-                    payload['estimated_payload_bytes'] = int(kwargs['total'])
-            current_percent = int(payload.get('percent', -1))
-            significant = (
-                stage != progress_state['last_stage']
-                or current_percent >= 100
-                or current_percent >= progress_state['last_percent'] + 5
-                or now - progress_state['last_attempt_at'] >= 2.0
-            )
-            if not significant:
-                return
-            progress_state['last_attempt_at'] = now
-            progress_state['last_stage'] = stage
-            progress_state['last_percent'] = max(progress_state['last_percent'], current_percent)
-            try:
-                response=api(config,'POST',f"/api/agent/v1/{config['node_id']}/commands/{command['command_id']}/progress",payload)
-            except urllib.error.HTTPError as exc:
-                if exc.code in {404, 409, 410}:
-                    cancel_event.set()
-                    raise CommandCancelled('Le Control Plane a clôturé la commande ; arrêt du worker local.') from None
-                if now - progress_state['last_success_at'] >= progress_grace:
-                    cancel_event.set()
-                    raise RuntimeError('Lease de commande non renouvelable ; arrêt avant expiration.') from None
-                return
-            except (urllib.error.URLError, TimeoutError, OSError):
-                if now - progress_state['last_success_at'] >= progress_grace:
-                    cancel_event.set()
-                    raise RuntimeError('Lease de commande non renouvelable ; arrêt avant expiration.') from None
-                return
-            progress_state['last_success_at'] = now
-            if response.get('cancel_requested'):
-                cancel_event.set()
+        progress_reporter = CommandProgressReporter(config, command['command_id'], cancel_event)
+        progress_callback = progress_reporter
     try:
         if command.get('command_type') == 'inventory' and inventory_request is not None:
             inventory_request.set()
@@ -2256,6 +2319,8 @@ def command_cycle(config, inventory_request=None, runtime=None):
         diagnostics = getattr(exc, "diagnostics", None)
         result = {"diagnostics": _sanitize_diagnostics(diagnostics)} if isinstance(diagnostics, dict) else {}
         payload = {"status": "failed", "error": _sanitize_diagnostic_text(str(exc)), "result": result}
+    if progress_reporter is not None:
+        progress_reporter.close()
     try:
         api(config,"POST",f"/api/agent/v1/{config['node_id']}/commands/{command['command_id']}/result",payload)
     finally:

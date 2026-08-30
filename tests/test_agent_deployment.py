@@ -6,6 +6,7 @@ import unittest
 import io
 import tarfile
 import errno
+import os
 import stat
 import pytest
 from pathlib import Path
@@ -321,7 +322,13 @@ class AgentDeploymentTests(unittest.TestCase):
 
     def test_cached_reference_reports_checksum_validation_extraction_and_sqlite(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp); data=reference_archive(root).read_bytes()
+            root=Path(tmp); archive=reference_archive(root)
+            # Realistic multi-block cached reference: progress must start before
+            # checksum completion and preserve the provisioning stage order.
+            (root/'fixture-config'/agent.PLEX_REFERENCE_ROOT/'Metadata/large.bin').write_bytes(os.urandom(3*1024*1024+17))
+            with tarfile.open(archive,'w:gz') as tar:
+                tar.add(root/'fixture-config'/'Library',arcname='Library')
+            data=archive.read_bytes()
             self.install(root,data)
             descriptor={'version_id':'v1','download_path':'/api/agent/v1/test/archive',
                         'sha256':hashlib.sha256(data).hexdigest(),
@@ -339,6 +346,30 @@ class AgentDeploymentTests(unittest.TestCase):
             for stage in stages:
                 values=[item['percent'] for item in progress if item['stage']==stage]
                 self.assertTrue(all(0 <= value <= 100 for value in values),stage)
+            first={stage:next(index for index,item in enumerate(progress) if item['stage']==stage)
+                   for stage in ('cache_reference','checksum_reference','archive_validation','extraction')}
+            self.assertLess(first['cache_reference'],first['checksum_reference'])
+            self.assertLess(first['checksum_reference'],first['archive_validation'])
+            self.assertLess(first['archive_validation'],first['extraction'])
+
+    def test_cancellation_interrupts_cached_checksum_and_extraction(self):
+        for cancelled_stage in ('checksum_reference','extraction'):
+            with self.subTest(stage=cancelled_stage), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp); data=reference_archive(root).read_bytes()
+                checksum=hashlib.sha256(data).hexdigest()
+                cache=root/'cache'; cache.mkdir(); (cache/f'{checksum}.tar.gz').write_bytes(data)
+                descriptor={'version_id':'v1','download_path':'/api/agent/v1/test/archive',
+                            'sha256':checksum,'size_bytes':len(data),'target_directory':'plex-config'}
+                def cancel(**payload):
+                    if payload['stage']==cancelled_stage:
+                        raise agent.CommandCancelled(f'cancelled during {cancelled_stage}')
+                with self.assertRaises(agent.CommandCancelled):
+                    agent.install_reference_archive(
+                        {'reference_cache_dir':str(cache)},descriptor,root/'cancelled-appbox',
+                        progress_callback=cancel,
+                    )
+                self.assertFalse((root/'cancelled-appbox'/'plex-config').exists())
+                self.assertEqual(list((root/'cancelled-appbox').glob('.plex-config.staging-*')),[])
 
     def test_large_checksum_reports_incremental_worker_activity(self):
         from agent.reference_contract import sha256_file

@@ -90,6 +90,7 @@ def sha256_file(path, progress_callback=None):
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(block)
             completed+=len(block); _progress(progress_callback,'checksum_reference',completed,total,'Calcul SHA-256 du cache de référence.')
+    _progress(progress_callback,'checksum_reference',total,total,'Calcul SHA-256 du cache de référence terminé.')
     return digest.hexdigest()
 
 
@@ -216,6 +217,7 @@ def validate_archive(path, plex=False, progress_callback=None):
             raise RuntimeError('Archive Plex : Metadata/Media absents.')
         if not {PLEX_ROOT+'/Preferences.xml', PLEX_ROOT+'/Plug-in Support/Databases/com.plexapp.plugins.library.db'} <= files:
             raise RuntimeError('Archive Plex : préférences ou base canonique absentes.')
+    _progress(progress_callback,'archive_validation',max(1,total),max(1,total),'Archive de référence validée.')
     return {'file_count': len(files), 'uncompressed_size_bytes': total}
 
 
@@ -243,3 +245,4 @@ def extract_archive(path, destination, progress_callback=None):
                         output.write(block); completed+=len(block)
                         _progress(progress_callback,'extraction',completed,total,'Extraction atomique dans le staging.')
                 target.chmod((member.mode & 0o755) | 0o600)
+    _progress(progress_callback,'extraction',total,total,'Extraction de la référence terminée.')

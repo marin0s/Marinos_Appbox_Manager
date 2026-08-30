@@ -50,6 +50,10 @@ AGENT_CLAIM_TIMEOUT_SECONDS = max(5, int(os.getenv("APPBOX_AGENT_CLAIM_TIMEOUT_S
 JOB_WATCHDOG_INTERVAL = max(15, int(os.getenv("APPBOX_JOB_WATCHDOG_INTERVAL", "30")))
 REFERENCE_COMMAND_LEASE_SECONDS = max(30, int(os.getenv("APPBOX_REFERENCE_COMMAND_LEASE_SECONDS", "180")))
 APPBOX_COMMAND_LEASE_SECONDS = max(30, int(os.getenv("APPBOX_COMMAND_LEASE_SECONDS", "180")))
+APPBOX_COMMAND_MAX_RUNTIME_SECONDS = max(
+    APPBOX_COMMAND_LEASE_SECONDS,
+    int(os.getenv("APPBOX_COMMAND_MAX_RUNTIME_SECONDS", "7200")),
+)
 JOB_ACTIVE_STATUSES = frozenset({'queued', 'running'})
 JOB_TERMINAL_STATUSES = frozenset({'success', 'failed', 'cancelled', 'error'})  # error is legacy-only
 COMMAND_TERMINAL_STATUSES = frozenset({'success', 'failed', 'cancelled'})
@@ -1150,6 +1154,7 @@ def init_database() -> None:
             "cancel_requested_at": "TEXT",
             "progress_json": "TEXT NOT NULL DEFAULT '{}'",
             "worker_activity_at": "TEXT",
+            "command_deadline_at": "TEXT",
         }.items():
             if column not in command_columns:
                 con.execute(f"ALTER TABLE agent_commands ADD COLUMN {column} {definition}")
@@ -4109,7 +4114,9 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
         update_step(job_id, "validate_compose", "success", compose_detail, 100, executor=f"agent-{node_id}")
     elif action == "start":
         update_step(job_id, "validate_compose", "success", "Compose et conteneurs existants validés par l’agent distant.", 100, executor=f"agent-{node_id}")
-    update_step(job_id, docker_step, "running", f"Commande {command_id[:8]} envoyée à {node_id}.", 20, executor=f"agent-{node_id}")
+    # Queued/claimed is ownership state, not proof that Docker has started.
+    # The compose step becomes running only from the agent compose_deployment stage.
+    update_job(job_id, progress=35, detail=f"Commande {command_id[:8]} envoyée à {node_id} ; préparation distante en attente.")
     ok, result, error = wait_agent_command(command_id, timeout=7200 if reference_archive else 900, job_id=job_id)
     detail = result.get("output") or error or "Commande distante terminée."
     if ok and reference_archive and not result.get("health_verified"):
@@ -5181,13 +5188,39 @@ async def agent_heartbeat(node_id: str, request: Request):
             store_agent_metrics(con, node_id, metrics, agent_version,
                                 payload.get('metrics_collected_at') or stamp)
         if active_command_id:
-            command = con.execute("SELECT command_type,status,cancel_requested_at FROM agent_commands WHERE command_id=? AND node_id=?",
+            command = con.execute("SELECT command_type,status,cancel_requested_at,command_deadline_at,payload_json FROM agent_commands WHERE command_id=? AND node_id=?",
                                   (active_command_id, node_id)).fetchone()
-            if command and command['command_type'] == 'reference_build' and command['status'] == 'claimed':
+            if command and command['command_type'] in {'reference_build', 'appbox_action'} and command['status'] == 'claimed':
                 cancel_requested = bool(command['cancel_requested_at'])
                 if not cancel_requested:
-                    lease = (datetime.now(timezone.utc) + timedelta(seconds=REFERENCE_COMMAND_LEASE_SECONDS)).isoformat()
-                    con.execute("UPDATE agent_commands SET lease_expires_at=? WHERE command_id=?", (lease, active_command_id))
+                    current = datetime.now(timezone.utc)
+                    lease_seconds = (REFERENCE_COMMAND_LEASE_SECONDS if command['command_type'] == 'reference_build'
+                                     else APPBOX_COMMAND_LEASE_SECONDS)
+                    lease_end = current + timedelta(seconds=lease_seconds)
+                    deadline = None
+                    if command['command_deadline_at']:
+                        try:
+                            deadline = datetime.fromisoformat(command['command_deadline_at'])
+                        except (TypeError, ValueError):
+                            deadline = current
+                    if deadline is not None and current >= deadline:
+                        cancel_requested = True
+                    else:
+                        if deadline is not None:
+                            lease_end = min(lease_end, deadline)
+                        con.execute("UPDATE agent_commands SET lease_expires_at=?,worker_activity_at=? WHERE command_id=?",
+                                    (lease_end.isoformat(), stamp, active_command_id))
+                        if command['command_type'] == 'appbox_action':
+                            try:
+                                job_id = str(json.loads(command['payload_json'] or '{}').get('_job_id') or '')
+                            except Exception:
+                                job_id = ''
+                            if job_id:
+                                # Keep the workflow watchdog informed without inventing UX progress.
+                                con.execute("UPDATE jobs SET updated_at=? WHERE job_id=? AND status='running'", (stamp, job_id))
+            elif command and command['command_type'] in {'reference_build', 'appbox_action'}:
+                # The runtime still believes it owns a command already terminal on CP.
+                cancel_requested = True
     return JSONResponse({
         "status": "ok",
         "server_version": VERSION,
@@ -5296,39 +5329,53 @@ def agent_poll_commands(node_id: str, request: Request):
         claimed_at = now_iso()
         lease_seconds = (REFERENCE_COMMAND_LEASE_SECONDS if row['command_type']=='reference_build' else
                          APPBOX_COMMAND_LEASE_SECONDS if row['command_type']=='appbox_action' and node and node.get('capabilities',{}).get('appbox_command_lease') else None)
-        lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat() if lease_seconds else None
+        claimed_now = datetime.now(timezone.utc)
+        lease = (claimed_now + timedelta(seconds=lease_seconds)).isoformat() if lease_seconds else None
+        deadline = ((claimed_now + timedelta(seconds=APPBOX_COMMAND_MAX_RUNTIME_SECONDS)).isoformat()
+                    if row['command_type'] == 'appbox_action' and lease_seconds else None)
         con.execute("""
             UPDATE agent_commands
-            SET status='claimed',claimed_at=?,lease_expires_at=?,worker_activity_at=?
+            SET status='claimed',claimed_at=?,lease_expires_at=?,worker_activity_at=?,command_deadline_at=?
             WHERE command_id=? AND status='queued'
-        """, (claimed_at, lease, claimed_at if lease else None, row["command_id"]))
+        """, (claimed_at, lease, claimed_at if lease else None, deadline, row["command_id"]))
     command = dict(row)
     command["payload"] = json.loads(command.pop("payload_json") or "{}")
     command['lease_timeout_seconds'] = lease_seconds
+    command['command_deadline_at'] = deadline
     return JSONResponse({"command": command})
 
 
 @app.post("/api/agent/v1/{node_id}/commands/{command_id}/progress")
 async def agent_command_progress(node_id: str, command_id: str, request: Request):
+    arrived_at = time.monotonic()
+    print(f"[agent-progress] event=received node={node_id} command={command_id[:12]}", flush=True)
     authenticate_agent(request, node_id)
     payload = await request.json()
     bytes_written = max(0, int(payload.get('bytes_written') or 0))
     estimated = max(1, int(payload.get('estimated_payload_bytes') or 1))
     stage = str(payload.get('stage') or 'capture')[:64]
     stamp = now_iso()
-    with db_lock, db() as con:
+    lock_started = time.monotonic()
+    result = 'ok'
+    try:
+      with db_lock, db() as con:
+        lock_wait_ms = round((time.monotonic() - lock_started) * 1000, 1)
+        transaction_started = time.monotonic()
         command = con.execute("SELECT * FROM agent_commands WHERE command_id=? AND node_id=? AND command_type IN ('reference_build','appbox_action')",
                               (command_id, node_id)).fetchone()
         if not command or command['status'] != 'claimed':
+            result = 'inactive'
             raise HTTPException(409, 'Commande longue inactive.')
         if command['cancel_requested_at']:
+            result = 'cancelling'
             return JSONResponse({'status':'cancelling','cancel_requested':True})
         percent=max(0,min(100,int(payload.get('percent') or 0)))
         detail=str(payload.get('detail') or '')[:12000]
         data = {'stage':stage,'percent':percent,'detail':detail,'bytes_written':bytes_written,'estimated_payload_bytes':estimated,'reported_at':stamp}
-        lease_seconds=REFERENCE_COMMAND_LEASE_SECONDS if command['command_type']=='reference_build' else APPBOX_COMMAND_LEASE_SECONDS
-        con.execute("UPDATE agent_commands SET progress_json=?,lease_expires_at=?,worker_activity_at=? WHERE command_id=?",
-                    (json.dumps(data,ensure_ascii=False),(datetime.now(timezone.utc)+timedelta(seconds=lease_seconds)).isoformat(),stamp,command_id))
+        # Functional progress is UX telemetry only. Ownership/lease is renewed by
+        # the independent heartbeat and is deliberately untouched here.
+        con.execute("UPDATE agent_commands SET progress_json=? WHERE command_id=?",
+                    (json.dumps(data,ensure_ascii=False),command_id))
         if command['command_type']=='appbox_action':
             try: command_payload=json.loads(command['payload_json'] or '{}')
             except Exception: command_payload={}
@@ -5336,19 +5383,22 @@ async def agent_command_progress(node_id: str, command_id: str, request: Request
             action=str(command_payload.get('action') or 'deploy')
             docker_step={'deploy':'docker_deploy','start':'docker_start','restart':'docker_restart',
                          'recreate':'docker_recreate','stop':'docker_stop','delete':'docker_remove'}.get(action,'docker_deploy')
-            stage_map={'preparing':(docker_step,40),'cache_reference':('cache_reference',43),
+            stage_map={'preparing':(None,35),'cache_reference':('cache_reference',43),
                 'checksum_reference':('checksum_reference',48),'archive_validation':('archive_validation',55),
                 'extraction':('extraction',65),'sqlite_validation':('sqlite_validation',72),
                 'runtime_customization':('runtime_customization',78),'write_configuration':('write_configuration',82),
-                'compose_deployment':(docker_step,88),'runtime_wait':(docker_step,92)}
-            step_key,base_progress=stage_map.get(stage,(docker_step,40))
+                'compose_deployment':(docker_step,88),'runtime_wait':('healthcheck',92)}
+            step_key,base_progress=stage_map.get(stage,(None,35))
             job=con.execute("SELECT progress,status FROM jobs WHERE job_id=?",(job_id,)).fetchone() if job_id else None
             if job and job['status']=='running':
                 global_progress=min(95,max(int(job['progress'] or 0),base_progress+round(percent*4/100)))
                 step_status='success' if percent>=100 else 'running'
-                con.execute("UPDATE job_steps SET status=?,progress=MAX(progress,?),detail=?,started_at=COALESCE(started_at,?),finished_at=CASE WHEN ?='success' THEN ? ELSE finished_at END WHERE job_id=? AND step_key=?",
-                            (step_status,percent,detail or stage,stamp,step_status,stamp,job_id,step_key))
+                if step_key:
+                    con.execute("UPDATE job_steps SET status=?,progress=MAX(progress,?),detail=?,started_at=COALESCE(started_at,?),finished_at=CASE WHEN ?='success' THEN ? ELSE finished_at END WHERE job_id=? AND step_key=?",
+                                (step_status,percent,detail or stage,stamp,step_status,stamp,job_id,step_key))
                 con.execute("UPDATE jobs SET progress=?,detail=?,updated_at=? WHERE job_id=? AND status='running'",(global_progress,detail or stage,stamp,job_id))
+                # Use the current transaction: calling update_control_plane_deployment
+                # here would reacquire the non-reentrant db_lock and deadlock.
                 con.execute("UPDATE control_plane_deployments SET status='deploying',current_step=?,progress=?,detail=?,updated_at=? WHERE client_id=?",
                             (stage,global_progress,detail or stage,stamp,command_payload.get('client_id')))
             return JSONResponse({'status':'ok','cancel_requested':False})
@@ -5366,7 +5416,17 @@ async def agent_command_progress(node_id: str, command_id: str, request: Request
                             (round(ratio*100),detail,build['job_id']))
                 con.execute("UPDATE jobs SET status='running',progress=?,detail=?,updated_at=? WHERE job_id=?",
                             (global_progress,detail,stamp,build['job_id']))
-    return JSONResponse({'status':'ok','cancel_requested':False})
+        return JSONResponse({'status':'ok','cancel_requested':False})
+    except HTTPException:
+        raise
+    except Exception:
+        result = 'error'
+        raise
+    finally:
+        duration_ms = round((time.monotonic() - arrived_at) * 1000, 1)
+        waited = locals().get('lock_wait_ms', round((time.monotonic() - lock_started) * 1000, 1))
+        transaction_ms = round((time.monotonic() - locals().get('transaction_started', time.monotonic())) * 1000, 1)
+        print(f"[agent-progress] event=completed node={node_id} command={command_id[:12]} stage={stage} percent={payload.get('percent', 0)} result={result} lock_wait_ms={waited} transaction_ms={transaction_ms} duration_ms={duration_ms}", flush=True)
 
 
 @app.post("/api/agent/v1/{node_id}/commands/{command_id}/result")

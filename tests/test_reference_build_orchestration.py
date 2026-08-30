@@ -172,8 +172,9 @@ class ReferenceBuildOrchestrationTests(unittest.TestCase):
         from contextlib import ExitStack
         for result in ({'output':'docker success'}, {'health_verified':True,'reference_cache':{'status':'ready','checksum':'wrong'}}):
             with self.subTest(result=result), ExitStack() as stack:
-                for name in ('update_step','update_job','record_event','deployment_env_for','build_deployment_manifest'):
+                for name in ('update_job','record_event','deployment_env_for','build_deployment_manifest'):
                     stack.enter_context(patch.object(main,name))
+                steps=stack.enter_context(patch.object(main,'update_step'))
                 stack.enter_context(patch.object(main,'list_control_nodes',return_value=nodes))
                 stack.enter_context(patch.object(main,'reference_deployment_archive',return_value=(Path(__file__),'a'*64)))
                 stack.enter_context(patch.object(main,'queue_agent_command',return_value='command'))
@@ -185,6 +186,8 @@ class ReferenceBuildOrchestrationTests(unittest.TestCase):
                 failed.assert_called_once()
                 self.assertEqual(status.call_args.args[1],'error')
                 self.assertEqual(distribution.call_args.args[2],'failed')
+                self.assertFalse(any(call.args[1]=='docker_deploy' and call.args[2]=='running'
+                                     for call in steps.call_args_list))
 
     def test_interrupted_job_does_not_accept_late_agent_result(self):
         job_id=main.create_job(None,'reference_build','test',node_id='ouranos')
