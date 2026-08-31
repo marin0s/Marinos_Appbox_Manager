@@ -7,6 +7,7 @@ from app import main
 from reference_fixtures import reference_archive
 from unittest.mock import patch
 import asyncio
+import threading
 from fastapi import HTTPException
 
 class ReferenceBuildOrchestrationTests(unittest.TestCase):
@@ -38,6 +39,84 @@ class ReferenceBuildOrchestrationTests(unittest.TestCase):
         self.assertTrue(any(item['kind']=='reference' and item['available'] for item in catalog))
         self.assertEqual(version['builder_version'], '1.6.0-alpha.5-phase1')
         self.assertEqual(json.loads(version['manifest_json'])['metadata'], {'file_count':1})
+
+    def test_slow_legacy_hash_runs_outside_db_lock_and_published_checksum_skips_hash(self):
+        archive=main._reference_build_storage(self.build_id)/'reference.tar.gz'
+        archive.write_bytes(reference_archive(Path(self.tmp.name)).read_bytes())
+        sha=main.sha256_file(archive)
+        main.finalize_reference_build_command(self.command,'success',{
+            'archive_path':str(archive),'sha256':sha,'uncompressed_size_bytes':100,
+            'sanitization':{'source_unchanged':True},'builder_version':'test','manifest':{'metadata':{}}},None)
+        with main.db() as con:
+            version=con.execute('SELECT version_id FROM reference_image_versions').fetchone()[0]
+        with patch.object(main,'sha256_file',side_effect=AssertionError('published immutable checksum must be reused')):
+            path,actual=main.reference_deployment_archive(version)
+        self.assertEqual((path,actual),(archive,sha))
+
+        with main.db() as con:
+            con.execute('UPDATE reference_image_versions SET checksum=NULL WHERE version_id=?',(version,))
+        entered=threading.Event(); release=threading.Event(); result=[]
+        def slow_hash(path):
+            entered.set(); self.assertTrue(release.wait(3)); return sha
+        def prepare(): result.append(main.reference_deployment_archive(version))
+        with patch.object(main,'sha256_file',side_effect=slow_hash),patch.object(main,'authenticate_agent'):
+            worker=threading.Thread(target=prepare); worker.start(); self.assertTrue(entered.wait(1))
+            completed=threading.Event()
+            class Request:
+                async def json(self): return {'agent_version':'test','capabilities':{}}
+            def heartbeat(): asyncio.run(main.agent_heartbeat('ouranos',Request())); completed.set()
+            concurrent=threading.Thread(target=heartbeat); concurrent.start()
+            self.assertTrue(completed.wait(1),'heartbeat blocked by reference hashing')
+            with main.db_lock,main.db() as con:
+                self.assertEqual(con.execute("SELECT status FROM nodes WHERE node_id='ouranos'").fetchone()[0],'online')
+            release.set(); worker.join(3); concurrent.join(3)
+        self.assertEqual(result,[(archive,sha)])
+
+        # A delete/republication transition that wins while the archive is
+        # being inspected must invalidate the prepared result, without making
+        # the filesystem work hold the global database lock.
+        entered=threading.Event(); release=threading.Event(); errors=[]
+        def racing_hash(path):
+            entered.set(); self.assertTrue(release.wait(3)); return sha
+        def prepare_during_delete():
+            try:
+                main.reference_deployment_archive(version)
+            except Exception as exc:
+                errors.append(exc)
+        with patch.object(main,'sha256_file',side_effect=racing_hash):
+            worker=threading.Thread(target=prepare_during_delete); worker.start(); self.assertTrue(entered.wait(1))
+            with main.db_lock,main.db() as con:
+                con.execute("UPDATE reference_image_versions SET state='deleting' WHERE version_id=?",(version,))
+            release.set(); worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors),1)
+        self.assertIsInstance(errors[0],HTTPException)
+        self.assertEqual(errors[0].status_code,409)
+
+        # The same post-I/O revalidation also catches republication/identity
+        # changes, not only deletion.
+        with main.db() as con:
+            con.execute("UPDATE reference_image_versions SET state='published',checksum=NULL WHERE version_id=?",(version,))
+        entered=threading.Event(); release=threading.Event(); errors=[]
+        with patch.object(main,'sha256_file',side_effect=racing_hash):
+            worker=threading.Thread(target=prepare_during_delete); worker.start(); self.assertTrue(entered.wait(1))
+            with main.db_lock,main.db() as con:
+                con.execute("UPDATE reference_image_versions SET checksum=? WHERE version_id=?",('f'*64,version))
+            release.set(); worker.join(3)
+        self.assertEqual(len(errors),1)
+        self.assertIsInstance(errors[0],HTTPException)
+        self.assertEqual(errors[0].status_code,409)
+
+        # If deletion starts just after archive resolution, the transactional
+        # enqueue check closes the remaining TOCTOU window.
+        with main.db() as con:
+            con.execute("UPDATE reference_image_versions SET state='deleting',checksum=? WHERE version_id=?",(sha,version))
+        with self.assertRaises(HTTPException) as rejected:
+            main.queue_agent_command('ouranos','appbox_action',{
+                'action':'deploy','reference_archive':{'version_id':version,'sha256':sha}})
+        self.assertEqual(rejected.exception.status_code,409)
+        with main.db() as con:
+            self.assertFalse(con.execute("SELECT 1 FROM agent_commands WHERE command_type='appbox_action'").fetchone())
 
     def test_new_version_build_keeps_image_identity_and_existing_appbox(self):
         def publish(build_id, command):

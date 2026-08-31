@@ -1579,6 +1579,7 @@ def heartbeat(config, metrics=None, active_command_id=""):
             "independent_heartbeat": True,
             "appbox_command_lease": True,
             "appbox_progress": True,
+            "appbox_delivery_ack": True,
             "remote_upgrade": RUNTIME_IDENTITY["managed"],
         },
     }
@@ -2281,6 +2282,36 @@ class CommandProgressReporter:
         self.thread.join(0.1)
 
 
+def acknowledge_command_delivery(config, command):
+    token = str(command.get('delivery_token') or '')
+    if not token:
+        return None
+    attempts = min(10, max(1, int(config.get('command_delivery_ack_attempts', 3))))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        try:
+            response = api(
+                config, 'POST',
+                f"/api/agent/v1/{config['node_id']}/commands/{command['command_id']}/ack",
+                {'delivery_token': token}, timeout=min(20, max(1, float(config.get('command_delivery_ack_timeout_seconds', 5)))),
+            )
+            if response.get('status') != 'claimed':
+                raise RuntimeError('ACK de livraison non confirmé par le Control Plane.')
+            print(f"Agent delivery: event=acknowledged command={str(command['command_id'])[:12]} attempt={attempt} duration_ms={round((time.monotonic()-started)*1000,1)}",flush=True)
+            return response
+        except urllib.error.HTTPError as exc:
+            if exc.code in {404,409,410}:
+                raise CommandCancelled('Offre de commande expirée ou remplacée avant exécution.') from None
+            last_error = exc
+        except (urllib.error.URLError,TimeoutError,OSError) as exc:
+            last_error = exc
+        print(f"Agent delivery: event=ack_retry command={str(command['command_id'])[:12]} attempt={attempt} duration_ms={round((time.monotonic()-started)*1000,1)}",flush=True)
+        if attempt < attempts:
+            time.sleep(min(2.0, 0.25 * attempt))
+    raise RuntimeError(f"ACK de livraison non confirmé après {attempts} tentative(s).") from last_error
+
+
 def command_cycle(config, inventory_request=None, runtime=None):
     response = api(
         config,
@@ -2296,6 +2327,11 @@ def command_cycle(config, inventory_request=None, runtime=None):
     if runtime is not None:
         runtime.begin_command(command['command_id'])
         cancel_event = runtime.cancel_event
+        try:
+            acknowledge_command_delivery(config,command)
+        except Exception:
+            runtime.finish_command(command['command_id'])
+            raise
         progress_reporter = CommandProgressReporter(config, command['command_id'], cancel_event)
         progress_callback = progress_reporter
     try:

@@ -148,7 +148,7 @@ def start(node_id, bootstrap=False, expected_sha=None):
     stamp = main.now_iso()
     with main.db_lock, main.db() as con:
         con.execute("BEGIN IMMEDIATE")
-        if active(con, node_id) or con.execute("SELECT 1 FROM agent_commands WHERE node_id=? AND status IN ('queued','claimed')", (node_id,)).fetchone() or con.execute("SELECT 1 FROM jobs WHERE node_id=? AND status IN ('queued','running')", (node_id,)).fetchone():
+        if active(con, node_id) or con.execute("SELECT 1 FROM agent_commands WHERE node_id=? AND status IN ('queued','offered','claimed')", (node_id,)).fetchone() or con.execute("SELECT 1 FROM jobs WHERE node_id=? AND status IN ('queued','running')", (node_id,)).fetchone():
             raise HTTPException(409, "Une opération incompatible est en cours ou en attente.")
         runtime = con.execute("SELECT process_id FROM agent_upgrade_runtime WHERE node_id=?", (node_id,)).fetchone()
         con.execute("""INSERT INTO agent_upgrades(operation_id,node_id,phase,version,build_id,package_sha256,

@@ -24,6 +24,19 @@
  <div class="card metric-card"><div class="metric-label">Intégrations</div><div class="metric-value">{{'%.2f s'|format(job.statistics.groups.integration.duration) if job.statistics.groups.integration.duration_known else '—'}}</div><small>{{job.statistics.skipped_steps}} ignorée(s)</small></div>
 </div>
 
+{% if job.command_delivery %}
+<section class="card"><h2>Livraison de la commande agent</h2>
+ <p><strong>{{job.command_delivery.status|upper}}</strong> · commande {{job.command_delivery.command_id[:12]}}</p>
+ <div class="resource-grid">
+  <div class="resource-chip"><small>Offerte</small><strong>{{job.command_delivery.delivery_offered_at or '—'}}</strong></div>
+  <div class="resource-chip"><small>ACK livraison</small><strong>{{job.command_delivery.delivery_acknowledged_at or 'En attente'}}</strong></div>
+  <div class="resource-chip"><small>Dernière ownership worker</small><strong>{{job.command_delivery.worker_activity_at or 'Aucune confirmation'}}</strong></div>
+  <div class="resource-chip"><small>Lease</small><strong>{{job.command_delivery.lease_expires_at or 'Non démarrée'}}</strong></div>
+  <div class="resource-chip"><small>Deadline globale</small><strong>{{job.command_delivery.command_deadline_at or 'Non démarrée'}}</strong></div>
+ </div>
+</section>
+{% endif %}
+
 <div class="section-head"><div><h2>Timeline d’exécution</h2><p>Chronologie persistante enregistrée dans SQLite</p></div></div>
 <div class="card workflow-timeline">
  {% for step in job.steps %}

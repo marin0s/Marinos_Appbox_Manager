@@ -9,20 +9,34 @@ un exécuteur de job par node. Une attente distante sur ORION ne monopolise pas 
 les jobs d'un même node et le worker métier de chaque agent restent séquentiels.
 Les commandes AppBox doivent être claimées sous 60 s par défaut
 (`APPBOX_AGENT_CLAIM_TIMEOUT_SECONDS`, minimum 5 s). Le délai et le lien au job sont
-portés par des métadonnées du payload existant, sans migration SQL. L'API de poll et
+portés par des métadonnées du payload existant. L'API de poll et
 le waiter appliquent la même expiration, avec transition conditionnelle sous verrou.
 Après restart, les jobs running sont finalisés en `failed` et leurs commandes encore
 queued annulées ; les jobs queued sont conservés. Voir [suppression et reprise](appbox-deletion-hotfix.md).
 
+Les agents annonçant `appbox_delivery_ack` reçoivent une commande AppBox selon
+`queued → offered → claimed`. Le GET crée une offre courte et renvoie un token aléatoire ;
+seul son SHA-256 est persisté. Une offre non ACKée avant
+`APPBOX_DELIVERY_ACK_SECONDS` (15 s par défaut, minimum 5) retourne à `queued` avec un
+nouveau token. L'agent appelle ensuite l'ACK avant toute I/O métier. L'ACK atomique
+devient `claimed`, démarre lease et deadline, et reste idempotent avec le même token :
+la perte de sa réponse HTTP ne double donc pas l'exécution. Un ancien token est refusé.
+
 Les agents annonçant `appbox_command_lease` séparent la liveness du processus et celle
-du worker métier. Le heartbeat maintient le node online et, lorsque le runtime déclare
-l'identifiant exact de la commande qu'il possède, renouvelle son ownership sans inventer
-de progression fonctionnelle. Le renouvellement reste borné par
-`command_deadline_at`. Le canal progress est une télémétrie UX best effort indépendante :
-il ne renouvelle ni `lease_expires_at` ni `worker_activity_at`. Une commande sans
-heartbeat propriétaire, ou arrivée à son deadline global, devient terminale et son
-résultat tardif ne modifie plus AppBox, job ou ports. Les agents alpha.5 antérieurs ne
-reçoivent pas ce bail afin de préserver leur protocole. Voir
+du worker métier. `worker_activity_at` reste vide tant qu'aucun ACK/ownership réel n'a
+été reçu. Le heartbeat maintient le node online et, lorsque le runtime déclare
+l'identifiant exact de la commande claimed qu'il possède, renouvelle son ownership sans
+inventer de progression fonctionnelle. Une offre seule ne renouvelle rien. Le
+renouvellement reste borné par `command_deadline_at`, calculé une seule fois à l'ACK.
+Le canal progress est une télémétrie UX best effort indépendante : il ne renouvelle ni
+`lease_expires_at` ni `worker_activity_at`. Une commande sans heartbeat propriétaire,
+ou arrivée à son deadline global, devient terminale et son résultat tardif ne modifie
+plus AppBox, job ou ports.
+
+Un Control Plane mis à jour accepte les agents antérieurs : faute de capability ACK,
+il conserve leur claim historique au GET. Cette voie ne bénéficie pas de la relivraison
+d'offre et doit seulement servir à la transition. Déployer le nouveau package agent sur
+chaque node avant de considérer la garantie de delivery active. Voir
 [provisioning distribué alpha.5](appbox-provisioning-alpha5.md).
 
 Le runtime observé par les agents est la source de vérité pour l'état des conteneurs. La base conserve l'état désiré et les informations métier. Le moteur de réconciliation compare les deux.
@@ -46,6 +60,15 @@ coopérative emprunte le même heartbeat et rend build/job/commande `cancelled` 
 nettoyage agent. Le preflight disque est rejoué avant capture avec réserve configurable.
 La migration ajoute uniquement des colonnes nullable/default aux tables existantes. Voir
 [le cycle de vie UX](reference-lifecycle.md).
+
+La résolution d'une archive publiée ne relit pas ses dizaines de Go : le checksum
+persisté au moment de la publication est l'identité immuable. Les seules transactions
+sous `db_lock` prennent puis revalident un snapshot de métadonnées. Hash legacy,
+compression, copie et inspections de fichiers s'exécutent hors verrou ; une transition
+concurrente vers suppression ou une republication fait échouer la revalidation plutôt
+que de livrer un résultat devenu obsolète. La dernière vérification d'état et l'insertion
+de la commande partagent ensuite une transaction : la commande queued bloque la
+suppression, ou une suppression déjà verrouillée bloque l'enqueue.
 
 ## Suppression des Reference Images
 

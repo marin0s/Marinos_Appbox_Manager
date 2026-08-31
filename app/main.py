@@ -47,6 +47,7 @@ AGENT_ASSET_DIR = Path(os.getenv("APPBOX_AGENT_ASSET_DIR", "/app/agent"))
 METRICS_INTERVAL = max(5, int(os.getenv("APPBOX_METRICS_INTERVAL", "10")))
 JOB_TIMEOUT_SECONDS = max(60, int(os.getenv("APPBOX_JOB_TIMEOUT_SECONDS", "900")))
 AGENT_CLAIM_TIMEOUT_SECONDS = max(5, int(os.getenv("APPBOX_AGENT_CLAIM_TIMEOUT_SECONDS", "60")))
+APPBOX_DELIVERY_ACK_SECONDS = max(5, int(os.getenv("APPBOX_DELIVERY_ACK_SECONDS", "15")))
 JOB_WATCHDOG_INTERVAL = max(15, int(os.getenv("APPBOX_JOB_WATCHDOG_INTERVAL", "30")))
 REFERENCE_COMMAND_LEASE_SECONDS = max(30, int(os.getenv("APPBOX_REFERENCE_COMMAND_LEASE_SECONDS", "180")))
 APPBOX_COMMAND_LEASE_SECONDS = max(30, int(os.getenv("APPBOX_COMMAND_LEASE_SECONDS", "180")))
@@ -309,6 +310,7 @@ WORKFLOW_DEFINITIONS = {
         ("validate_node", "Validation du node"),
         ("validate_storage", "Validation RDAD et GPU"),
         ("validate_compose", "Validation du Compose"),
+        ("prepare_reference", "Préparation de la référence"),
         ("cache_reference", "Cache de la référence"),
         ("checksum_reference", "Checksum de la référence"),
         ("archive_validation", "Validation de l’archive"),
@@ -1155,6 +1157,11 @@ def init_database() -> None:
             "progress_json": "TEXT NOT NULL DEFAULT '{}'",
             "worker_activity_at": "TEXT",
             "command_deadline_at": "TEXT",
+            "delivery_token_hash": "TEXT",
+            "delivery_offered_at": "TEXT",
+            "delivery_ack_deadline": "TEXT",
+            "delivery_acknowledged_at": "TEXT",
+            "delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
         }.items():
             if column not in command_columns:
                 con.execute(f"ALTER TABLE agent_commands ADD COLUMN {column} {definition}")
@@ -1690,6 +1697,19 @@ def queue_agent_command(
         payload['_claim_deadline'] = (datetime.now(timezone.utc) + timedelta(seconds=AGENT_CLAIM_TIMEOUT_SECONDS)).isoformat()
     with db_lock, db() as con:
         agent_upgrades.require_idle(con, node_id)
+        reference = payload.get('reference_archive') if command_type == 'appbox_action' else None
+        if isinstance(reference,dict) and reference.get('version_id'):
+            # This check and command insertion share the same transaction. A
+            # deletion either marks the version first (enqueue is refused), or
+            # sees this queued command as its blocker. No archive I/O occurs here.
+            version=con.execute('''SELECT v.state,v.checksum,i.status AS image_status
+                FROM reference_image_versions v JOIN reference_images i ON i.image_id=v.image_id
+                WHERE v.version_id=?''',(reference['version_id'],)).fetchone()
+            advertised=str(reference.get('sha256') or '').lower()
+            persisted=str(version['checksum'] or '').lower() if version else ''
+            if (not version or version['state']!='published' or version['image_status']!='published'
+                    or (persisted and not secrets.compare_digest(persisted,advertised))):
+                raise HTTPException(409,'La référence a changé avant la mise en file du déploiement.')
         con.execute("""
             INSERT INTO agent_commands(
                 command_id,node_id,command_type,payload_json,status,created_at
@@ -3034,43 +3054,72 @@ def parse_deployment_image(value: str, media_type: str) -> tuple[str | None, str
 
 
 def reference_deployment_archive(version_id: str) -> tuple[Path, str]:
-    # Serialize local archive creation against catalogue deletion/cleanup.
-    with db_lock:
-        return _reference_deployment_archive(version_id)
+    return _reference_deployment_archive(version_id)
+
+
+def _reference_deployment_metadata(version_id: str) -> dict[str, Any]:
+    """Snapshot immutable metadata only; never inspect archive bytes under db_lock."""
+    with db_lock,db() as con:
+        row=con.execute("""SELECT v.version_id,v.state,v.archive_path,v.checksum,v.compressed_size_bytes,
+            s.source_path,i.status AS image_status FROM reference_image_versions v
+            JOIN reference_images i ON i.image_id=v.image_id
+            JOIN catalog_snapshots s ON s.snapshot_id=v.snapshot_id WHERE v.version_id=?""",(version_id,)).fetchone()
+    if not row or row['state']!='published' or row['image_status']!='published':
+        raise HTTPException(404,"Image de déploiement indisponible.")
+    return dict(row)
+
+
+def _confirm_reference_deployment_metadata(reference: dict[str,Any],archive: Path,checksum: str) -> None:
+    """Detect deletion/republication races after all filesystem work completed."""
+    with db_lock,db() as con:
+        row=con.execute("SELECT state,archive_path,checksum FROM reference_image_versions WHERE version_id=?",
+                        (reference['version_id'],)).fetchone()
+    if (not row or row['state']!='published'
+            or str(row['archive_path'] or '')!=str(reference.get('archive_path') or '')
+            or str(row['checksum'] or '').lower()!=str(reference.get('checksum') or '').lower()):
+        raise HTTPException(409,'La référence a changé pendant la préparation du déploiement.')
+    if not archive.is_file():
+        raise HTTPException(404,'Archive de référence supprimée pendant la préparation.')
+    if not re.fullmatch(r'[0-9a-f]{64}',checksum):
+        raise HTTPException(409,'Checksum de référence absent ou invalide.')
 
 
 def _reference_deployment_archive(version_id: str) -> tuple[Path, str]:
-    reference = get_reference_version(version_id)
-    if not reference or not reference.get("source_available") or reference.get("state") != "published":
-        raise HTTPException(404, "Image de déploiement indisponible.")
+    reference = _reference_deployment_metadata(version_id)
     stored_archive = Path(str(reference.get("archive_path") or ""))
     if stored_archive.is_file():
-        digest = hashlib.sha256()
-        with stored_archive.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        actual = digest.hexdigest()
         expected = str(reference.get("checksum") or "").lower()
-        if expected and not secrets.compare_digest(actual, expected):
-            raise HTTPException(409, "Checksum de l’image de référence invalide.")
-        return stored_archive, actual
+        if not re.fullmatch(r'[0-9a-f]{64}',expected):
+            # Legacy published metadata: one physical verification outside the
+            # global lock, then refuse if catalogue state changed meanwhile.
+            expected = sha256_file(stored_archive)
+        _confirm_reference_deployment_metadata(reference,stored_archive,expected)
+        return stored_archive, expected
     source = Path(reference["source_path"]).resolve()
+    if not source.is_dir():
+        raise HTTPException(404,"Source de référence indisponible.")
     cache = REFERENCE_ROOT / "deployment-cache"
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / f"{slugify_identifier(version_id)}.tar.gz"
     source_mtime = max((item.stat().st_mtime for item in source.rglob("*") if item.exists()), default=source.stat().st_mtime)
     if not archive.exists() or archive.stat().st_mtime < source_mtime:
-        temporary = archive.with_suffix(".tmp")
-        temporary.unlink(missing_ok=True)
-        with tarfile.open(temporary, "w:gz", compresslevel=3) as tar:
-            for item in source.iterdir():
-                tar.add(item, arcname=item.name, recursive=True)
-        os.replace(temporary, archive)
+        # A unique temporary prevents concurrent resolvers from sharing a
+        # partially-written tar while keeping all compression outside db_lock.
+        temporary = archive.with_name(f'.{archive.name}.{uuid.uuid4().hex}.tmp')
+        try:
+            with tarfile.open(temporary, "w:gz", compresslevel=3) as tar:
+                for item in source.iterdir():
+                    tar.add(item, arcname=item.name, recursive=True)
+            os.replace(temporary, archive)
+        finally:
+            temporary.unlink(missing_ok=True)
     digest = hashlib.sha256()
     with archive.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
-    return archive, digest.hexdigest()
+    actual=digest.hexdigest()
+    _confirm_reference_deployment_metadata(reference,archive,actual)
+    return archive, actual
 
 
 def sanitize_plex_clone(config_dir: Path) -> None:
@@ -3818,6 +3867,12 @@ def job_dict(row: sqlite3.Row, include_steps: bool = False) -> dict[str, Any]:
     if include_steps:
         result["steps"] = step_rows(result["job_id"])
         result["statistics"] = workflow_statistics(result["steps"])
+        with db() as con:
+            command=con.execute("""SELECT command_id,status,delivery_offered_at,delivery_ack_deadline,
+                delivery_acknowledged_at,claimed_at,worker_activity_at,lease_expires_at,command_deadline_at
+                FROM agent_commands WHERE json_extract(payload_json,'$._job_id')=?
+                ORDER BY created_at DESC LIMIT 1""",(result['job_id'],)).fetchone()
+        result['command_delivery']=dict(command) if command else None
     return result
 
 
@@ -3853,7 +3908,7 @@ CLAIM_TIMEOUT_MESSAGE = 'Commande distante non prise en charge par le node dans 
 
 
 def appbox_claim_expired(command, now=None):
-    if command['command_type'] != 'appbox_action' or command['status'] != 'queued':
+    if command['command_type'] != 'appbox_action' or command['status'] not in {'queued', 'offered'}:
         return False
     try:
         payload = json.loads(command['payload_json'] or '{}')
@@ -3869,7 +3924,7 @@ def appbox_claim_expired(command, now=None):
 
 
 def expire_appbox_commands(con, node_id=None, interrupted_jobs=()):
-    rows = con.execute("SELECT * FROM agent_commands WHERE command_type='appbox_action' AND status='queued'").fetchall()
+    rows = con.execute("SELECT * FROM agent_commands WHERE command_type='appbox_action' AND status IN ('queued','offered')").fetchall()
     for row in rows:
         if node_id is not None and row['node_id'] != node_id:
             continue
@@ -3887,13 +3942,22 @@ def expire_appbox_commands(con, node_id=None, interrupted_jobs=()):
         detached = payload.get('_job_id') and (not job or job['status'] != 'running')
         if interrupted or detached or malformed or appbox_claim_expired(row):
             error = 'Workflow interrompu ; commande non exécutée annulée.' if interrupted or detached else CLAIM_TIMEOUT_MESSAGE
-            con.execute("UPDATE agent_commands SET status='failed',completed_at=?,error_text=? WHERE command_id=? AND status='queued'",
+            con.execute("UPDATE agent_commands SET status='failed',completed_at=?,error_text=? WHERE command_id=? AND status IN ('queued','offered')",
                         (now_iso(), error, row['command_id']))
+
+
+def release_expired_delivery_offers(con, node_id: str, now: datetime | None = None) -> int:
+    """Return an unacknowledged offer to the queue; no worker owned it yet."""
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
+    return con.execute("""UPDATE agent_commands SET status='queued',delivery_token_hash=NULL,
+        delivery_offered_at=NULL,delivery_ack_deadline=NULL
+        WHERE node_id=? AND command_type='appbox_action' AND status='offered'
+          AND delivery_ack_deadline IS NOT NULL AND delivery_ack_deadline<=?""", (node_id, stamp)).rowcount
 
 
 def fail_pending_command(command_id, message, queued_only=False):
     with db_lock, db() as con:
-        statuses = ('queued',) if queued_only else ('queued', 'claimed')
+        statuses = ('queued', 'offered') if queued_only else ('queued', 'offered', 'claimed')
         placeholders = ','.join('?' for _ in statuses)
         return con.execute(f"UPDATE agent_commands SET status='failed',completed_at=?,error_text=? WHERE command_id=? AND status IN ({placeholders})",
                            (now_iso(), message, command_id, *statuses)).rowcount
@@ -3986,6 +4050,34 @@ def finalize_appbox_deletion(client_id: str, job_id: str, purge: bool = False) -
     return True
 
 
+CONTROL_PLANE_WORKSPACE_MARKER = '.appbox-manager-workspace.json'
+
+
+def cleanup_control_plane_workspace(client_id: str, configured_path: str | Path) -> bool:
+    """Remove only the exact central workspace owned by the current AppBox row."""
+    base=BASE_DIR.resolve(); expected=(base/client_id).resolve(); supplied=Path(configured_path).resolve()
+    if expected.parent!=base or supplied!=expected or expected.name!=client_id:
+        raise RuntimeError('Workspace Control Plane hors du répertoire AppBox autorisé.')
+    if not expected.exists():
+        return False
+    if expected.is_symlink() or not expected.is_dir():
+        raise RuntimeError('Workspace Control Plane non sûr : dossier réel attendu.')
+    marker=expected/CONTROL_PLANE_WORKSPACE_MARKER
+    if marker.is_file():
+        try: identity=json.loads(marker.read_text(encoding='utf-8'))
+        except (OSError,ValueError,TypeError): identity={}
+        if identity.get('client_id')!=client_id:
+            raise RuntimeError('Workspace Control Plane non vérifié : marqueur invalide.')
+    else:
+        # Compatibility for workspaces created before the ownership marker.
+        allowed={'compose.yml','.env','plex-config','jellyfin-config','jellyfin-cache','tautulli-config'}
+        names={entry.name for entry in expected.iterdir()}
+        if not (expected/'compose.yml').is_file() or not names<=allowed:
+            raise RuntimeError('Workspace Control Plane legacy non vérifié ; nettoyage opérateur requis.')
+    shutil.rmtree(expected)
+    return True
+
+
 def set_reference_distribution(node_id, version_id, status, cache=None):
     cache = cache or {}
     with db_lock, db() as con:
@@ -4072,7 +4164,13 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
         fail_workflow(job_id, "validate_node", "Mettre à jour l'agent : personnalisation Plex non supportée.")
         return
     if action == "deploy" and item.get("reference_version_id"):
-        archive, archive_checksum = reference_deployment_archive(item["reference_version_id"])
+        update_step(job_id,'prepare_reference','running','Lecture des métadonnées immuables de la référence centrale.',20)
+        try:
+            archive, archive_checksum = reference_deployment_archive(item["reference_version_id"])
+        except Exception as exc:
+            update_step(job_id,'prepare_reference','failed',f'Préparation de la référence impossible : {exc}',100)
+            raise
+        update_step(job_id,'prepare_reference','success','Archive publiée prête ; checksum immuable chargé depuis le catalogue.',100)
         reference_archive = {
             "version_id": item["reference_version_id"],
             "download_path": f"/api/agent/v1/{node_id}/reference-deployments/{item['reference_version_id']}/archive",
@@ -4080,6 +4178,8 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
             "size_bytes": archive.stat().st_size,
             "target_directory": "plex-config" if item.get("type") == "plex" else "jellyfin-config",
         }
+    elif action=='deploy':
+        update_step(job_id,'prepare_reference','skipped','Aucune Reference Image sélectionnée.',100)
     payload = {
         "_job_id": job_id,
         "client_id": client_id,
@@ -4171,7 +4271,17 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
                 save_appbox_status(client_id, "error", verify_detail)
                 record_audit("DELETE_APPBOX", client_id, node_id, deletion_mode, "FAILED", verify_detail)
                 return
-            update_step(job_id, "cleanup_files", "success", "Conteneurs et dossier AppBox absents, commit autorisé.", 100, executor=f"agent-{node_id}", resources=result)
+            try:
+                central_removed=cleanup_control_plane_workspace(client_id,appbox_dir)
+            except Exception as exc:
+                verify_detail=f'Workspace Control Plane conservé : {exc}'
+                update_step(job_id,'cleanup_files','failed',verify_detail,100,executor='control-plane',resources=result)
+                fail_workflow(job_id,'cleanup_files',verify_detail)
+                save_appbox_status(client_id,'error',verify_detail)
+                record_audit('DELETE_APPBOX',client_id,node_id,deletion_mode,'FAILED',verify_detail)
+                return
+            result['control_plane_workspace_removed']=central_removed
+            update_step(job_id, "cleanup_files", "success", "Conteneurs, dossier distant et workspace Control Plane absents ; commit autorisé.", 100, executor=f"agent-{node_id}", resources=result)
             finalize_appbox_deletion(client_id, job_id, purge=(deletion_mode == "purge"))
             inventory_message = "AppBox supprimée de l’inventaire actif."
         update_step(job_id, "inventory", "success", inventory_message, 100, executor="control-plane")
@@ -5150,6 +5260,8 @@ async def agent_heartbeat(node_id: str, request: Request):
     endpoint = str(payload.get("endpoint") or "")
     active_command_id = str(payload.get("active_command_id") or "")
     cancel_requested = False
+    ownership_state = 'none'
+    ownership_confirmed_at = None
     with db_lock, db() as con:
         node = con.execute(
             "SELECT node_id FROM nodes WHERE node_id=?",
@@ -5191,6 +5303,7 @@ async def agent_heartbeat(node_id: str, request: Request):
             command = con.execute("SELECT command_type,status,cancel_requested_at,command_deadline_at,payload_json FROM agent_commands WHERE command_id=? AND node_id=?",
                                   (active_command_id, node_id)).fetchone()
             if command and command['command_type'] in {'reference_build', 'appbox_action'} and command['status'] == 'claimed':
+                ownership_state = 'claimed'
                 cancel_requested = bool(command['cancel_requested_at'])
                 if not cancel_requested:
                     current = datetime.now(timezone.utc)
@@ -5210,6 +5323,9 @@ async def agent_heartbeat(node_id: str, request: Request):
                             lease_end = min(lease_end, deadline)
                         con.execute("UPDATE agent_commands SET lease_expires_at=?,worker_activity_at=? WHERE command_id=?",
                                     (lease_end.isoformat(), stamp, active_command_id))
+                        ownership_state = 'lease_renewed'
+                        ownership_confirmed_at = stamp
+                        print(f"[command-ownership] event=lease_renewed node={node_id} command={active_command_id[:12]} confirmed_at={stamp} lease_expires_at={lease_end.isoformat()}",flush=True)
                         if command['command_type'] == 'appbox_action':
                             try:
                                 job_id = str(json.loads(command['payload_json'] or '{}').get('_job_id') or '')
@@ -5218,14 +5334,21 @@ async def agent_heartbeat(node_id: str, request: Request):
                             if job_id:
                                 # Keep the workflow watchdog informed without inventing UX progress.
                                 con.execute("UPDATE jobs SET updated_at=? WHERE job_id=? AND status='running'", (stamp, job_id))
-            elif command and command['command_type'] in {'reference_build', 'appbox_action'}:
+            elif command and command['command_type'] in {'reference_build', 'appbox_action'} and command['status'] in COMMAND_TERMINAL_STATUSES:
                 # The runtime still believes it owns a command already terminal on CP.
                 cancel_requested = True
+                ownership_state = 'terminal'
+            elif command and command['command_type']=='appbox_action' and command['status']=='offered':
+                # runtime.begin_command precedes the ACK so a lost ACK response can
+                # be retried safely; an offer alone never renews a lease.
+                ownership_state = 'offered_awaiting_ack'
     return JSONResponse({
         "status": "ok",
         "server_version": VERSION,
         "heartbeat_interval": min(60, AGENT_ONLINE_SECONDS // 3),
         "cancel_active_command": cancel_requested,
+        "active_command_state": ownership_state,
+        "worker_activity_at": ownership_confirmed_at,
     })
 
 
@@ -5306,6 +5429,7 @@ def agent_poll_commands(node_id: str, request: Request):
     node = next((n for n in list_control_nodes() if n['node_id'] == node_id), None)
     with db_lock, db() as con:
         expire_appbox_commands(con, node_id=node_id)
+        release_expired_delivery_offers(con, node_id)
         row = con.execute("""
             SELECT * FROM agent_commands
             WHERE node_id=? AND status='queued'
@@ -5329,6 +5453,28 @@ def agent_poll_commands(node_id: str, request: Request):
         claimed_at = now_iso()
         lease_seconds = (REFERENCE_COMMAND_LEASE_SECONDS if row['command_type']=='reference_build' else
                          APPBOX_COMMAND_LEASE_SECONDS if row['command_type']=='appbox_action' and node and node.get('capabilities',{}).get('appbox_command_lease') else None)
+        delivery_ack = bool(row['command_type']=='appbox_action' and node and
+                            node.get('capabilities',{}).get('appbox_delivery_ack'))
+        if delivery_ack:
+            token = secrets.token_urlsafe(32)
+            offered_at = datetime.now(timezone.utc)
+            ack_deadline = offered_at + timedelta(seconds=APPBOX_DELIVERY_ACK_SECONDS)
+            changed = con.execute("""UPDATE agent_commands SET status='offered',delivery_token_hash=?,
+                delivery_offered_at=?,delivery_ack_deadline=?,delivery_attempts=delivery_attempts+1,
+                claimed_at=NULL,lease_expires_at=NULL,worker_activity_at=NULL,command_deadline_at=NULL
+                WHERE command_id=? AND status='queued'""",
+                (hashlib.sha256(token.encode('utf-8')).hexdigest(),offered_at.isoformat(),ack_deadline.isoformat(),row['command_id'])).rowcount
+            if not changed:
+                return JSONResponse({'command':None,'reason':'offer_race'})
+            command = dict(row)
+            command['status'] = 'offered'
+            command["payload"] = json.loads(command.pop("payload_json") or "{}")
+            command['delivery_token'] = token
+            command['delivery_ack_deadline'] = ack_deadline.isoformat()
+            command['lease_timeout_seconds'] = lease_seconds
+            command['command_deadline_at'] = None
+            print(f"[command-delivery] event=offered node={node_id} command={row['command_id'][:12]} ack_deadline={ack_deadline.isoformat()}",flush=True)
+            return JSONResponse({'command':command})
         claimed_now = datetime.now(timezone.utc)
         lease = (claimed_now + timedelta(seconds=lease_seconds)).isoformat() if lease_seconds else None
         deadline = ((claimed_now + timedelta(seconds=APPBOX_COMMAND_MAX_RUNTIME_SECONDS)).isoformat()
@@ -5337,12 +5483,52 @@ def agent_poll_commands(node_id: str, request: Request):
             UPDATE agent_commands
             SET status='claimed',claimed_at=?,lease_expires_at=?,worker_activity_at=?,command_deadline_at=?
             WHERE command_id=? AND status='queued'
-        """, (claimed_at, lease, claimed_at if lease else None, deadline, row["command_id"]))
+        """, (claimed_at, lease, claimed_at if lease and row['command_type']!='appbox_action' else None, deadline, row["command_id"]))
     command = dict(row)
     command["payload"] = json.loads(command.pop("payload_json") or "{}")
     command['lease_timeout_seconds'] = lease_seconds
     command['command_deadline_at'] = deadline
     return JSONResponse({"command": command})
+
+
+@app.post('/api/agent/v1/{node_id}/commands/{command_id}/ack')
+async def agent_ack_command_delivery(node_id: str, command_id: str, request: Request):
+    authenticate_agent(request,node_id)
+    payload=await request.json(); token=str(payload.get('delivery_token') or '')
+    if not 20 <= len(token) <= 200:
+        raise HTTPException(400,'Token de livraison invalide.')
+    token_hash=hashlib.sha256(token.encode('utf-8')).hexdigest(); stamp=now_iso()
+    with db_lock,db() as con:
+        command=con.execute("SELECT * FROM agent_commands WHERE command_id=? AND node_id=? AND command_type='appbox_action'",
+                            (command_id,node_id)).fetchone()
+        if not command:
+            raise HTTPException(404,'Commande introuvable.')
+        if not secrets.compare_digest(str(command['delivery_token_hash'] or ''),token_hash):
+            raise HTTPException(409,'Offre de commande remplacée ou invalide.')
+        if command['status']=='claimed' and command['delivery_acknowledged_at']:
+            return JSONResponse({'status':'claimed','idempotent':True,
+                                 'lease_expires_at':command['lease_expires_at'],
+                                 'command_deadline_at':command['command_deadline_at']})
+        if command['status']!='offered':
+            raise HTTPException(409,'Commande non disponible pour ACK.')
+        try:
+            ack_deadline=datetime.fromisoformat(command['delivery_ack_deadline'])
+        except (TypeError,ValueError):
+            ack_deadline=datetime.now(timezone.utc)-timedelta(seconds=1)
+        current=datetime.now(timezone.utc)
+        if current >= ack_deadline:
+            raise HTTPException(409,'Offre de commande expirée.')
+        deadline=current+timedelta(seconds=APPBOX_COMMAND_MAX_RUNTIME_SECONDS)
+        lease=min(current+timedelta(seconds=APPBOX_COMMAND_LEASE_SECONDS),deadline)
+        changed=con.execute("""UPDATE agent_commands SET status='claimed',claimed_at=?,
+            delivery_acknowledged_at=?,lease_expires_at=?,worker_activity_at=?,command_deadline_at=?
+            WHERE command_id=? AND node_id=? AND status='offered' AND delivery_token_hash=?""",
+            (stamp,stamp,lease.isoformat(),stamp,deadline.isoformat(),command_id,node_id,token_hash)).rowcount
+        if not changed:
+            raise HTTPException(409,'ACK de livraison concurrent refusé.')
+    print(f"[command-delivery] event=acknowledged node={node_id} command={command_id[:12]} worker_activity_at={stamp}",flush=True)
+    return JSONResponse({'status':'claimed','idempotent':False,
+                         'lease_expires_at':lease.isoformat(),'command_deadline_at':deadline.isoformat()})
 
 
 @app.post("/api/agent/v1/{node_id}/commands/{command_id}/progress")
@@ -6718,8 +6904,18 @@ def create_appbox(
         if tautulli_port: services.append(('tautulli',tautulli_port))
 
         appbox_dir = BASE_DIR / client_id
-        appbox_dir.mkdir(parents=True, exist_ok=False)
+        if appbox_dir.exists():
+            raise HTTPException(409,
+                'Un workspace Control Plane orphelin existe pour ce client ; vérification/nettoyage sûr requis avant recréation.')
         try:
+            appbox_dir.mkdir(parents=True,exist_ok=False)
+        except FileExistsError:
+            raise HTTPException(409,
+                'Le workspace Control Plane vient d’être créé par une opération concurrente.') from None
+        try:
+            (appbox_dir/CONTROL_PLANE_WORKSPACE_MARKER).write_text(json.dumps({
+                'schema_version':1,'client_id':client_id,'node_id':selected_node_id,
+                'created_at':stamp},ensure_ascii=False,sort_keys=True),encoding='utf-8')
             if media_type == "plex":
                 (appbox_dir / "plex-config").mkdir()
             else:

@@ -240,7 +240,7 @@ def _plan(con, image_id, version_id=None):
             value = {}
         if _mentions(value, targets):
             blockers.append(f"Job actif : {row['job_id']} ({row['action']}/{row['status']})")
-    for row in con.execute("SELECT command_id,command_type,status,payload_json FROM agent_commands WHERE status IN ('queued','claimed')"):
+    for row in con.execute("SELECT command_id,command_type,status,payload_json FROM agent_commands WHERE status IN ('queued','offered','claimed')"):
         try:
             value = json.loads(row['payload_json'] or '{}')
         except (ValueError, TypeError):

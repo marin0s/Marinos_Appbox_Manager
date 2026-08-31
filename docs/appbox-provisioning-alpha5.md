@@ -17,15 +17,27 @@ Les jobs utilisent `queued`, `running`, puis `success`, `failed` ou `cancelled`.
 migration convertit les anciennes lignes `error` en `failed`; `error` reste uniquement
 un état métier historique possible d’une AppBox, pas un état actif de job.
 
-## Bail du worker et compatibilité
+## Livraison, bail du worker et compatibilité
 
-Un nouvel agent annonce `appbox_command_lease` et `appbox_progress`. Au claim, le CP
-crée un bail de 180 secondes par défaut, configurable par
+Un nouvel agent annonce `appbox_delivery_ack`, `appbox_command_lease` et
+`appbox_progress`. Le poll ne claim plus directement une commande AppBox : il effectue
+la transition atomique `queued → offered`, persiste uniquement le SHA-256 d'un token et
+retourne le token à l'agent. Si la réponse GET est perdue ou si l'agent n'ACK pas dans
+`APPBOX_DELIVERY_ACK_SECONDS` (15 secondes par défaut, minimum 5), l'offre expire,
+retourne à `queued` et le poll suivant reçoit une nouvelle offre. L'ancien token ne peut
+plus prendre possession de la commande.
+
+Avant toute I/O métier, l'agent envoie un ACK authentifié. Sa transition
+`offered → claimed` démarre le bail et la deadline globale. Un retry avec le même token
+après perte de la réponse ACK retourne le même claim sans seconde exécution. Deux
+workers ne peuvent donc pas ACK deux offres concurrentes. `worker_activity_at`, le bail
+et la deadline restent vides avant cette confirmation réelle. Le CP crée ensuite un bail
+de 180 secondes par défaut, configurable par
 `APPBOX_COMMAND_LEASE_SECONDS` (minimum 30). Le heartbeat léger transmet
 `active_command_id` et renouvelle le bail uniquement si cette commande est encore
 claimed sur ce node. Cette preuve d'ownership met à jour `worker_activity_at` sans
 changer le stage, le détail ou le pourcentage. Le renouvellement ne dépasse jamais
-`command_deadline_at`, calculé une fois au claim avec
+`command_deadline_at`, calculé une fois à l'ACK avec
 `APPBOX_COMMAND_MAX_RUNTIME_SECONDS` (7200 s par défaut).
 
 Le canal progress est distinct et best effort. Il utilise un reporter asynchrone avec
@@ -41,14 +53,31 @@ commandes queued : une commande terminale n’est jamais reprise. Le node garde 
 la boucle worker (`worker_last_poll_at`) prouve sa reprise et rétablit sa capacité.
 
 Les agents alpha.5 déjà installés qui n’annoncent pas ces capacités continuent à
-fonctionner selon le chemin historique : aucun bail ne leur est imposé et les phases
-non observables sont indiquées comme télémétrie indisponible. Leur mise à jour est
-requise pour détecter un worker figé avec heartbeat encore sain.
+fonctionner selon le chemin historique : claim immédiat au GET, aucun protocole d'offre
+ne leur est imposé et leurs phases non observables sont indiquées comme télémétrie
+indisponible. La compatibilité permet de déployer le Control Plane en premier, mais la
+mise à jour de l'agent est requise pour la relivraison après perte du GET et la détection
+complète d'un worker figé avec heartbeat encore sain.
 
-## Progression
+## Préparation centrale, workspace et progression
+
+Pour une version Reference Image publiée, le checksum enregistré à la publication est
+la source de vérité : le chemin synchrone ne rehash pas l'archive. Les accès SQLite sous
+`db_lock` se limitent au snapshot puis à la revalidation des métadonnées. Les éventuels
+hash legacy, compression, copie et I/O archive restent hors verrou. Si suppression ou
+republication gagne la course, la revalidation refuse le déploiement. Une dernière
+validation du catalogue et l'enqueue sont atomiques : la commande devient blocker de
+suppression, ou l'enqueue échoue si la suppression a déjà verrouillé la version. Heartbeat,
+métriques, inventaire et poll ne sont donc pas immobilisés par une archive volumineuse.
+
+Chaque workspace central créé possède un marqueur d'identité client/node. Après preuve
+de suppression distante, le Control Plane ne nettoie que le chemin exact sous
+`APPBOX_BASE_DIR` dont ce marqueur est valide. Un workspace legacy n'est accepté que si
+son `compose.yml` et sa liste fermée d'entrées correspondent au layout connu. Un dossier
+orphelin non vérifié est conservé et la recréation répond HTTP 409, jamais 500.
 
 Le workflow deploy persiste les phases validation node/stockage/manifeste, préparation neutre, cache,
-checksum, validation archive, extraction, SQLite, personnalisation runtime, fichiers,
+préparation de la référence centrale, checksum, validation archive, extraction, SQLite, personnalisation runtime, fichiers,
 Compose, attente runtime/health, refresh, watchdog et notification. Les pourcentages
 de phase et du job ne diminuent pas. `preparing` ne démarre aucune étape Docker et
 `docker_deploy` ne passe running qu'au report `compose_deployment`. Un résultat final peut confirmer une phase déjà
@@ -84,10 +113,13 @@ orphelines sont libérées sans campagne de nettoyage distante.
 1. Sauvegarder SQLite et relever pour `ab34ah` : état, StartedAt et RestartCount de
    `plex-appb-34ah`. Relever l’agent version/build/SHA et le timeout de bail.
 2. Vérifier ARTEMIS online, metrics séparées, tags `appbox-node`/`media`, hors
-   maintenance et sans commande claimed antérieure.
+   maintenance et sans commande offered/claimed antérieure. Confirmer que son heartbeat
+   annonce `appbox_delivery_ack=true`.
 3. Créer JDMRY sans déployer. Vérifier `generated`, `not_deployed`, aucun job/commande,
    et les réservations Plex/Tautulli sur ARTEMIS, pas CRONOS.
-4. Déployer. Observer dans le job les phases cache, checksum, archive, extraction,
+4. Déployer. Observer `offered`, l'ACK puis `claimed`; vérifier que lease, activité et
+   deadline sont absentes avant ACK. Observer dans le job les phases préparation de la
+   référence, cache, checksum, archive, extraction,
    SQLite, runtime, configuration, Compose et santé. Vérifier une progression monotone,
    `worker_activity_at` et le renouvellement du bail par heartbeat pendant les phases longues,
    même si le canal progress est momentanément indisponible.
@@ -107,6 +139,11 @@ orphelines sont libérées sans campagne de nettoyage distante.
 9. Rejouer la réconciliation : stopped sans port drift; deleted avec artefact présent
    signalé sans suppression. Confirmer que `ab34ah` a toujours le même StartedAt et
    RestartCount.
+10. Sur une AppBox jetable distincte, interrompre la réponse GET après création de
+    l'offre : elle doit être offerte de nouveau après le délai ACK. Perdre ensuite une
+    réponse ACK et renvoyer le même ACK : un seul worker/exécution doit apparaître.
+    Supprimer après un déploiement échoué, confirmer la disparition du workspace central,
+    puis recréer le même client. Ne jamais employer `ab34ah` pour ces injections.
 
 ## Rollback et limites
 

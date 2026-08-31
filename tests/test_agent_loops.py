@@ -77,6 +77,50 @@ class AgentLoopTests(unittest.TestCase):
         self.assertGreaterEqual(progress_attempts[0], 2)
         self.assertEqual(sum(1 for method,path,_ in calls if path.endswith('/result')), 1)
 
+    def test_ack_response_lost_after_server_commit_retries_without_double_execution(self):
+        command={'command_id':'delivery-one','command_type':'appbox_action','payload':{'action':'deploy'},
+                 'delivery_token':'delivery-token-value-1234567890'}
+        attempts=[0]; executions=[0]
+        def api(config,method,path,payload=None,**_kwargs):
+            if method=='GET': return {'command':command}
+            if path.endswith('/ack'):
+                attempts[0]+=1
+                if attempts[0]==1:
+                    # Server commit happened, but its HTTP response was lost.
+                    raise TimeoutError('response lost after commit')
+                return {'status':'claimed','idempotent':True}
+            return {}
+        def execute(*args,**kwargs): executions[0]+=1; return {'state':'running'}
+        class Runtime:
+            def __init__(self): self.cancel_event=threading.Event(); self.active=''
+            def begin_command(self,command_id): self.active=command_id
+            def finish_command(self,command_id): self.active=''
+        runtime=Runtime()
+        with patch.object(agent,'api',side_effect=api),patch.object(agent,'execute_command',side_effect=execute):
+            agent.command_cycle({'node_id':'test','command_delivery_ack_attempts':2},runtime=runtime)
+        self.assertEqual(attempts,[2])
+        self.assertEqual(executions,[1])
+        self.assertEqual(runtime.active,'')
+
+    def test_offer_not_acknowledged_never_executes(self):
+        command={'command_id':'delivery-expired','command_type':'appbox_action','payload':{'action':'deploy'},
+                 'delivery_token':'expired-delivery-token-1234567890'}
+        def api(config,method,path,payload=None,**_kwargs):
+            if method=='GET': return {'command':command}
+            if path.endswith('/ack'):
+                raise urllib.error.HTTPError(path,409,'expired',None,None)
+            return {}
+        class Runtime:
+            def __init__(self): self.cancel_event=threading.Event(); self.active=''
+            def begin_command(self,command_id): self.active=command_id
+            def finish_command(self,command_id): self.active=''
+        runtime=Runtime()
+        with patch.object(agent,'api',side_effect=api),patch.object(agent,'execute_command') as execute:
+            with self.assertRaises(agent.CommandCancelled):
+                agent.command_cycle({'node_id':'test'},runtime=runtime)
+        execute.assert_not_called()
+        self.assertEqual(runtime.active,'')
+
     def test_long_command_and_blocked_telemetry_do_not_block_heartbeats(self):
         loops = agent.AgentLoops({'node_id':'test'})
         loops.heartbeat_interval = .01

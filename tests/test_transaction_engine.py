@@ -109,6 +109,7 @@ if __name__ == '__main__':
 @pytest.fixture
 def job_database(tmp_path,monkeypatch):
     monkeypatch.setattr(main,'DB_FILE',tmp_path/'jobs.db')
+    monkeypatch.setattr(main,'BASE_DIR',tmp_path)
     monkeypatch.setattr(main,'HOSTNAME','cronos')
     monkeypatch.setattr(main,'worker_stop',Event())
     monkeypatch.setattr(main,'worker_wakeup',Event())
@@ -425,6 +426,33 @@ def test_manual_create_reserves_plex_and_tautulli_on_selected_node(job_database,
     assert 'CONFIGURATION CRÉÉE — NON DÉPLOYÉE' in rendered
 
 
+def test_failed_remote_delete_cleans_verified_cp_workspace_and_allows_recreate(job_database,monkeypatch):
+    root=job_database/'control-plane-runtime'; monkeypatch.setattr(main,'BASE_DIR',root)
+    _create_remote_appbox(job_database,client_id='retry01',port='32461')
+    workspace=root/'retry01'
+    assert (workspace/main.CONTROL_PLANE_WORKSPACE_MARKER).is_file()
+    with main.db() as con:
+        con.execute("UPDATE appboxes SET status='error',last_message='failed deploy' WHERE client_id='retry01'")
+    # The remote node proves its own path and containers are absent. It never
+    # touches this central workspace; execute_remote_job must verify and remove it.
+    monkeypatch.setattr(main,'wait_agent_command',lambda *args,**kwargs:
+                        (True,{'output':'remote cleanup complete','path_exists':False,'containers_remaining':[]},''))
+    deletion_job=main.create_job('retry01','delete','cleanup',node_id='artemis')
+    with main.db() as con:
+        job=dict(con.execute('SELECT * FROM jobs WHERE job_id=?',(deletion_job,)).fetchone())
+    main.execute_job(job)
+    with main.db() as con:
+        assert con.execute('SELECT status FROM jobs WHERE job_id=?',(deletion_job,)).fetchone()[0]=='success'
+        assert not con.execute("SELECT 1 FROM appboxes WHERE client_id='retry01'").fetchone()
+    assert not workspace.exists()
+    assert _create_remote_appbox(job_database,client_id='retry01',port='32461').status_code==303
+
+    orphan=root/'unsafe01'; orphan.mkdir(); (orphan/'operator-data').write_text('keep')
+    with pytest.raises(main.HTTPException) as conflict:
+        _create_remote_appbox(job_database,client_id='unsafe01',port='32462')
+    assert conflict.value.status_code==409 and orphan.exists()
+
+
 def test_automatic_create_uses_eligible_appbox_node_for_port(job_database,monkeypatch):
     monkeypatch.setattr(main, 'BASE_DIR', job_database/'automatic')
     stamp=main.now_iso()
@@ -487,10 +515,10 @@ def test_appbox_lease_progress_expiry_late_result_and_restart_are_terminal(job_d
         asyncio.run(main.agent_command_progress('artemis',command_id,AgentResultRequest({'stage':'checksum_reference','percent':20,'detail':'old'})))
     with main.db() as con:
         command=con.execute("SELECT lease_expires_at,worker_activity_at,progress_json,command_deadline_at FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
-        claimed_lease=command['lease_expires_at']; claimed_activity=command['worker_activity_at']
+        claimed_lease=command['lease_expires_at']
         step=con.execute("SELECT progress FROM job_steps WHERE job_id=? AND step_key='checksum_reference'",(job_id,)).fetchone()[0]
         docker=con.execute("SELECT status FROM job_steps WHERE job_id=? AND step_key='docker_deploy'",(job_id,)).fetchone()[0]
-        assert command['lease_expires_at'] and command['worker_activity_at'] and command['command_deadline_at'] and step==63
+        assert command['lease_expires_at'] and command['worker_activity_at'] is None and command['command_deadline_at'] and step==63
         assert docker == 'pending'
     # UX progress cannot renew ownership. A heartbeat from the runtime that owns
     # this exact command does, without changing functional progress.
@@ -504,7 +532,7 @@ def test_appbox_lease_progress_expiry_late_result_and_restart_are_terminal(job_d
     with main.db() as con:
         renewed=con.execute("SELECT lease_expires_at,worker_activity_at,progress_json FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
         assert renewed['lease_expires_at'] >= claimed_lease
-        assert renewed['worker_activity_at'] >= claimed_activity
+        assert renewed['worker_activity_at'] is not None
         assert json.loads(renewed['progress_json'])['percent']==20
     with patch.object(main,'authenticate_agent'):
         asyncio.run(main.agent_command_progress('artemis',command_id,AgentResultRequest({'stage':'compose_deployment','percent':10,'detail':'compose'})))
@@ -547,6 +575,88 @@ def test_executor_health_is_distinct_from_agent_liveness(job_database):
     assert node['status']=='online' and node['agent_online']
     assert node['executor_health']=='stalled' and node['worker_lease_status']=='stalled'
     assert not node['execution_capable'] and not node['actionable']
+
+
+def test_delivery_offer_lost_before_client_receives_response_is_reoffered(job_database):
+    with main.db() as con:
+        con.execute("UPDATE node_agents SET capabilities_json=? WHERE node_id='artemis'",
+                    (json.dumps({'deployment_executor':True,'appbox_command_lease':True,'appbox_delivery_ack':True}),))
+    command_id=main.queue_agent_command('artemis','appbox_action',{'action':'deploy'})
+    with patch.object(main,'authenticate_agent'):
+        first=json.loads(main.agent_poll_commands('artemis',AgentResultRequest({})).body)['command']
+    assert first['status']=='offered' and first['delivery_token']
+    with main.db() as con:
+        row=con.execute("SELECT status,claimed_at,worker_activity_at,lease_expires_at FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+        assert tuple(row)==('offered',None,None,None)
+        con.execute("UPDATE agent_commands SET delivery_ack_deadline='2000-01-01T00:00:00+00:00' WHERE command_id=?",(command_id,))
+    with patch.object(main,'authenticate_agent'):
+        second=json.loads(main.agent_poll_commands('artemis',AgentResultRequest({})).body)['command']
+        with pytest.raises(main.HTTPException) as old_offer:
+            asyncio.run(main.agent_ack_command_delivery('artemis',command_id,AgentResultRequest({'delivery_token':first['delivery_token']})))
+        acknowledged=json.loads(asyncio.run(main.agent_ack_command_delivery(
+            'artemis',command_id,AgentResultRequest({'delivery_token':second['delivery_token']}))).body)
+        repeated=json.loads(asyncio.run(main.agent_ack_command_delivery(
+            'artemis',command_id,AgentResultRequest({'delivery_token':second['delivery_token']}))).body)
+    assert old_offer.value.status_code==409
+    assert second['delivery_token']!=first['delivery_token']
+    assert acknowledged['status']=='claimed' and not acknowledged['idempotent']
+    assert repeated['status']=='claimed' and repeated['idempotent']
+    with main.db() as con:
+        row=con.execute("SELECT status,delivery_attempts,delivery_acknowledged_at,worker_activity_at,command_deadline_at FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+        assert row['status']=='claimed' and row['delivery_attempts']==2
+        assert row['delivery_acknowledged_at'] and row['worker_activity_at'] and row['command_deadline_at']
+
+
+def test_delivery_columns_migrate_additively_without_changing_legacy_commands(job_database):
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute('DROP TABLE agent_commands')
+        con.execute('''CREATE TABLE agent_commands (
+            command_id TEXT PRIMARY KEY,node_id TEXT NOT NULL,command_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',status TEXT NOT NULL DEFAULT 'queued',
+            created_at TEXT NOT NULL,claimed_at TEXT,completed_at TEXT,result_json TEXT,error_text TEXT,
+            FOREIGN KEY(node_id) REFERENCES nodes(node_id) ON DELETE CASCADE)''')
+        con.execute("INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,created_at) VALUES('legacy-delivery','artemis','appbox_action','{\"action\":\"start\"}','queued',?)",(stamp,))
+    main.init_database()
+    with main.db() as con:
+        columns={row['name'] for row in con.execute('PRAGMA table_info(agent_commands)')}
+        command=con.execute("SELECT * FROM agent_commands WHERE command_id='legacy-delivery'").fetchone()
+    assert {'delivery_token_hash','delivery_offered_at','delivery_ack_deadline',
+            'delivery_acknowledged_at','delivery_attempts'} <= columns
+    assert command['status']=='queued' and json.loads(command['payload_json'])=={'action':'start'}
+    assert command['delivery_token_hash'] is None and command['delivery_attempts']==0
+
+
+def test_ack_then_silent_worker_heartbeat_renews_lease_and_dead_worker_expires(job_database):
+    job_id=main.create_job('ab40ah','deploy','delivery',node_id='artemis')
+    main.update_job(job_id,'running',7,'Préparation de la référence')
+    with main.db() as con:
+        con.execute("UPDATE node_agents SET capabilities_json=? WHERE node_id='artemis'",
+                    (json.dumps({'deployment_executor':True,'appbox_command_lease':True,'appbox_delivery_ack':True}),))
+    command_id=main.queue_agent_command('artemis','appbox_action',{'_job_id':job_id,'client_id':'ab40ah','action':'deploy'})
+    with patch.object(main,'authenticate_agent'):
+        offer=json.loads(main.agent_poll_commands('artemis',AgentResultRequest({})).body)['command']
+        asyncio.run(main.agent_ack_command_delivery('artemis',command_id,AgentResultRequest({'delivery_token':offer['delivery_token']})))
+    with main.db() as con:
+        before=con.execute("SELECT lease_expires_at,worker_activity_at,progress_json,command_deadline_at FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+    with patch.object(main,'authenticate_agent'):
+        heartbeat=json.loads(asyncio.run(main.agent_heartbeat('artemis',AgentResultRequest({
+            'agent_version':'test','active_command_id':command_id,
+            'capabilities':{'deployment_executor':True,'appbox_command_lease':True,'appbox_delivery_ack':True},
+        }))).body)
+    assert heartbeat['active_command_state']=='lease_renewed' and heartbeat['worker_activity_at']
+    with main.db() as con:
+        after=con.execute("SELECT lease_expires_at,worker_activity_at,progress_json,command_deadline_at FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+        assert after['lease_expires_at']>=before['lease_expires_at']
+        assert after['worker_activity_at']>=before['worker_activity_at']
+        assert after['progress_json']=='{}' and after['command_deadline_at']==before['command_deadline_at']
+        con.execute("UPDATE agent_commands SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE command_id=?",(command_id,))
+    assert main.expire_appbox_command_leases()==1
+    with main.db() as con:
+        assert con.execute("SELECT status FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()[0]=='failed'
+        job=con.execute("SELECT * FROM jobs WHERE job_id=?",(job_id,)).fetchone()
+    delivery=main.job_dict(job,include_steps=True)['command_delivery']
+    assert delivery['delivery_acknowledged_at'] and delivery['worker_activity_at']
 
 
 def test_generated_deleted_capacity_remote_job_counts_and_legacy_error_migration(job_database):
