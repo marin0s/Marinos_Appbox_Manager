@@ -498,6 +498,200 @@ def test_same_node_port_collision_and_creation_rollback(job_database,monkeypatch
     assert not (job_database/'collisions'/'second01').exists()
 
 
+def _insert_historical_appbox(con, client_id, status, port, base):
+    stamp = main.now_iso()
+    con.execute("""INSERT INTO appboxes(
+        client_id,node_id,path,containers_json,status,plex_port,created_at,updated_at,
+        desired_state,observed_state
+    ) VALUES(?,'artemis',?,'[]',?,?,?,?,'deleted','missing')""",
+        (client_id, str(base/client_id), status, port, stamp, stamp))
+
+
+def _assert_creation_absent(base, client_id):
+    with main.db() as con:
+        for table in ('appboxes','port_reservations','appbox_mounts','jobs'):
+            assert con.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE client_id=?", (client_id,)
+            ).fetchone()[0] == 0, table
+        assert con.execute(
+            "SELECT COUNT(*) FROM agent_commands WHERE payload_json LIKE ?",
+            (f'%{client_id}%',),
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT COUNT(*) FROM placement_decisions WHERE client_id=?", (client_id,)
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT COUNT(*) FROM control_plane_deployments WHERE client_id=?", (client_id,)
+        ).fetchone()[0] == 0
+    assert not (base/client_id).exists()
+
+
+def test_deleted_appbox_with_released_reservation_allows_automatic_port_reuse(job_database,monkeypatch):
+    root = job_database/'deleted-port-reuse'
+    monkeypatch.setattr(main, 'BASE_DIR', root)
+    stamp = main.now_iso()
+    with main.db() as con:
+        _insert_historical_appbox(con, 'testlab01', 'deleted', 32436, root)
+        con.execute("""INSERT INTO port_reservations(
+            node_id,client_id,service,port,protocol,status,reserved_at,released_at
+        ) VALUES('artemis','testlab01','plex',32436,'tcp','released',?,?)""", (stamp, stamp))
+        _insert_historical_appbox(con, 'portguard', 'stopped', 32435, root)
+
+    response = main.create_appbox(
+        client_id='p0e2e01', media_type='plex', profile_id='', deployment_image_id='',
+        mount_group_id='', snapshot_id='', reference_version_id='', port_mode='automatic',
+        media_port_requested='', acceleration_mode='disabled', placement_mode='manual',
+        target_node_id='artemis', bare_metal_override=False, with_tautulli=False,
+        deploy_now=False,
+    )
+    assert response.status_code == 303
+    with main.db() as con:
+        created = con.execute(
+            "SELECT plex_port,status FROM appboxes WHERE client_id='p0e2e01'"
+        ).fetchone()
+        reservation = con.execute("""SELECT port,status FROM port_reservations
+            WHERE client_id='p0e2e01' AND service='plex'""").fetchone()
+    assert tuple(created) == (32436, 'generated')
+    assert tuple(reservation) == (32436, 'reserved')
+
+
+@pytest.mark.parametrize('status', ['stopped', 'error', 'missing', 'not_deployed'])
+def test_non_terminal_appbox_status_keeps_port_reserved_for_allocator(job_database,monkeypatch,status):
+    root = job_database/f'active-port-{status}'
+    monkeypatch.setattr(main, 'BASE_DIR', root)
+    with main.db() as con:
+        _insert_historical_appbox(con, 'portguard', 'running', 32435, root)
+        _insert_historical_appbox(con, 'existing01', status, 32436, root)
+
+    response = main.create_appbox(
+        client_id='nextport', media_type='plex', profile_id='', deployment_image_id='',
+        mount_group_id='', snapshot_id='', reference_version_id='', port_mode='automatic',
+        media_port_requested='', acceleration_mode='disabled', placement_mode='manual',
+        target_node_id='artemis', bare_metal_override=False, with_tautulli=False,
+        deploy_now=False,
+    )
+    assert response.status_code == 303
+    with main.db() as con:
+        assert con.execute(
+            "SELECT plex_port FROM appboxes WHERE client_id='nextport'"
+        ).fetchone()[0] == 32437
+
+
+def test_concurrent_port_collision_after_allocation_returns_409_and_rolls_back(job_database,monkeypatch):
+    root = job_database/'concurrent-collision'
+    monkeypatch.setattr(main, 'BASE_DIR', root)
+    with main.db() as con:
+        con.execute("""CREATE TRIGGER concurrent_port_owner BEFORE INSERT ON appboxes
+            WHEN NEW.client_id='race02'
+            BEGIN
+                INSERT INTO appboxes(
+                    client_id,node_id,media_type,with_tautulli,plex_port,status,
+                    path,containers_json,created_at,updated_at
+                ) VALUES(
+                    'race-owner',NEW.node_id,'plex',0,NEW.plex_port,'generated',
+                    'trigger-owner','[]',datetime('now'),datetime('now')
+                );
+            END""")
+    with pytest.raises(main.HTTPException) as conflict:
+        _create_remote_appbox(job_database, client_id='race02', port='32470')
+    assert conflict.value.status_code == 409
+    assert 'Conflit de création' in conflict.value.detail
+    _assert_creation_absent(root, 'race02')
+    with main.db() as con:
+        assert not con.execute("SELECT 1 FROM appboxes WHERE client_id='race-owner'").fetchone()
+
+
+@pytest.mark.parametrize('table', ['appboxes', 'port_reservations', 'appbox_mounts'])
+def test_integrity_failure_after_workspace_generation_rolls_back_db_and_files(job_database,monkeypatch,table):
+    root = job_database/f'forced-{table}'
+    monkeypatch.setattr(main, 'BASE_DIR', root)
+    client_id = {'appboxes':'failapp', 'port_reservations':'failport', 'appbox_mounts':'failmount'}[table]
+    with main.db() as con:
+        con.execute(f"""CREATE TRIGGER force_{table}_failure BEFORE INSERT ON {table}
+            WHEN NEW.client_id='{client_id}'
+            BEGIN SELECT RAISE(ABORT,'forced {table} integrity failure'); END""")
+    with pytest.raises(main.HTTPException) as conflict:
+        _create_remote_appbox(job_database, client_id=client_id, port='32471')
+    assert conflict.value.status_code == 409
+    _assert_creation_absent(root, client_id)
+
+
+def test_marker_write_failure_removes_only_empty_workspace_without_recursive_delete(job_database,monkeypatch):
+    root = job_database/'marker-failure'
+    monkeypatch.setattr(main, 'BASE_DIR', root)
+    original_write_text = Path.write_text
+
+    def fail_marker_staging(path, *args, **kwargs):
+        if (
+            path.parent == root/'markfail'
+            and path.name.startswith(f'.{main.CONTROL_PLANE_WORKSPACE_MARKER}.')
+        ):
+            raise OSError('forced marker write failure')
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'write_text', fail_marker_staging)
+    with pytest.raises(OSError, match='forced marker write failure'):
+        _create_remote_appbox(job_database, client_id='markfail', port='32473')
+    _assert_creation_absent(root, 'markfail')
+
+
+@pytest.mark.parametrize('marker', [
+    {'schema_version':1, 'client_id':'existing01', 'node_id':'artemis'},
+    {'schema_version':1, 'client_id':'wrong-client', 'node_id':'artemis'},
+])
+def test_preexisting_workspace_is_never_removed_by_creation_rollback(job_database,monkeypatch,marker):
+    root = job_database/'preexisting-workspace'
+    monkeypatch.setattr(main, 'BASE_DIR', root)
+    workspace = root/'existing01'
+    workspace.mkdir(parents=True)
+    (workspace/main.CONTROL_PLANE_WORKSPACE_MARKER).write_text(json.dumps(marker), encoding='utf-8')
+    sentinel = workspace/'operator-data'
+    sentinel.write_text('keep', encoding='utf-8')
+    with pytest.raises(main.HTTPException) as conflict:
+        _create_remote_appbox(job_database, client_id='existing01', port='32472')
+    assert conflict.value.status_code == 409
+    assert sentinel.read_text(encoding='utf-8') == 'keep'
+    with main.db() as con:
+        assert not con.execute("SELECT 1 FROM appboxes WHERE client_id='existing01'").fetchone()
+
+
+def test_port_index_migration_preserves_deleted_history_and_frees_plex_and_tautulli(job_database):
+    with main.db() as con:
+        con.executescript("""
+            DROP INDEX ux_appbox_node_plex_port;
+            CREATE UNIQUE INDEX ux_appbox_node_plex_port
+                ON appboxes(node_id,plex_port) WHERE plex_port IS NOT NULL;
+            DROP INDEX ux_appbox_node_tautulli_port;
+            CREATE UNIQUE INDEX ux_appbox_node_tautulli_port
+                ON appboxes(node_id,tautulli_port) WHERE tautulli_port IS NOT NULL;
+        """)
+        stamp = main.now_iso()
+        con.execute("""INSERT INTO appboxes(
+            client_id,node_id,path,containers_json,status,plex_port,tautulli_port,created_at,updated_at
+        ) VALUES('legacy-deleted','artemis','legacy','[]','deleted',32480,8190,?,?)""", (stamp,stamp))
+
+    main.init_database()
+    with main.db() as con:
+        index_sql = {
+            row['name']: row['sql'] for row in con.execute("""SELECT name,sql FROM sqlite_master
+                WHERE type='index' AND name IN (
+                    'ux_appbox_node_plex_port','ux_appbox_node_tautulli_port'
+                )""").fetchall()
+        }
+        assert all("status != 'deleted'" in sql for sql in index_sql.values())
+        stamp = main.now_iso()
+        con.execute("""INSERT INTO appboxes(
+            client_id,node_id,path,containers_json,status,plex_port,tautulli_port,created_at,updated_at
+        ) VALUES('new-active','artemis','active','[]','generated',32480,8190,?,?)""", (stamp,stamp))
+        assert tuple(con.execute(
+            "SELECT plex_port,tautulli_port FROM appboxes WHERE client_id='legacy-deleted'"
+        ).fetchone()) == (32480,8190)
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("""INSERT INTO appboxes(
+                client_id,node_id,path,containers_json,status,plex_port,created_at,updated_at
+            ) VALUES('second-active','artemis','second','[]','error',32480,?,?)""", (stamp,stamp))
+
+
 def test_appbox_lease_progress_expiry_late_result_and_restart_are_terminal(job_database):
     job_id=main.create_job('ab40ah','deploy','lease',node_id='artemis')
     main.update_job(job_id,'running',10,'started')

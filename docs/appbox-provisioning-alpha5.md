@@ -76,6 +76,14 @@ de suppression distante, le Control Plane ne nettoie que le chemin exact sous
 son `compose.yml` et sa liste fermée d'entrées correspondent au layout connu. Un dossier
 orphelin non vérifié est conservé et la recréation répond HTTP 409, jamais 500.
 
+La création utilise une transaction `BEGIN IMMEDIATE` couvrant allocation, génération du
+workspace, AppBox, réservations, montages, snapshot éventuel, décision de placement,
+déploiement central, événement et job `deploy_now` éventuel. Si une étape échoue, SQLite
+rollback l'ensemble puis le Control Plane supprime uniquement le workspace créé par cette
+requête : chemin exact sous `APPBOX_BASE_DIR`, dossier réel et marqueur versionné dont
+`client_id` et `node_id` correspondent exactement. Un workspace présent avant la requête,
+même muni d'un marqueur valide, produit HTTP 409 et n'entre jamais dans le rollback.
+
 Le workflow deploy persiste les phases validation node/stockage/manifeste, préparation neutre, cache,
 préparation de la référence centrale, checksum, validation archive, extraction, SQLite, personnalisation runtime, fichiers,
 Compose, attente runtime/health, refresh, watchdog et notification. Les pourcentages
@@ -86,10 +94,22 @@ faussement exécutée. Le job global n’atteint 100 % qu’à son état termina
 
 ## Ports et placement
 
-Une réservation active est unique par `(node_id, port, protocol)`. Le node est toujours
-le `selected_node_id`; le test de sockets local ne s’applique qu’au node local, jamais à
-CRONOS pour une cible distante. Plex et Tautulli sont réservés dans la même transaction
-que l’AppBox. Un échec logique annule la transaction et supprime le staging central.
+Une réservation active est unique par `(node_id, port, protocol)`. Les index AppBox Plex
+et Tautulli sont uniques par node uniquement pour `status != 'deleted'`. Une ligne
+définitivement deleted reste donc consultable avec ses anciens ports, sans bloquer leur
+réutilisation. Tous les autres états, dont `generated`, `imported`, `running`, `stopped`,
+`error`, `missing` et `not_deployed`, conservent leurs ports. Au démarrage, la migration
+idempotente reconstruit les deux anciens index sous savepoint, sans réécrire les lignes ni
+effacer l'historique ; une collision active incohérente fait échouer la migration et restaure
+les index précédents pour permettre une correction opérateur sûre.
+
+L'allocator prend l'union des réservations actives et des colonnes Plex/Tautulli de toutes
+les AppBox non deleted. Le node est toujours le `selected_node_id`; le test de sockets local
+ne s’applique qu’au node local, jamais à CRONOS pour une cible distante. Plex et Tautulli
+sont réservés dans la même transaction que l’AppBox. `BEGIN IMMEDIATE` sérialise les
+writers et les contraintes uniques restent le dernier garde-fou. Une collision tardive ou
+une incohérence d'intégrité produit HTTP 409, annule toutes les lignes et supprime le seul
+workspace neuf vérifié.
 La synchronisation est idempotente : elle recrée une réservation manquante, suit un
 changement de node et libère les lignes sans AppBox active. La suppression définitive
 libère aussi les ports. Deux nodes peuvent utiliser le même numéro.
@@ -145,12 +165,44 @@ orphelines sont libérées sans campagne de nettoyage distante.
     Supprimer après un déploiement échoué, confirmer la disparition du workspace central,
     puis recréer le même client. Ne jamais employer `ab34ah` pour ces injections.
 
+### Recette terrain exacte create → deploy → delete → recreate
+
+À exécuter uniquement sur un client jetable et après sauvegarde de SQLite :
+
+1. Relever le premier port libre attendu sur ARTEMIS dans `appboxes` non deleted et
+   `port_reservations` reserved. Créer le client jetable en port automatique depuis l'UI.
+   Vérifier une ligne `generated/not_deployed`, une réservation `reserved`, le workspace
+   marqué client/node, et l'absence de job si « Déployer maintenant » est décoché.
+2. Déployer et attendre le succès terminal. Vérifier le port publié, le conteneur attendu et
+   l'absence de commande queued/offered/claimed résiduelle. Ne jamais réutiliser une
+   AppBox de production pour cette recette.
+3. Supprimer définitivement depuis l'UI, attendre la preuve agent et le succès du job.
+   Vérifier conteneur et chemin distant absents, réservation `released` (ou détachée selon
+   l'historique), inventaires supprimés et workspace central absent.
+4. Recréer exactement le même `client_id` : la création doit réussir sans HTTP 500. Puis
+   supprimer à nouveau ce client jetable.
+5. Rejouer avec un client B après suppression d'un client A et vérifier que le port libéré
+   peut être réalloué. Pour reproduire l'incident historique, conserver une ligne A
+   `status='deleted'` avec son ancien `plex_port` et une réservation `released`; B doit
+   recevoir ce port et créer une nouvelle réservation `reserved`.
+6. En cas de HTTP 409, vérifier le message métier puis confirmer qu'aucune ligne B n'existe
+   dans `appboxes`, `port_reservations`, `appbox_mounts`, `jobs` ou `agent_commands`, et
+   qu'aucun workspace B n'est resté. Ne supprimer manuellement un workspace préexistant
+   qu'après sauvegarde et validation opérateur de son marqueur et de son contenu.
+
 ## Rollback et limites
 
 Rollback applicatif : arrêter le Control Plane, restaurer ensemble son code et la
 sauvegarde SQLite antérieure, puis redémarrer. Pour l’agent managed, utiliser le rollback
 de release documenté dans `agent-upgrades.md`; ne pas remplacer agent.json. Un rollback
 vers un ancien agent retire la protection de bail AppBox et la télémétrie détaillée.
+
+Avant déploiement du hotfix, sauvegarder le fichier SQLite complet avec ses sidecars selon
+la procédure d'exploitation. Le rollback du lifecycle des ports exige de restaurer cette
+sauvegarde en même temps que le code : une base ayant réutilisé un port d'une ligne deleted
+peut contenir deux valeurs historiques identiques, incompatibles avec l'ancien index global.
+Ne recréer l'ancien index qu'après suppression ou archivage explicite de cette collision
+historique ; ne jamais effacer une ligne de production uniquement pour faire passer l'index.
 
 Les tests locaux simulent Docker, le réseau et Linux. Restent à valider sur ARTEMIS :
 durées et débit réels d’un gros cache, cadence des callbacks SQLite/tar, comportement

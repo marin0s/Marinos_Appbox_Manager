@@ -650,9 +650,11 @@ def init_database() -> None:
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS ux_appbox_node_plex_port
-            ON appboxes(node_id, plex_port) WHERE plex_port IS NOT NULL;
+            ON appboxes(node_id, plex_port)
+            WHERE plex_port IS NOT NULL AND status != 'deleted';
         CREATE UNIQUE INDEX IF NOT EXISTS ux_appbox_node_tautulli_port
-            ON appboxes(node_id, tautulli_port) WHERE tautulli_port IS NOT NULL;
+            ON appboxes(node_id, tautulli_port)
+            WHERE tautulli_port IS NOT NULL AND status != 'deleted';
 
 
         CREATE TABLE IF NOT EXISTS storage_mounts (
@@ -1145,6 +1147,27 @@ def init_database() -> None:
         }.items():
             if column not in appbox_columns:
                 con.execute(f"ALTER TABLE appboxes ADD COLUMN {column} {definition}")
+
+        # A definitively deleted AppBox remains queryable as history, but no
+        # longer owns runtime ports. Rebuild the legacy indexes on every start:
+        # DROP/CREATE is idempotent and upgrades existing databases without
+        # rewriting historical AppBox rows or losing their former port values.
+        con.execute("SAVEPOINT migrate_appbox_port_indexes")
+        try:
+            con.execute("DROP INDEX IF EXISTS ux_appbox_node_plex_port")
+            con.execute("""CREATE UNIQUE INDEX ux_appbox_node_plex_port
+                ON appboxes(node_id, plex_port)
+                WHERE plex_port IS NOT NULL AND status != 'deleted'""")
+            con.execute("DROP INDEX IF EXISTS ux_appbox_node_tautulli_port")
+            con.execute("""CREATE UNIQUE INDEX ux_appbox_node_tautulli_port
+                ON appboxes(node_id, tautulli_port)
+                WHERE tautulli_port IS NOT NULL AND status != 'deleted'""")
+        except Exception:
+            con.execute("ROLLBACK TO migrate_appbox_port_indexes")
+            con.execute("RELEASE migrate_appbox_port_indexes")
+            raise
+        else:
+            con.execute("RELEASE migrate_appbox_port_indexes")
 
         job_columns = {row["name"] for row in con.execute("PRAGMA table_info(jobs)").fetchall()}
         if "options_json" not in job_columns:
@@ -3642,26 +3665,39 @@ def workflow_definition(action: str) -> list[tuple[str, str]]:
     ])
 
 
-def create_job(client_id: str, action: str, title: str, detail: str = "", node_id: str | None = None, options: dict[str, Any] | None = None) -> str:
+def _insert_job(
+    con: sqlite3.Connection,
+    client_id: str,
+    action: str,
+    title: str,
+    detail: str = "",
+    node_id: str | None = None,
+    options: dict[str, Any] | None = None,
+) -> str:
     job_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     stamp = now_iso()
     steps = workflow_definition(action)
     options = dict(options or {})
     if action == 'delete':
         options['original_client_id'] = client_id  # jobs.client_id is detached at finalization
+    agent_upgrades.require_idle(con, node_id or HOSTNAME)
+    con.execute("""
+        INSERT INTO jobs(
+            job_id,client_id,node_id,action,title,status,progress,
+            detail,created_at,updated_at,options_json
+        ) VALUES(?,?,?,?,?,'queued',0,?,?,?,?)
+    """, (job_id, client_id, (node_id or HOSTNAME), action, title, detail[-12000:], stamp, stamp, json.dumps(options or {}, ensure_ascii=False)))
+    con.executemany("""
+        INSERT INTO job_steps(
+            job_id,step_key,title,status,progress,detail,executor,resources_json
+        ) VALUES(?,?,?,'pending',0,'','control-plane','{}')
+    """, [(job_id, key, step_title) for key, step_title in steps])
+    return job_id
+
+
+def create_job(client_id: str, action: str, title: str, detail: str = "", node_id: str | None = None, options: dict[str, Any] | None = None) -> str:
     with db_lock, db() as con:
-        agent_upgrades.require_idle(con, node_id or HOSTNAME)
-        con.execute("""
-            INSERT INTO jobs(
-                job_id,client_id,node_id,action,title,status,progress,
-                detail,created_at,updated_at,options_json
-            ) VALUES(?,?,?,?,?,'queued',0,?,?,?,?)
-        """, (job_id, client_id, (node_id or HOSTNAME), action, title, detail[-12000:], stamp, stamp, json.dumps(options or {}, ensure_ascii=False)))
-        con.executemany("""
-            INSERT INTO job_steps(
-                job_id,step_key,title,status,progress,detail,executor,resources_json
-            ) VALUES(?,?,?,'pending',0,'','control-plane','{}')
-        """, [(job_id, key, step_title) for key, step_title in steps])
+        job_id = _insert_job(con, client_id, action, title, detail, node_id, options)
     worker_wakeup.set()
     return job_id
 
@@ -4074,6 +4110,43 @@ def cleanup_control_plane_workspace(client_id: str, configured_path: str | Path)
         names={entry.name for entry in expected.iterdir()}
         if not (expected/'compose.yml').is_file() or not names<=allowed:
             raise RuntimeError('Workspace Control Plane legacy non vérifié ; nettoyage opérateur requis.')
+    shutil.rmtree(expected)
+    return True
+
+
+def rollback_created_control_plane_workspace(
+    client_id: str,
+    node_id: str,
+    configured_path: str | Path,
+) -> bool:
+    """Remove only a workspace created and marked by the current request.
+
+    Unlike final deletion, creation rollback deliberately has no legacy mode:
+    a missing, malformed or mismatched marker is never sufficient authority to
+    recursively remove a pre-existing directory.
+    """
+    base = BASE_DIR.resolve()
+    expected = (base / client_id).resolve()
+    supplied = Path(configured_path).resolve()
+    if expected.parent != base or supplied != expected or expected.name != client_id:
+        raise RuntimeError('Rollback workspace hors du répertoire AppBox autorisé.')
+    if not expected.exists():
+        return False
+    if expected.is_symlink() or not expected.is_dir():
+        raise RuntimeError('Rollback workspace non sûr : dossier réel attendu.')
+    marker = expected / CONTROL_PLANE_WORKSPACE_MARKER
+    if not marker.is_file() or marker.is_symlink():
+        raise RuntimeError('Rollback workspace refusé : marqueur absent ou non sûr.')
+    try:
+        identity = json.loads(marker.read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError('Rollback workspace refusé : marqueur illisible.') from exc
+    if (
+        identity.get('schema_version') != 1
+        or identity.get('client_id') != client_id
+        or identity.get('node_id') != node_id
+    ):
+        raise RuntimeError('Rollback workspace refusé : identité du marqueur invalide.')
     shutil.rmtree(expected)
     return True
 
@@ -6889,33 +6962,69 @@ def create_appbox(
         if mount_errors:
             raise HTTPException(409, " ; ".join(mount_errors))
 
-    with db_lock, db() as con:
-        if con.execute("SELECT 1 FROM appboxes WHERE client_id=?", (client_id,)).fetchone():
-            raise HTTPException(409, "Cette AppBox existe déjà.")
-        reserved = {int(row[0]) for row in con.execute(
-            "SELECT port FROM port_reservations WHERE node_id=? AND protocol='tcp' AND status='reserved'",
-            (selected_node_id,)).fetchall()}
-        check_local=selected_node_id==HOSTNAME
-        media_port = choose_media_port(media_type, media_port_requested, port_mode, reserved,check_local=check_local)
-        reserved.add(media_port)
-        tautulli_port = reserve_port(TAUTULLI_RANGE, reserved,check_local=check_local) if with_tautulli else None
-        stamp = now_iso()
-        services=[('plex' if media_type=='plex' else 'jellyfin',media_port)]
-        if tautulli_port: services.append(('tautulli',tautulli_port))
+    appbox_dir = BASE_DIR / client_id
+    workspace_created = False
+    deploy_job_id = None
+    source_label = "Plex vierge" if not reference_version_id else f"image de déploiement {reference_version_id}"
+    deployment_id = str(uuid.uuid4())
+    try:
+        # BEGIN IMMEDIATE serializes allocation and reservation against every
+        # SQLite writer. The UNIQUE indexes remain the final collision guard.
+        with db_lock, immediate_transaction() as con:
+            if con.execute("SELECT 1 FROM appboxes WHERE client_id=?", (client_id,)).fetchone():
+                raise HTTPException(409, "Cette AppBox existe déjà.")
+            occupied = {int(row[0]) for row in con.execute("""
+                SELECT port FROM port_reservations
+                WHERE node_id=? AND protocol='tcp' AND status='reserved'
+                UNION
+                SELECT plex_port FROM appboxes
+                WHERE node_id=? AND status!='deleted' AND plex_port IS NOT NULL
+                UNION
+                SELECT tautulli_port FROM appboxes
+                WHERE node_id=? AND status!='deleted' AND tautulli_port IS NOT NULL
+            """, (selected_node_id, selected_node_id, selected_node_id)).fetchall()}
+            check_local = selected_node_id == HOSTNAME
+            media_port = choose_media_port(
+                media_type, media_port_requested, port_mode, occupied,
+                check_local=check_local,
+            )
+            occupied.add(media_port)
+            tautulli_port = (
+                reserve_port(TAUTULLI_RANGE, occupied, check_local=check_local)
+                if with_tautulli else None
+            )
+            stamp = now_iso()
+            services = [('plex' if media_type == 'plex' else 'jellyfin', media_port)]
+            if tautulli_port:
+                services.append(('tautulli', tautulli_port))
 
-        appbox_dir = BASE_DIR / client_id
-        if appbox_dir.exists():
-            raise HTTPException(409,
-                'Un workspace Control Plane orphelin existe pour ce client ; vérification/nettoyage sûr requis avant recréation.')
-        try:
-            appbox_dir.mkdir(parents=True,exist_ok=False)
-        except FileExistsError:
-            raise HTTPException(409,
-                'Le workspace Control Plane vient d’être créé par une opération concurrente.') from None
-        try:
-            (appbox_dir/CONTROL_PLANE_WORKSPACE_MARKER).write_text(json.dumps({
+            if appbox_dir.exists():
+                raise HTTPException(409,
+                    'Un workspace Control Plane orphelin existe pour ce client ; vérification/nettoyage sûr requis avant recréation.')
+            try:
+                appbox_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                raise HTTPException(409,
+                    'Le workspace Control Plane vient d’être créé par une opération concurrente.') from None
+            workspace_created = True
+            marker = appbox_dir / CONTROL_PLANE_WORKSPACE_MARKER
+            marker_staging = appbox_dir / f'.{CONTROL_PLANE_WORKSPACE_MARKER}.{uuid.uuid4().hex}.tmp'
+            marker_payload = json.dumps({
                 'schema_version':1,'client_id':client_id,'node_id':selected_node_id,
-                'created_at':stamp},ensure_ascii=False,sort_keys=True),encoding='utf-8')
+                'created_at':stamp},ensure_ascii=False,sort_keys=True)
+            try:
+                marker_staging.write_text(marker_payload, encoding='utf-8')
+                marker_staging.replace(marker)
+            except Exception:
+                # Before a verified marker exists, recursive deletion is never
+                # authorized. Remove only our exact staging file, then the
+                # workspace with rmdir if and only if it is still empty.
+                marker_staging.unlink(missing_ok=True)
+                try:
+                    appbox_dir.rmdir()
+                except OSError:
+                    pass
+                raise
             if media_type == "plex":
                 (appbox_dir / "plex-config").mkdir()
             else:
@@ -6949,93 +7058,100 @@ def create_appbox(
                 }),
                 encoding="utf-8",
             )
-        except Exception:
-            shutil.rmtree(appbox_dir, ignore_errors=True)
-            raise
 
-        containers = [f"plex-appb-{plex_short_id(client_id)}" if media_type == "plex" else f"jellyfin-{client_id}"]
-        if with_tautulli:
-            containers.append(f"tautulli-{client_id}")
-        con.execute("""
-            INSERT INTO appboxes(
-                client_id,node_id,media_type,with_tautulli,plex_port,
-                tautulli_port,status,path,containers_json,created_at,updated_at,
-                profile_id,snapshot_id,mount_group_id,storage_mode,port_mode,
-                reference_image_id,reference_version_id,acceleration_mode,
-                placement_mode,requested_node_id,selected_node_id,placement_reason,
-                desired_state,observed_state,reconciliation_status,drift_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            client_id,selected_node_id,media_type,int(with_tautulli),media_port,
-            tautulli_port,"generated",str(appbox_dir),json.dumps(containers),
-            stamp,stamp,profile_id or None,snapshot_id,mount_group_id,
-            storage_mode,port_mode,reference_image_id,
-            reference_version_id,acceleration_mode,placement_mode,
-            target_node_id,selected_node_id,placement_result["reason"],
-            'not_deployed','not_deployed','in_sync','[]',
-        ))
-        try:
+            containers = [f"plex-appb-{plex_short_id(client_id)}" if media_type == "plex" else f"jellyfin-{client_id}"]
+            if with_tautulli:
+                containers.append(f"tautulli-{client_id}")
+            con.execute("""
+                INSERT INTO appboxes(
+                    client_id,node_id,media_type,with_tautulli,plex_port,
+                    tautulli_port,status,path,containers_json,created_at,updated_at,
+                    profile_id,snapshot_id,mount_group_id,storage_mode,port_mode,
+                    reference_image_id,reference_version_id,acceleration_mode,
+                    placement_mode,requested_node_id,selected_node_id,placement_reason,
+                    desired_state,observed_state,reconciliation_status,drift_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                client_id,selected_node_id,media_type,int(with_tautulli),media_port,
+                tautulli_port,"generated",str(appbox_dir),json.dumps(containers),
+                stamp,stamp,profile_id or None,snapshot_id,mount_group_id,
+                storage_mode,port_mode,reference_image_id,
+                reference_version_id,acceleration_mode,placement_mode,
+                target_node_id,selected_node_id,placement_result["reason"],
+                'not_deployed','not_deployed','in_sync','[]',
+            ))
             # The AppBox row must exist before its FK-backed reservations. Both
             # remain in the same transaction, so a collision rolls everything back.
             con.executemany("""INSERT INTO port_reservations(node_id,client_id,service,port,protocol,status,reserved_at)
                 VALUES(?,?,?,?,?,'reserved',?)""",[(selected_node_id,client_id,service,port,'tcp',stamp) for service,port in services])
-        except sqlite3.IntegrityError:
-            shutil.rmtree(appbox_dir, ignore_errors=True)
-            raise HTTPException(409,'Un port vient d’être réservé sur le node sélectionné ; recommencez le provisioning.') from None
-        con.executemany("""
-            INSERT INTO appbox_mounts(
-                client_id,mount_id,host_path,container_path,read_only,propagation
-            ) VALUES(?,?,?,?,?,?)
-        """, [
-            (
-                client_id,mount["mount_id"],mount["host_path"],
-                mount["container_path"],int(mount["read_only"]),mount["propagation"],
-            )
-            for mount in mounts
-        ])
-        if snapshot_id:
+            con.executemany("""
+                INSERT INTO appbox_mounts(
+                    client_id,mount_id,host_path,container_path,read_only,propagation
+                ) VALUES(?,?,?,?,?,?)
+            """, [
+                (
+                    client_id,mount["mount_id"],mount["host_path"],
+                    mount["container_path"],int(mount["read_only"]),mount["propagation"],
+                )
+                for mount in mounts
+            ])
+            if snapshot_id:
+                con.execute("""
+                    INSERT INTO snapshot_deployments(
+                        client_id,snapshot_id,status,detail,deployed_at
+                    ) VALUES(?,?,?,'Snapshot copié vers la configuration AppBox.',?)
+                """, (client_id,snapshot_id,"prepared",stamp))
+
+            placement_cursor = con.execute("""
+                INSERT INTO placement_decisions(
+                    client_id,requested_mode,requested_node_id,selected_node_id,
+                    eligible_nodes_json,rejected_nodes_json,reason,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+            """, (
+                client_id, placement_mode, target_node_id, selected_node_id,
+                json.dumps([node["node_id"] for node in placement_result["eligible"]], ensure_ascii=False),
+                json.dumps(placement_result["rejected"], ensure_ascii=False),
+                placement_result["reason"], stamp,
+            ))
+            placement_decision_id = int(placement_cursor.lastrowid)
             con.execute("""
-                INSERT INTO snapshot_deployments(
-                    client_id,snapshot_id,status,detail,deployed_at
-                ) VALUES(?,?,?,'Snapshot copié vers la configuration AppBox.',?)
-            """, (client_id,snapshot_id,"prepared",stamp))
+                INSERT INTO control_plane_deployments(
+                    deployment_id,client_id,node_id,placement_decision_id,
+                    reference_version_id,status,current_step,progress,detail,
+                    created_at,updated_at
+                ) VALUES(?,?,?,?,?,'prepared','compose_ready',25,?,?,?)
+            """, (
+                deployment_id, client_id, selected_node_id, placement_decision_id,
+                reference_version_id, placement_result["reason"], stamp, stamp,
+            ))
+            con.execute("""
+                INSERT INTO events(client_id,node_id,event_type,level,message,created_at)
+                VALUES(?,?,'created','success',?,?)
+            """, (
+                client_id, HOSTNAME,
+                f"AppBox {media_type.upper()} créée sur {selected_node_id} depuis {source_label}, "
+                f"groupe {mount_group_id}, port {media_port}. {placement_result['reason']}",
+                stamp,
+            ))
+            if deploy_now:
+                deploy_job_id = _insert_job(
+                    con, client_id, "deploy", "Déploiement de l’AppBox",
+                    "Opération placée dans la file globale.", selected_node_id,
+                )
+    except sqlite3.IntegrityError:
+        if workspace_created:
+            rollback_created_control_plane_workspace(client_id, selected_node_id, appbox_dir)
+        raise HTTPException(
+            409,
+            'Conflit de création AppBox ou de réservation de port ; rechargez les données puis recommencez.',
+        ) from None
+    except Exception:
+        if workspace_created:
+            rollback_created_control_plane_workspace(client_id, selected_node_id, appbox_dir)
+        raise
 
-    placement_decision_id = record_placement_decision(
-        client_id,
-        placement_mode,
-        target_node_id,
-        placement_result,
-    )
-    deployment_id = str(uuid.uuid4())
-    with db_lock, db() as con:
-        con.execute("""
-            INSERT INTO control_plane_deployments(
-                deployment_id,client_id,node_id,placement_decision_id,
-                reference_version_id,status,current_step,progress,detail,
-                created_at,updated_at
-            ) VALUES(?,?,?,?,?,'prepared','compose_ready',25,?,?,?)
-        """, (
-            deployment_id,
-            client_id,
-            selected_node_id,
-            placement_decision_id,
-            reference_version_id,
-            placement_result["reason"],
-            now_iso(),
-            now_iso(),
-        ))
-
-    source_label = "Plex vierge" if not reference_version_id else f"image de déploiement {reference_version_id}"
-    record_event(
-        client_id,
-        "created",
-        f"AppBox {media_type.upper()} créée sur {selected_node_id} depuis {source_label}, "
-        f"groupe {mount_group_id}, port {media_port}. {placement_result['reason']}",
-        "success",
-    )
-    sync_port_reservations()
-    if deploy_now:
-        create_job(client_id, "deploy", "Déploiement de l’AppBox", "Opération placée dans la file globale.")
+    if deploy_job_id:
+        worker_wakeup.set()
     return RedirectResponse(f"/appboxes/{client_id}", status_code=303)
 
 
