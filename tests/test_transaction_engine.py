@@ -119,7 +119,13 @@ def job_database(tmp_path,monkeypatch):
         for node in ('artemis','orion'):
             con.execute("INSERT INTO nodes(node_id,name,mode,status,created_at,updated_at) VALUES(?,?,'remote','online',?,?)",(node,node,stamp,stamp))
             con.execute("INSERT INTO node_agents(node_id,status,last_heartbeat,capabilities_json,updated_at) VALUES(?,'online',?,?,?)",
-                        (node,stamp,json.dumps({'deployment_executor':True}),stamp))
+                        (node,stamp,json.dumps({'deployment_executor':True,'storage_observations':True}),stamp))
+            main.persist_storage_observations(con,node,[
+                {'path':path,'exists':True,'mounted':True}
+                for path in [row[0] for row in con.execute(
+                    "SELECT DISTINCT host_path FROM storage_mounts WHERE enabled=1"
+                ).fetchall()]
+            ],stamp,stamp)
         for client,node in [('ab40ah','artemis'),('ab37ah','artemis'),('image-jelly','orion')]:
             con.execute("INSERT INTO appboxes(client_id,node_id,path,containers_json,status,desired_state,observed_state,created_at,updated_at) VALUES(?,?,?,'[]','error','deleted','missing',?,?)",
                         (client,node,str(tmp_path/client),stamp,stamp))

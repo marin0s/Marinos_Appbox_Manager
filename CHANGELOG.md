@@ -2,6 +2,13 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Topologie distribuée des Volume Mounts
+- Les définitions `storage_mounts` sont désormais des ressources logiques réutilisables ; leur ancien `node_id` est conservé pour compatibilité mais ne détermine plus la disponibilité.
+- Les agents observent les chemins demandés dans la boucle inventory/metrics indépendante et publient existence, état mountpoint et métadonnées optionnelles. Le heartbeat reste léger et transmet seulement la configuration des chemins à observer.
+- Le Control Plane persiste les observations par `(node_id, host_path)`, expose `available`, `absent`, `unknown` ou `stale` dans une matrice par node, et utilise un timeout configurable de 180 s (`APPBOX_STORAGE_OBSERVATION_SECONDS`).
+- Le provisioning résout le groupe sur le node réellement sélectionné : un montage requis non confirmé bloque avec une erreur explicite ; un montage optionnel non confirmé est omis du Compose pour éviter la création silencieuse d'un bind local vide.
+- Migration SQLite additive : les définitions historiques conservent la sémantique « chemin existant » (`requires_mountpoint=0`), tandis que les nouvelles définitions peuvent exiger explicitement un véritable mountpoint. Les anciens payloads inventory/agents restent compatibles et leur stockage demeure `unknown` jusqu'à mise à jour. Un mount optionnel n'est omis que sur absence fraîchement confirmée ; `unknown/stale` bloque une décision ambiguë. Le cycle de vie des Reference Images reste inchangé.
+
 ### Fiabilité du provisioning AppBox distribué
 - Hotfix lifecycle des ports et création transactionnelle : les index Plex/Tautulli excluent uniquement les AppBox définitivement `deleted`, tandis que l’allocator fusionne réservations actives et ports de toutes les AppBox non terminales (`stopped`, `error`, `missing`, `not_deployed` inclus). La migration conserve l’historique des ports et reconstruit les index sous savepoint. Toute collision SQLite devient un HTTP 409 métier ; AppBox, réservations, montages, décision, déploiement, événement et éventuel job sont commit ensemble, avec rollback du seul workspace neuf dont le marqueur client/node est exact.
 - Livraison fiable des commandes AppBox compatibles selon `queued → offered → ACK → claimed` : une réponse GET perdue ne crée plus de commande orpheline, une offre non confirmée est relivrée avec un nouveau token et l'ACK est idempotent si sa réponse se perd. Lease, activité worker et deadline ne démarrent qu'après ownership confirmé ; le chemin historique reste disponible pendant la migration des agents.

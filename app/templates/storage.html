@@ -3,7 +3,7 @@
 {% block page_title %}Stockage{% endblock %}
 {% block content %}
 <section class="hero storage-hero">
- <div><div class="eyebrow">Volume Manager</div><h1>Montages des AppBox</h1><p>Définissez les chemins disponibles sur les nodes et regroupez-les pour les appliquer aux AppBox.</p></div>
+ <div><div class="eyebrow">Volume Manager</div><h1>Montages des AppBox</h1><p>Définissez des chemins logiques globaux ; leur disponibilité runtime est observée séparément sur chaque node.</p></div>
  <button type="button" data-open-dialog="mount-create">Ajouter un montage</button>
 </section>
 <div class="workflow-guide storage-workflow">
@@ -16,8 +16,8 @@
  <button data-target="groups">Groupes <span>{{groups|length}}</span></button>
 </div>
 <section class="resource-panel active" data-panel="mounts">
- <div class="panel-toolbar"><div><h2>Volume Mounts</h2><p>Chemins injectés dans les conteneurs AppBox.</p></div><button type="button" data-open-dialog="mount-create">Ajouter un montage</button></div>
- <div class="resource-card-grid">{% for mount in mounts %}<article class="card resource-definition"><div class="card-top"><div><div class="eyebrow">{{mount.mount_id}}</div><h3>{{mount.name}}</h3></div><span class="pill {{'ok' if mount.available else 'bad'}}">{{'DISPONIBLE' if mount.available else 'ABSENT'}}</span></div><div class="path-pair"><code>{{mount.host_path}}</code><span>→</span><code>{{mount.container_path}}</code></div><div class="service-list">{% for t in mount.media_types %}<span class="service-chip">{{t|upper}}</span>{% endfor %}<span class="service-chip">{{'RO' if mount.read_only else 'RW'}}</span><span class="service-chip">{{mount.propagation}}</span></div></article>{% else %}<div class="card empty">Aucun montage configuré.</div>{% endfor %}</div>
+ <div class="panel-toolbar"><div><h2>Volume Mounts</h2><p>Définitions globales et observations fraîches des nodes. Seuls les chemins confirmés sont injectés.</p></div><button type="button" data-open-dialog="mount-create">Ajouter un montage</button></div>
+ <div class="resource-card-grid">{% for mount in mounts %}<article class="card resource-definition"><div class="card-top"><div><div class="eyebrow">{{mount.mount_id}}</div><h3>{{mount.name}}</h3></div><span class="pill info">TOPOLOGIE</span></div><div class="path-pair"><code>{{mount.host_path}}</code><span>→</span><code>{{mount.container_path}}</code></div><div class="service-list">{% for t in mount.media_types %}<span class="service-chip">{{t|upper}}</span>{% endfor %}<span class="service-chip">{{'RO' if mount.read_only else 'RW'}}</span><span class="service-chip">{{mount.propagation}}</span><span class="service-chip">{{'POINT DE MONTAGE' if mount.requires_mountpoint else 'RÉPERTOIRE'}}</span></div><div class="mount-stack storage-node-matrix">{% for state in mount.node_states %}<div title="{{state.reason}}"><span>{{state.node_name}}<small>{% if state.age_seconds is not none %} · {{state.age_seconds|int}} s{% endif %}</small></span><span class="pill {{'ok' if state.state=='available' else 'bad' if state.state=='absent' else 'warn'}}">{{state.state|upper}}</span></div>{% else %}<div>Aucun node enregistré</div>{% endfor %}</div></article>{% else %}<div class="card empty">Aucun montage configuré.</div>{% endfor %}</div>
 </section>
 <section class="resource-panel" data-panel="groups">
  <div class="panel-toolbar"><div><h2>Groupes de montages</h2><p>Un groupe rassemble les mounts appliqués ensemble à une AppBox.</p></div><button type="button" data-open-dialog="group-create">Créer un groupe</button></div>
@@ -30,7 +30,7 @@
   <div class="grid two"><label>Chemin hôte<input name="host_path" required placeholder="/mnt/APOLLON"></label><label>Chemin conteneur<input name="container_path" required placeholder="/APOLLON"></label></div>
   <label>Propagation<select name="propagation"><option value="rprivate">rprivate</option><option value="rshared">rshared</option><option value="rslave">rslave</option></select></label>
   <label>Description<input name="description"></label>
-  <div class="compact-options"><label><input type="checkbox" name="media_types" value="plex" checked><span>Plex</span></label><label><input type="checkbox" name="media_types" value="jellyfin" checked><span>Jellyfin</span></label><label><input type="checkbox" name="read_only" value="true" checked><span>Lecture seule</span></label><label><input type="checkbox" name="required" value="true"><span>Obligatoire</span></label></div>
+  <div class="compact-options"><label><input type="checkbox" name="media_types" value="plex" checked><span>Plex</span></label><label><input type="checkbox" name="media_types" value="jellyfin" checked><span>Jellyfin</span></label><label><input type="checkbox" name="read_only" value="true" checked><span>Lecture seule</span></label><label><input type="checkbox" name="required" value="true"><span>Obligatoire</span></label><label><input type="checkbox" name="requires_mountpoint" value="true" checked><span>Doit être un vrai point de montage</span></label></div>
   <div class="modal-actions"><button>Ajouter</button><button type="button" class="secondary" data-close-dialog>Annuler</button></div>
  </form>
 </dialog>

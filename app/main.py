@@ -47,6 +47,7 @@ AGENT_ASSET_DIR = Path(os.getenv("APPBOX_AGENT_ASSET_DIR", "/app/agent"))
 METRICS_INTERVAL = max(5, int(os.getenv("APPBOX_METRICS_INTERVAL", "10")))
 JOB_TIMEOUT_SECONDS = max(60, int(os.getenv("APPBOX_JOB_TIMEOUT_SECONDS", "900")))
 AGENT_CLAIM_TIMEOUT_SECONDS = max(5, int(os.getenv("APPBOX_AGENT_CLAIM_TIMEOUT_SECONDS", "60")))
+STORAGE_OBSERVATION_SECONDS = max(30, int(os.getenv("APPBOX_STORAGE_OBSERVATION_SECONDS", "180")))
 APPBOX_DELIVERY_ACK_SECONDS = max(5, int(os.getenv("APPBOX_DELIVERY_ACK_SECONDS", "15")))
 JOB_WATCHDOG_INTERVAL = max(15, int(os.getenv("APPBOX_JOB_WATCHDOG_INTERVAL", "30")))
 REFERENCE_COMMAND_LEASE_SECONDS = max(30, int(os.getenv("APPBOX_REFERENCE_COMMAND_LEASE_SECONDS", "180")))
@@ -666,6 +667,7 @@ def init_database() -> None:
             read_only INTEGER NOT NULL DEFAULT 1,
             propagation TEXT NOT NULL DEFAULT 'rprivate',
             required INTEGER NOT NULL DEFAULT 0,
+            requires_mountpoint INTEGER NOT NULL DEFAULT 0,
             media_types_json TEXT NOT NULL DEFAULT '["plex","jellyfin"]',
             enabled INTEGER NOT NULL DEFAULT 1,
             description TEXT,
@@ -676,6 +678,26 @@ def init_database() -> None:
 
         CREATE UNIQUE INDEX IF NOT EXISTS ux_storage_mount_path
             ON storage_mounts(node_id, host_path, container_path);
+
+        CREATE TABLE IF NOT EXISTS node_storage_paths (
+            node_id TEXT NOT NULL,
+            host_path TEXT NOT NULL,
+            path_exists INTEGER,
+            mounted INTEGER,
+            filesystem TEXT,
+            source TEXT,
+            mount_type TEXT,
+            total_bytes INTEGER,
+            free_bytes INTEGER,
+            used_bytes INTEGER,
+            collected_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            PRIMARY KEY(node_id,host_path),
+            FOREIGN KEY(node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS ix_node_storage_paths_received
+            ON node_storage_paths(node_id, received_at);
 
         CREATE TABLE IF NOT EXISTS mount_groups (
             group_id TEXT PRIMARY KEY,
@@ -1193,6 +1215,13 @@ def init_database() -> None:
         if "worker_last_poll_at" not in agent_columns:
             con.execute("ALTER TABLE node_agents ADD COLUMN worker_last_poll_at TEXT")
 
+        storage_columns = {row["name"] for row in con.execute("PRAGMA table_info(storage_mounts)").fetchall()}
+        if "requires_mountpoint" not in storage_columns:
+            # Preserve the historical contract: legacy mounts required an
+            # existing path, not necessarily a direct mountpoint. Operators
+            # can opt into the stricter policy for new definitions.
+            con.execute("ALTER TABLE storage_mounts ADD COLUMN requires_mountpoint INTEGER NOT NULL DEFAULT 0")
+
         build_columns = {row["name"] for row in con.execute("PRAGMA table_info(reference_builds)").fetchall()}
         for column, definition in {
             "cancel_requested_at": "TEXT",
@@ -1396,19 +1425,19 @@ def init_database() -> None:
         ))
 
         default_mounts = [
-            ("rdad-media", "RDAD Media", "/mnt/decypharr-poc", "/data", 1, "rshared", 1,
+            ("rdad-media", "RDAD Media", "/mnt/decypharr-poc", "/data", 1, "rshared", 1, 0,
              '["plex","jellyfin"]', "Catalogue RDAD partagé"),
-            ("nas-athena", "NAS ATHENA", "/mnt/ATHENA", "/ATHENA", 1, "rprivate", 0,
+            ("nas-athena", "NAS ATHENA", "/mnt/ATHENA", "/ATHENA", 1, "rprivate", 0, 1,
              '["plex","jellyfin"]', "Bibliothèques locales ATHENA"),
-            ("nas-nemesis", "NAS NEMESIS", "/mnt/NEMESIS", "/NEMESIS", 1, "rprivate", 0,
+            ("nas-nemesis", "NAS NEMESIS", "/mnt/NEMESIS", "/NEMESIS", 1, "rprivate", 0, 1,
              '["plex","jellyfin"]', "Bibliothèques locales NEMESIS"),
         ]
         con.executemany("""
             INSERT OR IGNORE INTO storage_mounts(
                 mount_id,name,node_id,host_path,container_path,read_only,
-                propagation,required,media_types_json,enabled,description,
+                propagation,required,requires_mountpoint,media_types_json,enabled,description,
                 created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?,?)
         """, [
             (
                 mount_id,
@@ -1419,6 +1448,7 @@ def init_database() -> None:
                 read_only,
                 propagation,
                 required,
+                requires_mountpoint,
                 media_types_json,
                 description,
                 stamp,
@@ -1432,6 +1462,7 @@ def init_database() -> None:
                 read_only,
                 propagation,
                 required,
+                requires_mountpoint,
                 media_types_json,
                 description,
             ) in default_mounts
@@ -1656,8 +1687,6 @@ def provisioning_block_reason(node: dict[str, Any], *, automatic: bool = False) 
     if automatic:
         if node.get('metrics_stale'):
             return 'metrics stale : capacité non fiable pour le placement automatique.'
-        if not node.get('rdad_ok'):
-            return 'RDAD indisponible pour le placement automatique.'
     return None
 
 
@@ -1901,6 +1930,7 @@ def evaluate_placement(
     requested_node_id: str | None,
     *,
     allow_bare_metal_override: bool = False,
+    mounts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     config = placement_config()
     nodes = list_control_nodes()
@@ -1923,12 +1953,16 @@ def evaluate_placement(
                 409,
                 "Ce node ne possède pas encore d’agent actif. Le déploiement distant sera disponible avec l’agent.",
             )
+        storage = resolve_mounts_for_node(mounts or [], node["node_id"])
+        if storage["blockers"]:
+            raise HTTPException(409, " ; ".join(storage["blockers"]))
         reason = f"Sélection manuelle du node {node['name']}."
         return {
             "selected": node,
             "eligible": [node],
             "rejected": rejected,
             "reason": reason,
+            "storage": storage,
         }
 
     required_tag = config["automatic_required_tag"]
@@ -1944,9 +1978,11 @@ def evaluate_placement(
         if not node["actionable"]:
             reject(node, "Agent indisponible")
             continue
-        if not node["rdad_ok"]:
-            reject(node, "RDAD indisponible")
+        storage = resolve_mounts_for_node(mounts or [], node["node_id"])
+        if storage["blockers"]:
+            reject(node, " ; ".join(storage["blockers"]))
             continue
+        node["storage_resolution"] = storage
         eligible.append(node)
 
     if not eligible:
@@ -1967,7 +2003,7 @@ def evaluate_placement(
     selected = eligible[0]
     reason = (
         f"Placement automatique parmi {len(eligible)} AppBox-Node(s) éligible(s) : "
-        f"{selected['name']} retenu (agent disponible, RDAD OK, "
+        f"{selected['name']} retenu (agent et stockage requis disponibles, "
         f"{selected['appbox_count']} AppBox active(s))."
     )
     return {
@@ -1975,6 +2011,7 @@ def evaluate_placement(
         "eligible": eligible,
         "rejected": rejected,
         "reason": reason,
+        "storage": selected.get("storage_resolution") or resolve_mounts_for_node(mounts or [], selected["node_id"]),
     }
 
 
@@ -2537,6 +2574,144 @@ def slugify_identifier(value: str) -> str:
     return value[:48]
 
 
+def _storage_mount(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["media_types"] = json.loads(item.pop("media_types_json") or "[]")
+    item["legacy_node_id"] = item.get("node_id")
+    return item
+
+
+def storage_requested_paths() -> list[str]:
+    """Return the logical Linux paths agents must observe, independent of node scope."""
+    with db() as con:
+        return [row[0] for row in con.execute(
+            "SELECT DISTINCT host_path FROM storage_mounts WHERE enabled=1 ORDER BY host_path"
+        ).fetchall()]
+
+
+def persist_storage_observations(
+    con: sqlite3.Connection,
+    node_id: str,
+    observations: list[Any],
+    collected_at: str,
+    received_at: str,
+) -> int:
+    configured_paths = {
+        row[0] for row in con.execute(
+            "SELECT DISTINCT host_path FROM storage_mounts WHERE enabled=1"
+        ).fetchall()
+    }
+    persisted = 0
+    for observed in observations:
+        if not isinstance(observed, dict):
+            continue
+        host_path = str(observed.get("path") or "")
+        if host_path not in configured_paths or not host_path.startswith("/") or ".." in Path(host_path).parts:
+            continue
+        path_exists = observed.get("exists")
+        mounted = observed.get("mounted")
+        if not isinstance(path_exists, bool) or not isinstance(mounted, bool):
+            continue
+
+        def bounded_text(key: str) -> str | None:
+            value = observed.get(key)
+            return str(value)[:255] if value is not None else None
+
+        def nonnegative_int(key: str) -> int | None:
+            value = observed.get(key)
+            return int(value) if isinstance(value, int) and value >= 0 else None
+
+        con.execute("""
+            INSERT INTO node_storage_paths(
+                node_id,host_path,path_exists,mounted,filesystem,source,mount_type,
+                total_bytes,free_bytes,used_bytes,collected_at,received_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(node_id,host_path) DO UPDATE SET
+                path_exists=excluded.path_exists,mounted=excluded.mounted,
+                filesystem=excluded.filesystem,source=excluded.source,
+                mount_type=excluded.mount_type,total_bytes=excluded.total_bytes,
+                free_bytes=excluded.free_bytes,used_bytes=excluded.used_bytes,
+                collected_at=excluded.collected_at,received_at=excluded.received_at
+        """, (
+            node_id,host_path,int(path_exists),int(mounted),bounded_text("filesystem"),
+            bounded_text("source"),bounded_text("mount_type"),nonnegative_int("total_bytes"),
+            nonnegative_int("free_bytes"),nonnegative_int("used_bytes"),
+            str(observed.get("collected_at") or collected_at)[:80],received_at,
+        ))
+        persisted += 1
+    return persisted
+
+
+def _storage_state(
+    mount: dict[str, Any],
+    node: dict[str, Any],
+    observation: sqlite3.Row | dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    base = {
+        "node_id": node["node_id"],
+        "node_name": node.get("name") or node["node_id"],
+        "state": "unknown",
+        "reason": "Aucune télémétrie stockage reçue.",
+        "age_seconds": None,
+        "collected_at": None,
+    }
+    capabilities = node.get("capabilities") or {}
+    if not node.get("is_local") and not capabilities.get("storage_observations"):
+        base["reason"] = "Agent sans capacité de télémétrie stockage."
+        return base
+    if observation is None:
+        return base
+    observed = dict(observation)
+    base.update({
+        "collected_at": observed.get("collected_at"),
+        "exists": None if observed.get("path_exists") is None else bool(observed.get("path_exists")),
+        "mounted": None if observed.get("mounted") is None else bool(observed.get("mounted")),
+        "filesystem": observed.get("filesystem"),
+        "source": observed.get("source"),
+        "mount_type": observed.get("mount_type"),
+        "total_bytes": observed.get("total_bytes"),
+        "free_bytes": observed.get("free_bytes"),
+        "used_bytes": observed.get("used_bytes"),
+    })
+    try:
+        received = datetime.fromisoformat(str(observed.get("received_at")))
+        if received.tzinfo is None:
+            received = received.replace(tzinfo=timezone.utc)
+        age = max(0.0, (now - received.astimezone(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        base["reason"] = "Horodatage de télémétrie stockage invalide."
+        return base
+    base["age_seconds"] = age
+    if age > STORAGE_OBSERVATION_SECONDS:
+        base.update(state="stale", reason=f"Observation expirée ({int(age)} s).")
+    elif base["exists"] is not True:
+        base.update(state="absent", reason="Chemin absent sur ce node.")
+    elif mount.get("requires_mountpoint", 0) and base["mounted"] is not True:
+        base.update(state="absent", reason="Chemin présent mais non monté comme point de montage.")
+    else:
+        base.update(state="available", reason="Chemin confirmé disponible sur ce node.")
+    return base
+
+
+def storage_topology(mounts: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    nodes = list_control_nodes()
+    with db() as con:
+        observations = {
+            (row["node_id"], row["host_path"]): row
+            for row in con.execute("SELECT * FROM node_storage_paths").fetchall()
+        }
+    current = datetime.now(timezone.utc)
+    return {
+        mount["mount_id"]: [
+            _storage_state(mount, node, observations.get((node["node_id"], mount["host_path"])), now=current)
+            for node in nodes
+        ]
+        for mount in mounts
+    }
+
+
 def list_storage_mounts(enabled_only: bool = False) -> list[dict[str, Any]]:
     query = "SELECT * FROM storage_mounts"
     params: tuple[Any, ...] = ()
@@ -2545,12 +2720,10 @@ def list_storage_mounts(enabled_only: bool = False) -> list[dict[str, Any]]:
     query += " ORDER BY required DESC,name"
     with db() as con:
         rows = con.execute(query, params).fetchall()
-    result = []
-    for row in rows:
-        item = dict(row)
-        item["media_types"] = json.loads(item.pop("media_types_json") or "[]")
-        item["available"] = Path(item["host_path"]).exists()
-        result.append(item)
+    result = [_storage_mount(row) for row in rows]
+    topology = storage_topology(result) if result else {}
+    for item in result:
+        item["node_states"] = topology.get(item["mount_id"], [])
     return result
 
 
@@ -2571,10 +2744,7 @@ def list_mount_groups() -> list[dict[str, Any]]:
             item = dict(group)
             item["mounts"] = []
             for row in mounts:
-                mount = dict(row)
-                mount["media_types"] = json.loads(mount.pop("media_types_json") or "[]")
-                mount["available"] = Path(mount["host_path"]).exists()
-                item["mounts"].append(mount)
+                item["mounts"].append(_storage_mount(row))
             result.append(item)
     return result
 
@@ -2592,16 +2762,58 @@ def mounts_for_group(group_id: str | None, media_type: str) -> list[dict[str, An
     ]
 
 
-def validate_mounts(mounts: list[dict[str, Any]]) -> list[str]:
-    errors = []
+def resolve_mounts_for_node(mounts: list[dict[str, Any]], node_id: str) -> dict[str, Any]:
+    """Resolve logical definitions against one node's fresh runtime observations."""
+    nodes = {node["node_id"]: node for node in list_control_nodes()}
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(400, "Node cible introuvable.")
+    with db() as con:
+        observations = {
+            row["host_path"]: row for row in con.execute(
+                "SELECT * FROM node_storage_paths WHERE node_id=?", (node_id,)
+            ).fetchall()
+        }
+    current = datetime.now(timezone.utc)
+    states = []
+    selected = []
+    blockers = []
+    omitted = []
     targets: set[str] = set()
     for mount in mounts:
         if mount["container_path"] in targets:
-            errors.append(f"Chemin conteneur dupliqué : {mount['container_path']}")
+            blockers.append(f"Chemin conteneur dupliqué : {mount['container_path']}")
         targets.add(mount["container_path"])
-        if mount["required"] and not Path(mount["host_path"]).exists():
-            errors.append(f"Montage obligatoire absent : {mount['name']} ({mount['host_path']})")
-    return errors
+        state = _storage_state(mount, node, observations.get(mount["host_path"]), now=current)
+        states.append({**state, "mount_id": mount["mount_id"], "name": mount["name"], "required": bool(mount["required"])})
+        if state["state"] == "available":
+            selected.append(mount)
+        elif mount["required"]:
+            blockers.append(
+                f"Montage obligatoire {state['state']} sur {node_id.upper()} : "
+                f"{mount['name']} ({mount['host_path']}) — {state['reason']}"
+            )
+        elif state["state"] in {"unknown", "stale"}:
+            blockers.append(
+                f"Montage optionnel {state['state']} sur {node_id.upper()} : "
+                f"{mount['name']} ({mount['host_path']}) — impossible de décider une omission sûre."
+            )
+        else:
+            omitted.append({"mount": mount, "state": state})
+    return {"mounts": selected, "blockers": blockers, "omitted": omitted, "states": states}
+
+
+def mounts_for_appbox(client_id: str) -> list[dict[str, Any]]:
+    """Return the immutable AppBox mount snapshot plus current validation policy."""
+    with db() as con:
+        rows = con.execute("""
+            SELECT am.*,sm.name,sm.required,sm.requires_mountpoint,sm.media_types_json,
+                   sm.enabled,sm.description,sm.node_id
+            FROM appbox_mounts am
+            JOIN storage_mounts sm ON sm.mount_id=am.mount_id
+            WHERE am.client_id=? ORDER BY am.container_path
+        """, (client_id,)).fetchall()
+    return [_storage_mount(row) for row in rows]
 
 
 def compose_mount_lines(mounts: list[dict[str, Any]]) -> str:
@@ -4222,6 +4434,23 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
 
     first_validation = "validate_appbox" if action in {"stop", "delete"} else "validate_node"
     update_step(job_id, first_validation, "success", f"Agent {node_id} en ligne et exécuteur disponible.", 100, executor=f"agent-{node_id}")
+    if action in {"deploy", "recreate"}:
+        storage = resolve_mounts_for_node(mounts_for_appbox(client_id), node_id)
+        # Optional mounts already present in this AppBox's immutable Compose
+        # cannot be silently removed at execution time. Block instead of
+        # letting Docker create an empty local bind after the mount vanished.
+        unavailable = list(storage["blockers"])
+        unavailable.extend(
+            f"Montage du Compose non confirmé sur {node_id.upper()} : "
+            f"{entry['mount']['name']} — {entry['state']['reason']}"
+            for entry in storage["omitted"]
+        )
+        if unavailable:
+            fail_workflow(job_id, "validate_storage", " ; ".join(unavailable))
+            return
+        update_step(job_id, "validate_storage", "success",
+                    f"{len(storage['mounts'])} montage(s) confirmé(s) par télémétrie fraîche sur {node_id}.",
+                    100, executor="control-plane")
     directories: list[str] = []
     if action in {"deploy", "recreate"}:
         if item.get("type") == "jellyfin":
@@ -4278,7 +4507,6 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
         update_control_plane_deployment(client_id,'deploying','command_queued',35,
                                         f'Commande {command_id[:8]} envoyée à {node_id}.')
     if action in {"deploy", "recreate"}:
-        update_step(job_id, "validate_storage", "success", "Validation déléguée à l’agent distant.", 100, executor=f"agent-{node_id}")
         compose_detail = (
             f"Manifeste {manifest['checksum'][:12]} vérifié et Compose/.env transférés à l’agent."
             if control_plane_compose and manifest else
@@ -4420,14 +4648,18 @@ def execute_job(job: dict[str, Any]) -> None:
         return ok, f"Docker opérationnel — version {version.strip() if ok else 'inconnue'}"
 
     def validate_storage() -> tuple[bool, str]:
-        checks = {
-            "RDAD": Path("/mnt/decypharr-poc/.mnt").exists(),
-            "GPU": Path("/dev/dri").exists(),
-            "Dossier AppBox": appbox_dir.exists(),
-        }
-        failed = [name for name, state in checks.items() if not state]
-        detail = " · ".join(f"{name}={'OK' if state else 'KO'}" for name, state in checks.items())
-        return not failed, detail
+        resolution = resolve_mounts_for_node(mounts_for_appbox(client_id), HOSTNAME)
+        unavailable = list(resolution["blockers"])
+        unavailable.extend(
+            f"Montage du Compose non confirmé : {entry['mount']['name']} — {entry['state']['reason']}"
+            for entry in resolution["omitted"]
+        )
+        if not appbox_dir.exists():
+            unavailable.append("Dossier AppBox absent.")
+        return not unavailable, (
+            " · ".join(unavailable) if unavailable
+            else f"{len(resolution['mounts'])} montage(s) confirmé(s) et dossier AppBox présent."
+        )
 
     def validate_compose() -> tuple[bool, str]:
         compose_path = appbox_dir / "compose.yml"
@@ -4816,6 +5048,7 @@ def collect_metrics_loop() -> None:
             total_containers, running_containers = docker_counts()
             rdad_ok = int(Path("/mnt/decypharr-poc/.mnt").exists())
             gpu_ok = int(Path("/dev/dri").exists())
+            local_storage = collect_local_storage_paths(storage_requested_paths())
             stamp = now_iso()
 
             with db_lock, db() as con:
@@ -4836,12 +5069,44 @@ def collect_metrics_loop() -> None:
                     UPDATE nodes SET status='online',rdad_ok=?,gpu_ok=?,
                         last_seen=?,updated_at=? WHERE node_id=?
                 """, (rdad_ok, gpu_ok, stamp, stamp, HOSTNAME))
+                persist_storage_observations(con, HOSTNAME, local_storage, stamp, stamp)
                 cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
                 con.execute("DELETE FROM node_metrics WHERE collected_at < ?", (cutoff,))
 
             previous_disk, previous_net, previous_time = disk_now, net_now, current_time
         except Exception as exc:
             record_event(None, "metrics_error", f"Erreur collecte métriques : {exc}", "error")
+
+
+def collect_local_storage_paths(paths: list[str]) -> list[dict[str, Any]]:
+    """Observe only this process' node; callers run it outside db_lock."""
+    partitions = {item.mountpoint: item for item in psutil.disk_partitions(all=True)}
+    collected_at = now_iso()
+    result = []
+    for host_path in paths:
+        item: dict[str, Any] = {
+            "path": host_path,
+            "exists": False,
+            "mounted": False,
+            "collected_at": collected_at,
+        }
+        try:
+            path = Path(host_path)
+            item["exists"] = path.exists()
+            item["mounted"] = os.path.ismount(host_path)
+            partition = partitions.get(host_path)
+            if partition:
+                item.update(filesystem=partition.fstype or None, source=partition.device or None,
+                            mount_type=partition.opts or None)
+            if item["exists"]:
+                usage = shutil.disk_usage(path)
+                item.update(total_bytes=usage.total, free_bytes=usage.free, used_bytes=usage.used)
+        except OSError:
+            # A failed stat is a negative/unknown-safe observation, never proof
+            # that a required mount may be injected into Compose.
+            pass
+        result.append(item)
+    return result
 
 
 def latest_node_metric() -> dict[str, Any]:
@@ -5435,6 +5700,9 @@ async def agent_heartbeat(node_id: str, request: Request):
         "status": "ok",
         "server_version": VERSION,
         "heartbeat_interval": min(60, AGENT_ONLINE_SECONDS // 3),
+        # This is configuration only: the heartbeat performs no filesystem I/O.
+        # The agent consumes it later from its independent telemetry loop.
+        "storage_paths": storage_requested_paths(),
         "cancel_active_command": cancel_requested,
         "active_command_state": ownership_state,
         "worker_activity_at": ownership_confirmed_at,
@@ -5449,9 +5717,17 @@ async def agent_inventory(node_id: str, request: Request):
     containers = payload.get("containers") or []
     if not isinstance(containers, list):
         raise HTTPException(400, "Inventaire de conteneurs invalide.")
+    storage_paths = payload.get("storage_paths")
+    if storage_paths is not None and not isinstance(storage_paths, list):
+        raise HTTPException(400, "Télémétrie stockage invalide.")
     stamp = now_iso()
     seen: set[str] = set()
     with db_lock, db() as con:
+        if storage_paths is not None:
+            persist_storage_observations(
+                con, node_id, storage_paths,
+                str(payload.get("collected_at") or stamp), stamp,
+            )
         for item in containers:
             container_id = str(item.get("container_id") or "").strip()
             name = str(item.get("name") or "").strip()
@@ -6590,6 +6866,7 @@ def create_storage_mount(
     media_types: list[str] = Form(...),
     read_only: bool = Form(False),
     required: bool = Form(False),
+    requires_mountpoint: bool = Form(False),
     propagation: str = Form("rprivate"),
     description: str = Form(""),
 ):
@@ -6606,12 +6883,12 @@ def create_storage_mount(
         con.execute("""
             INSERT INTO storage_mounts(
                 mount_id,name,node_id,host_path,container_path,read_only,
-                propagation,required,media_types_json,enabled,description,
+                propagation,required,requires_mountpoint,media_types_json,enabled,description,
                 created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?,?)
         """, (
             mount_id,name.strip(),HOSTNAME,host_path.strip(),container_path.strip(),
-            int(read_only),propagation,int(required),json.dumps(allowed),
+            int(read_only),propagation,int(required),int(requires_mountpoint),json.dumps(allowed),
             description.strip(),stamp,stamp,
         ))
     record_event(None, "storage_mount_created", f"Montage {name} ajouté.", "success")
@@ -6976,10 +7253,12 @@ def create_appbox(
         snapshot_id = reference["snapshot_id"]
         reference_image_id = reference["image_id"]
 
+    logical_mounts = mounts_for_group(mount_group_id, media_type)
     placement_result = evaluate_placement(
         placement_mode,
         target_node_id,
         allow_bare_metal_override=bare_metal_override,
+        mounts=logical_mounts,
     )
     selected_node = placement_result["selected"]
     selected_node_id = selected_node["node_id"]
@@ -6989,11 +7268,11 @@ def create_appbox(
             "Le node sélectionné n’est pas prêt : agent hors ligne ou exécuteur de déploiement indisponible.",
         )
 
-    mounts = mounts_for_group(mount_group_id, media_type)
-    if selected_node_id == HOSTNAME:
-        mount_errors = validate_mounts(mounts)
-        if mount_errors:
-            raise HTTPException(409, " ; ".join(mount_errors))
+    storage_resolution = placement_result["storage"]
+    mounts = storage_resolution["mounts"]
+    if storage_resolution["omitted"]:
+        omitted_names = ", ".join(item["mount"]["name"] for item in storage_resolution["omitted"])
+        placement_result["reason"] += f" Montages optionnels omis car non confirmés : {omitted_names}."
 
     appbox_dir = BASE_DIR / client_id
     workspace_created = False
@@ -7525,6 +7804,7 @@ def health():
         "jellyfin_appboxes": True,
         "resource_manager": True,
         "volume_mounts": True,
+        "distributed_storage_topology": True,
         "reference_snapshots": True,
         "manual_media_ports": True,
         "storage_profiles_ui": True,

@@ -1525,11 +1525,48 @@ def build_and_upload_plex_reference(config: dict, payload: dict, *, progress_cal
     return result
 
 
-def send_inventory(config):
+def collect_storage_paths(paths):
+    """Collect storage topology in telemetry, never from the heartbeat thread."""
+    mountinfo = {}
+    try:
+        for line in Path('/proc/self/mountinfo').read_text(encoding='utf-8').splitlines():
+            fields = line.split()
+            separator = fields.index('-')
+            mountpoint = fields[4].replace('\\040', ' ').replace('\\011', '\t')
+            mountinfo[os.path.normpath(mountpoint)] = {
+                'mount_type': fields[5],
+                'filesystem': fields[separator + 1],
+                'source': fields[separator + 2],
+            }
+    except (OSError, ValueError, IndexError):
+        mountinfo = {}
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    result = []
+    for raw_path in paths or []:
+        host_path = str(raw_path or '')
+        if not host_path.startswith('/') or '..' in Path(host_path).parts:
+            continue
+        normalized = os.path.normpath(host_path)
+        item = {'path': host_path, 'exists': False, 'mounted': False, 'collected_at': stamp}
+        try:
+            item['exists'] = Path(host_path).exists()
+            item['mounted'] = os.path.ismount(host_path)
+            item.update(mountinfo.get(normalized, {}))
+            if item['exists']:
+                usage = shutil.disk_usage(host_path)
+                item.update(total_bytes=usage.total, free_bytes=usage.free, used_bytes=usage.used)
+        except OSError:
+            pass
+        result.append(item)
+    return result
+
+
+def send_inventory(config, storage_paths=None):
     payload = {
         "agent_version": VERSION,
         "collected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "containers": collect_container_inventory(config),
+        "storage_paths": collect_storage_paths(storage_paths or []),
     }
     return api(config, "POST", f"/api/agent/v1/{config['node_id']}/inventory", payload)
 
@@ -1565,6 +1602,7 @@ def heartbeat(config, metrics=None, active_command_id=""):
             "compose": metrics.get("compose_version") is not None,
             "filesystem": True,
             "inventory": True,
+            "storage_observations": True,
             "reference_distribution": True,
             "reference_deployment": True,
             "reference_cache_delete": True,
@@ -2374,6 +2412,7 @@ class AgentLoops:
         self.inventory_request = Event()
         self.lock = Lock()
         self.metrics = {}
+        self.storage_paths = list(config.get('storage_paths') or [])
         self.active_command_id = ""
         self.cancel_event = Event()
         self.heartbeat_interval = min(60, max(1, float(config.get('heartbeat_interval', 60))))
@@ -2391,6 +2430,10 @@ class AgentLoops:
                     metrics = dict(self.metrics)
                     active_command_id = self.active_command_id
                 response = heartbeat(self.config, metrics, active_command_id)
+                requested_storage = response.get('storage_paths')
+                if isinstance(requested_storage, list):
+                    with self.lock:
+                        self.storage_paths = [str(path) for path in requested_storage]
                 if active_command_id and response.get('cancel_active_command'):
                     self.cancel_event.set()
                 recommended = response.get('heartbeat_interval')
@@ -2414,7 +2457,9 @@ class AgentLoops:
             except Exception as exc:
                 self.report_error('metrics', exc)
             try:
-                send_inventory(self.config)
+                with self.lock:
+                    storage_paths = list(self.storage_paths)
+                send_inventory(self.config, storage_paths)
             except Exception as exc:
                 self.report_error('inventory', exc)
             self.inventory_request.wait(self.inventory_interval)
