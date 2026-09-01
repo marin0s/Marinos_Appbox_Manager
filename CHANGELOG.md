@@ -16,6 +16,8 @@
 - La réconciliation marque les lignes deleted avec un état cohérent, signale dossiers/conteneurs encore présents sans les détruire et n’invente plus de port drift pour un conteneur arrêté.
 
 ### Fiabilité et progression des Reference Builds
+- Fix Reference Builder worker lease expiration during long captures: les agents compatibles utilisent désormais `queued → offered → ACK → claimed`; lease et `worker_activity_at` ne commencent qu’après ACK et sont renouvelés par le heartbeat indépendant, même si la progression reste fixe pendant plusieurs heures. Les agents legacy restent acceptés sans lease artificiellement non renouvelable.
+- Une expiration réelle persiste la demande d’annulation, maintient le build terminal, refuse upload/résultat tardifs et laisse l’agent interrompre l’I/O puis nettoyer son staging. L’ACK et le résultat terminal sont idempotents ; aucune version supplémentaire n’est publiée lors d’un retry HTTP.
 - Un seul workflow global couvre désormais découverte, preflight, capture, validation et publication ; les commandes agent restent des sous-jobs techniques et ne peuvent plus afficher un faux succès à 100 %.
 - Progression de capture remontée périodiquement depuis les octets réellement écrits, persistée de façon monotone et limitée en fréquence. États, libellés et durées de l’inspecteur reflètent les données réellement disponibles.
 - Preflight du filesystem temporaire bloquant avec besoin `payload estimé + max(5 GiB, 10 %)`, marge configurable et second contrôle juste avant la capture.

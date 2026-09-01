@@ -1580,6 +1580,8 @@ def heartbeat(config, metrics=None, active_command_id=""):
             "appbox_command_lease": True,
             "appbox_progress": True,
             "appbox_delivery_ack": True,
+            "reference_build_command_lease": True,
+            "reference_build_delivery_ack": True,
             "remote_upgrade": RUNTIME_IDENTITY["managed"],
         },
     }

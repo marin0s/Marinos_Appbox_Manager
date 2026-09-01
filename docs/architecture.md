@@ -54,12 +54,24 @@ monotone, puis les jalons validation/publication terminent à 100 %. Pour une no
 version, `reference_builds.image_id` désigne explicitement
 la référence cible. La publication conserve cet `image_id`, insère une nouvelle version
 et bascule `current_version_id`; l’ancienne version devient historique dans l’UX.
-Une lease sur la commande longue est renouvelée par le heartbeat indépendant. Son
-expiration échoue le build sans double exécution ni résultat tardif accepté. L’annulation
-coopérative emprunte le même heartbeat et rend build/job/commande `cancelled` après
-nettoyage agent. Le preflight disque est rejoué avant capture avec réserve configurable.
-La migration ajoute uniquement des colonnes nullable/default aux tables existantes. Voir
-[le cycle de vie UX](reference-lifecycle.md).
+Les agents annonçant `reference_build_delivery_ack` et
+`reference_build_command_lease` réutilisent le protocole commun
+`queued → offered → ACK → claimed`. Le GET n’est pas une preuve d’ownership : lease et
+`worker_activity_at` restent vides jusqu’à l’ACK. Ensuite, le heartbeat indépendant
+portant l’identifiant exact renouvelle la lease de 180 secondes, sans dépendre de la
+progression. Il rafraîchit aussi l’activité opérationnelle du build/job pour le watchdog
+global, sans modifier stage ni pourcentage. Aucune deadline globale ne limite une capture vivante de plusieurs heures.
+Un agent legacy reste compatible mais ne reçoit pas une lease qu’il ne sait pas
+renouveler ; sa mise à jour est requise pour la détection d’un worker disparu.
+
+Une expiration réellement constatée marque commande/build/job en échec et persiste
+`cancel_requested_at`. Si le worker revient ou si son heartbeat reprend, il reçoit la
+cancellation, arrête l’écriture ou l’upload au prochain point coopératif et nettoie son
+staging. Upload et résultat tardifs restent refusés ; un retry d’un résultat déjà terminal
+ne republie rien. Progress décrit l’avancement métier, `worker_activity_at` la dernière
+preuve de vie, et le résultat terminal seul autorise publication. Le preflight disque est
+rejoué avant capture avec réserve configurable. La migration utilise les colonnes
+delivery/lease additives déjà présentes. Voir [le cycle de vie UX](reference-lifecycle.md).
 
 La résolution d'une archive publiée ne relit pas ses dizaines de Go : le checksum
 persisté au moment de la publication est l'identité immuable. Les seules transactions

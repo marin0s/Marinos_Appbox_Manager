@@ -3987,7 +3987,7 @@ def release_expired_delivery_offers(con, node_id: str, now: datetime | None = No
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     return con.execute("""UPDATE agent_commands SET status='queued',delivery_token_hash=NULL,
         delivery_offered_at=NULL,delivery_ack_deadline=NULL
-        WHERE node_id=? AND command_type='appbox_action' AND status='offered'
+        WHERE node_id=? AND command_type IN ('appbox_action','reference_build') AND status='offered'
           AND delivery_ack_deadline IS NOT NULL AND delivery_ack_deadline<=?""", (node_id, stamp)).rowcount
 
 
@@ -4740,10 +4740,13 @@ def expire_reference_command_leases(now: datetime | None = None) -> int:
     with db_lock, db() as con:
         rows = con.execute("""SELECT * FROM agent_commands
             WHERE command_type='reference_build' AND status='claimed'
+              AND delivery_acknowledged_at IS NOT NULL
               AND lease_expires_at IS NOT NULL AND lease_expires_at<=?""",(cutoff,)).fetchall()
         for row in rows:
-            changed = con.execute("UPDATE agent_commands SET status='failed',completed_at=?,error_text=? WHERE command_id=? AND status='claimed'",
-                                  (cutoff,'Lease de capture expirée : worker ou agent indisponible.',row['command_id'])).rowcount
+            changed = con.execute("""UPDATE agent_commands SET status='failed',completed_at=?,error_text=?,
+                cancel_requested_at=COALESCE(cancel_requested_at,?)
+                WHERE command_id=? AND status='claimed'""",
+                (cutoff,'Lease de capture expirée : worker ou agent indisponible.',cutoff,row['command_id'])).rowcount
             if changed: expired.append(row)
     for row in expired:
         finalize_reference_build_command(row,'failed',{},'Lease de capture expirée : worker ou agent indisponible.')
@@ -5407,11 +5410,24 @@ async def agent_heartbeat(node_id: str, request: Request):
                             if job_id:
                                 # Keep the workflow watchdog informed without inventing UX progress.
                                 con.execute("UPDATE jobs SET updated_at=? WHERE job_id=? AND status='running'", (stamp, job_id))
+                        elif command['command_type']=='reference_build':
+                            try:
+                                build_id=str(json.loads(command['payload_json'] or '{}').get('build_id') or '')
+                            except Exception:
+                                build_id=''
+                            if build_id:
+                                build=con.execute("SELECT job_id FROM reference_builds WHERE build_id=?",(build_id,)).fetchone()
+                                con.execute("""UPDATE reference_builds SET updated_at=? WHERE build_id=?
+                                    AND status IN ('building','cancelling')""",(stamp,build_id))
+                                if build and build['job_id']:
+                                    # Operational activity only: progress and stage remain untouched.
+                                    con.execute("UPDATE jobs SET updated_at=? WHERE job_id=? AND status='running'",
+                                                (stamp,build['job_id']))
             elif command and command['command_type'] in {'reference_build', 'appbox_action'} and command['status'] in COMMAND_TERMINAL_STATUSES:
                 # The runtime still believes it owns a command already terminal on CP.
                 cancel_requested = True
                 ownership_state = 'terminal'
-            elif command and command['command_type']=='appbox_action' and command['status']=='offered':
+            elif command and command['command_type'] in {'appbox_action','reference_build'} and command['status']=='offered':
                 # runtime.begin_command precedes the ACK so a lost ACK response can
                 # be retried safely; an offer alone never renews a lease.
                 ownership_state = 'offered_awaiting_ack'
@@ -5524,10 +5540,15 @@ def agent_poll_commands(node_id: str, request: Request):
             if not node or node['status'] != 'online' or not node['agent_online']:
                 return JSONResponse({'command': None, 'reason': 'node_unavailable'})
         claimed_at = now_iso()
-        lease_seconds = (REFERENCE_COMMAND_LEASE_SECONDS if row['command_type']=='reference_build' else
+        lease_seconds = (REFERENCE_COMMAND_LEASE_SECONDS
+                         if row['command_type']=='reference_build' and node and
+                            node.get('capabilities',{}).get('reference_build_command_lease') else
                          APPBOX_COMMAND_LEASE_SECONDS if row['command_type']=='appbox_action' and node and node.get('capabilities',{}).get('appbox_command_lease') else None)
-        delivery_ack = bool(row['command_type']=='appbox_action' and node and
-                            node.get('capabilities',{}).get('appbox_delivery_ack'))
+        delivery_ack = bool(node and (
+            (row['command_type']=='appbox_action' and node.get('capabilities',{}).get('appbox_delivery_ack')) or
+            (row['command_type']=='reference_build' and
+             node.get('capabilities',{}).get('reference_build_delivery_ack') and
+             node.get('capabilities',{}).get('reference_build_command_lease'))))
         if delivery_ack:
             token = secrets.token_urlsafe(32)
             offered_at = datetime.now(timezone.utc)
@@ -5572,7 +5593,8 @@ async def agent_ack_command_delivery(node_id: str, command_id: str, request: Req
         raise HTTPException(400,'Token de livraison invalide.')
     token_hash=hashlib.sha256(token.encode('utf-8')).hexdigest(); stamp=now_iso()
     with db_lock,db() as con:
-        command=con.execute("SELECT * FROM agent_commands WHERE command_id=? AND node_id=? AND command_type='appbox_action'",
+        command=con.execute("""SELECT * FROM agent_commands WHERE command_id=? AND node_id=?
+            AND command_type IN ('appbox_action','reference_build')""",
                             (command_id,node_id)).fetchone()
         if not command:
             raise HTTPException(404,'Commande introuvable.')
@@ -5591,17 +5613,22 @@ async def agent_ack_command_delivery(node_id: str, command_id: str, request: Req
         current=datetime.now(timezone.utc)
         if current >= ack_deadline:
             raise HTTPException(409,'Offre de commande expirée.')
-        deadline=current+timedelta(seconds=APPBOX_COMMAND_MAX_RUNTIME_SECONDS)
-        lease=min(current+timedelta(seconds=APPBOX_COMMAND_LEASE_SECONDS),deadline)
+        if command['command_type']=='reference_build':
+            deadline=None
+            lease=current+timedelta(seconds=REFERENCE_COMMAND_LEASE_SECONDS)
+        else:
+            deadline=current+timedelta(seconds=APPBOX_COMMAND_MAX_RUNTIME_SECONDS)
+            lease=min(current+timedelta(seconds=APPBOX_COMMAND_LEASE_SECONDS),deadline)
         changed=con.execute("""UPDATE agent_commands SET status='claimed',claimed_at=?,
             delivery_acknowledged_at=?,lease_expires_at=?,worker_activity_at=?,command_deadline_at=?
             WHERE command_id=? AND node_id=? AND status='offered' AND delivery_token_hash=?""",
-            (stamp,stamp,lease.isoformat(),stamp,deadline.isoformat(),command_id,node_id,token_hash)).rowcount
+            (stamp,stamp,lease.isoformat(),stamp,deadline.isoformat() if deadline else None,command_id,node_id,token_hash)).rowcount
         if not changed:
             raise HTTPException(409,'ACK de livraison concurrent refusé.')
     print(f"[command-delivery] event=acknowledged node={node_id} command={command_id[:12]} worker_activity_at={stamp}",flush=True)
     return JSONResponse({'status':'claimed','idempotent':False,
-                         'lease_expires_at':lease.isoformat(),'command_deadline_at':deadline.isoformat()})
+                         'lease_expires_at':lease.isoformat(),
+                         'command_deadline_at':deadline.isoformat() if deadline else None})
 
 
 @app.post("/api/agent/v1/{node_id}/commands/{command_id}/progress")
@@ -6098,12 +6125,12 @@ def cancel_reference_build(build_id: str):
                 return RedirectResponse(f"/reference-builds/{build_id}",status_code=303)
             raise HTTPException(409,"Ce build est déjà terminé.")
         command = con.execute("""SELECT * FROM agent_commands WHERE command_type='reference_build'
-            AND json_extract(payload_json,'$.build_id')=? AND status IN ('queued','claimed')
+            AND json_extract(payload_json,'$.build_id')=? AND status IN ('queued','offered','claimed')
             ORDER BY created_at DESC LIMIT 1""",(build_id,)).fetchone()
         con.execute("UPDATE reference_builds SET status='cancelling',current_stage='cancelling',cancel_requested_at=?,updated_at=? WHERE build_id=?",
                     (stamp,stamp,build_id))
         if command:
-            if command['status'] == 'queued':
+            if command['status'] in {'queued','offered'}:
                 con.execute("UPDATE agent_commands SET status='cancelled',cancel_requested_at=?,completed_at=? WHERE command_id=?",
                             (stamp,stamp,command['command_id']))
                 immediate = command
@@ -6141,7 +6168,10 @@ def api_reference_build_detail(build_id: str):
     with db() as con:
         row=con.execute("SELECT * FROM reference_builds WHERE build_id=?",(build_id,)).fetchone()
         logs=[dict(item) for item in con.execute("SELECT * FROM reference_build_logs WHERE build_id=? ORDER BY log_id",(build_id,)).fetchall()]
-        commands=[dict(item) for item in con.execute("SELECT command_id,command_type,status,created_at,claimed_at,completed_at,progress_json FROM agent_commands WHERE json_extract(payload_json,'$.build_id')=? ORDER BY created_at",(build_id,)).fetchall()]
+        commands=[dict(item) for item in con.execute("""SELECT command_id,command_type,status,created_at,
+            delivery_offered_at,delivery_acknowledged_at,claimed_at,worker_activity_at,
+            lease_expires_at,command_deadline_at,cancel_requested_at,completed_at,progress_json
+            FROM agent_commands WHERE json_extract(payload_json,'$.build_id')=? ORDER BY created_at""",(build_id,)).fetchall()]
     if not row: raise HTTPException(404,"Build de référence introuvable.")
     return JSONResponse({"build":dict(row),"logs":logs,"commands":commands})
 
@@ -6248,7 +6278,10 @@ def reference_build_page(request: Request, build_id: str):
             "SELECT * FROM reference_build_logs WHERE build_id=? ORDER BY log_id", (build_id,)
         ).fetchall()]
         job_row=con.execute("SELECT * FROM jobs WHERE job_id=?",(build.get('job_id'),)).fetchone() if build.get('job_id') else None
-        commands=[dict(row) for row in con.execute("SELECT command_id,command_type,status,created_at,claimed_at,completed_at,progress_json FROM agent_commands WHERE json_extract(payload_json,'$.build_id')=? ORDER BY created_at",(build_id,)).fetchall()]
+        commands=[dict(row) for row in con.execute("""SELECT command_id,command_type,status,created_at,
+            delivery_offered_at,delivery_acknowledged_at,claimed_at,worker_activity_at,
+            lease_expires_at,command_deadline_at,cancel_requested_at,completed_at,progress_json
+            FROM agent_commands WHERE json_extract(payload_json,'$.build_id')=? ORDER BY created_at""",(build_id,)).fetchall()]
     return templates.TemplateResponse(request, "reference_build_detail.html", {
         "mode": APPBOX_MODE,
         "hostname": HOSTNAME,

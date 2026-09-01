@@ -16,6 +16,24 @@ Le protocole de validation terrain et le rollback sont décrits dans [le runbook
 
 ## Transfert et restauration alpha.5
 
+### Ownership et captures longues
+
+Une capture compatible est d’abord offerte, puis ACKée par le worker avant toute I/O
+métier. Le Control Plane ne crée ni activité worker ni lease au simple GET. Après ACK,
+le heartbeat léger continue dans un thread indépendant pendant copie, assainissement,
+tar.gz, checksum et upload. Il renouvelle `worker_activity_at` et `lease_expires_at` même
+si le pourcentage fonctionnel reste inchangé, et maintient le watchdog du workflow sans
+inventer de progression. La durée totale n’est pas bornée tant que
+ces preuves de vie restent valides.
+
+Une lease expirée signifie que le worker confirmé a cessé de répondre : le build devient
+terminalement failed et une cancellation est mémorisée. Un worker qui revient reçoit
+ce signal, interrompt l’I/O et nettoie le répertoire `appbox-reference-build-*`. L’upload
+et le résultat arrivant après cette terminalisation sont refusés sans ressusciter ni
+publier le build. Un agent antérieur ne déclarant pas les capabilities correspondantes
+reste utilisable sans lease ; il doit être mis à jour avant de revendiquer la détection
+de panne worker.
+
 L’agent et le Control Plane utilisent `agent/reference_contract.py` pour valider le contrat. L’upload est lu par blocs, écrit dans un fichier unique, synchronisé puis contrôlé (SHA-256, gzip jusqu’à EOF, tar et contrat Plex) avant rename atomique. Un verrou par build refuse les uploads concurrents. Après crash, ne retirer un verrou résiduel qu’après confirmation de l’absence d’upload actif. Un build ayant déjà reçu une archive différente doit être recréé, pas écrasé.
 
 La publication conserve le manifeste de l’agent (SQLite, tailles, cycle de vie) et le complète avec les vérifications du Control Plane. La version builder vient du résultat, pas d’une constante alpha.3. Les livraisons répétées d’un résultat publié sont idempotentes.

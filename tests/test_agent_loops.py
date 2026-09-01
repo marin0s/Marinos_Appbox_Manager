@@ -23,6 +23,8 @@ class AgentLoopTests(unittest.TestCase):
         self.assertTrue(payload['capabilities']['independent_heartbeat'])
         self.assertTrue(payload['capabilities']['appbox_command_lease'])
         self.assertTrue(payload['capabilities']['appbox_progress'])
+        self.assertTrue(payload['capabilities']['reference_build_command_lease'])
+        self.assertTrue(payload['capabilities']['reference_build_delivery_ack'])
 
     def test_appbox_worker_reports_real_phase_activity_before_result(self):
         calls=[]

@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from reference_fixtures import reference_archive
 from test_agent_deployment import agent
 
 
@@ -27,8 +30,10 @@ def reliable_build(tmp_path, monkeypatch):
         con.execute("UPDATE reference_builds SET job_id=?,status='building',current_stage='capture',progress=25 WHERE build_id=?",(job_id,build_id))
         con.execute("UPDATE job_steps SET status='running',started_at=? WHERE job_id=? AND step_key='capture'",(stamp,job_id))
         payload=json.dumps({'build_id':build_id})
-        con.execute("INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,created_at,claimed_at,lease_expires_at) VALUES('capture','ouranos','reference_build',?,'claimed',?,?,?)",
-                    (payload,stamp,stamp,(datetime.now(timezone.utc)+timedelta(seconds=180)).isoformat()))
+        con.execute("""INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,
+            created_at,claimed_at,delivery_acknowledged_at,worker_activity_at,lease_expires_at)
+            VALUES('capture','ouranos','reference_build',?,'claimed',?,?,?,?,?)""",
+            (payload,stamp,stamp,stamp,stamp,(datetime.now(timezone.utc)+timedelta(seconds=180)).isoformat()))
     yield SimpleNamespace(build_id=build_id,job_id=job_id,tmp=tmp_path)
     main.DB_FILE, main.REFERENCE_ROOT = old_db, old_root
 
@@ -36,6 +41,50 @@ def reliable_build(tmp_path, monkeypatch):
 class JsonRequest:
     def __init__(self,payload): self.payload=payload
     async def json(self): return self.payload
+
+
+def enable_reference_delivery(command_id='capture'):
+    capabilities={
+        'reference_builder_foundation':True,
+        'reference_build_command_lease':True,
+        'reference_build_delivery_ack':True,
+        'independent_heartbeat':True,
+    }
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("""INSERT INTO node_agents(node_id,status,last_heartbeat,capabilities_json,updated_at)
+            VALUES('ouranos','online',?,?,?) ON CONFLICT(node_id) DO UPDATE SET
+            status='online',last_heartbeat=excluded.last_heartbeat,
+            capabilities_json=excluded.capabilities_json,updated_at=excluded.updated_at""",
+            (stamp,json.dumps(capabilities),stamp))
+        con.execute("""UPDATE agent_commands SET status='queued',claimed_at=NULL,completed_at=NULL,
+            lease_expires_at=NULL,worker_activity_at=NULL,command_deadline_at=NULL,
+            delivery_token_hash=NULL,delivery_offered_at=NULL,delivery_ack_deadline=NULL,
+            delivery_acknowledged_at=NULL,delivery_attempts=0,error_text=NULL
+            WHERE command_id=?""",(command_id,))
+    return capabilities
+
+
+def offer_and_ack_reference(capabilities, command_id='capture'):
+    with patch.object(main,'authenticate_agent'):
+        first=json.loads(main.agent_poll_commands('ouranos',JsonRequest({})).body)['command']
+    assert first['status']=='offered' and first['delivery_token']
+    with main.db() as con:
+        offered=con.execute("SELECT claimed_at,worker_activity_at,lease_expires_at FROM agent_commands WHERE command_id=?",(command_id,)).fetchone()
+        assert tuple(offered)==(None,None,None)
+        con.execute("UPDATE agent_commands SET delivery_ack_deadline='2000-01-01T00:00:00+00:00' WHERE command_id=?",(command_id,))
+    with patch.object(main,'authenticate_agent'):
+        second=json.loads(main.agent_poll_commands('ouranos',JsonRequest({})).body)['command']
+        with pytest.raises(main.HTTPException) as old:
+            asyncio.run(main.agent_ack_command_delivery('ouranos',command_id,JsonRequest({'delivery_token':first['delivery_token']})))
+        claimed=json.loads(asyncio.run(main.agent_ack_command_delivery(
+            'ouranos',command_id,JsonRequest({'delivery_token':second['delivery_token']}))).body)
+        repeated=json.loads(asyncio.run(main.agent_ack_command_delivery(
+            'ouranos',command_id,JsonRequest({'delivery_token':second['delivery_token']}))).body)
+    assert old.value.status_code==409 and first['delivery_token']!=second['delivery_token']
+    assert claimed['status']=='claimed' and not claimed['idempotent']
+    assert repeated['status']=='claimed' and repeated['idempotent']
+    return second
 
 
 def test_capture_progress_is_real_and_globally_monotone(reliable_build):
@@ -63,6 +112,104 @@ def test_heartbeat_renews_lease_and_returns_cancellation(reliable_build):
     assert json.loads(response.body)['cancel_active_command'] is True
 
 
+def test_reference_capture_can_run_for_virtual_hours_with_fixed_progress(reliable_build):
+    capabilities=enable_reference_delivery()
+    base=datetime.now(timezone.utc); clock=[base]
+    class Clock(datetime):
+        @classmethod
+        def now(cls,tz=None): return clock[0]
+    with patch.object(main,'datetime',Clock):
+        offer_and_ack_reference(capabilities)
+        with main.db() as con:
+            acknowledged=con.execute("SELECT worker_activity_at,lease_expires_at,command_deadline_at FROM agent_commands WHERE command_id='capture'").fetchone()
+        assert acknowledged['worker_activity_at'] and acknowledged['lease_expires_at']
+        assert acknowledged['command_deadline_at'] is None
+        first_activity=acknowledged['worker_activity_at']
+        for _ in range(181):
+            clock[0]+=timedelta(seconds=60)
+            with patch.object(main,'authenticate_agent'):
+                heartbeat=json.loads(asyncio.run(main.agent_heartbeat('ouranos',JsonRequest({
+                    'agent_version':'test','active_command_id':'capture','capabilities':capabilities}))).body)
+            assert heartbeat['active_command_state']=='lease_renewed'
+            assert main.expire_reference_command_leases(now=clock[0])==0
+        with main.db() as con:
+            command=con.execute("SELECT worker_activity_at,lease_expires_at,progress_json FROM agent_commands WHERE command_id='capture'").fetchone()
+            build=con.execute("SELECT status,progress,updated_at FROM reference_builds WHERE build_id=?",(reliable_build.build_id,)).fetchone()
+            job=con.execute("SELECT status,progress,updated_at FROM jobs WHERE job_id=?",(reliable_build.job_id,)).fetchone()
+        assert command['worker_activity_at']>first_activity
+        assert datetime.fromisoformat(command['lease_expires_at'])>clock[0]
+        assert command['progress_json']=='{}' and tuple(build[:2])==('building',25)
+        assert tuple(job[:2])==('running',0)
+        assert build['updated_at']==job['updated_at']==clock[0].isoformat()
+
+        data=reference_archive(reliable_build.tmp).read_bytes(); checksum=hashlib.sha256(data).hexdigest()
+        class UploadRequest:
+            headers={'X-Reference-SHA256':checksum}
+            async def stream(self):
+                for offset in range(0,len(data),97): yield data[offset:offset+97]
+        with patch.object(main,'authenticate_agent'):
+            uploaded=asyncio.run(main.upload_reference_build_archive('ouranos',reliable_build.build_id,UploadRequest()))
+            assert uploaded.status_code==200
+            result={'sha256':checksum,'uncompressed_size_bytes':len(data),'sanitization':{'source_unchanged':True},
+                    'builder_version':'test','manifest':{'metadata':{}}}
+            completed=asyncio.run(main.agent_command_result('ouranos','capture',JsonRequest({'status':'success','result':result})))
+            retry=asyncio.run(main.agent_command_result('ouranos','capture',JsonRequest({'status':'success','result':result})))
+        assert completed.status_code==200 and json.loads(retry.body)['ignored']=='terminal_command'
+    with main.db() as con:
+        assert con.execute("SELECT status FROM reference_builds WHERE build_id=?",(reliable_build.build_id,)).fetchone()[0]=='published'
+        assert con.execute('SELECT COUNT(*) FROM reference_image_versions').fetchone()[0]==1
+
+
+def test_reference_legacy_agent_is_not_given_an_unrenewable_lease(reliable_build):
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("""INSERT INTO node_agents(node_id,status,last_heartbeat,capabilities_json,updated_at)
+            VALUES('ouranos','online',?,'{}',?) ON CONFLICT(node_id) DO UPDATE SET
+            last_heartbeat=excluded.last_heartbeat,capabilities_json='{}',updated_at=excluded.updated_at""",(stamp,stamp))
+        con.execute("""UPDATE agent_commands SET status='queued',claimed_at=NULL,
+            lease_expires_at=NULL,worker_activity_at=NULL,delivery_acknowledged_at=NULL
+            WHERE command_id='capture'""")
+    with patch.object(main,'authenticate_agent'):
+        command=json.loads(main.agent_poll_commands('ouranos',JsonRequest({})).body)['command']
+    # Legacy poll responses keep their historical pre-update status field; the
+    # persisted command is claimed, but without an unrenewable lease.
+    assert command['status']=='queued' and command['lease_timeout_seconds'] is None
+    with main.db() as con:
+        row=con.execute("SELECT status,lease_expires_at,worker_activity_at FROM agent_commands WHERE command_id='capture'").fetchone()
+    assert tuple(row)==('claimed',None,None)
+    # A lease left by the pre-fix Control Plane has no delivery ACK proof and
+    # must not terminalize an in-flight legacy capture during rolling upgrade.
+    with main.db() as con:
+        con.execute("UPDATE agent_commands SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE command_id='capture'")
+    assert main.expire_reference_command_leases()==0
+
+
+def test_dead_reference_worker_expires_requests_cancel_and_rejects_late_upload(reliable_build):
+    capabilities=enable_reference_delivery(); offer_and_ack_reference(capabilities)
+    with main.db() as con:
+        lease=con.execute("SELECT lease_expires_at FROM agent_commands WHERE command_id='capture'").fetchone()[0]
+    assert main.expire_reference_command_leases(datetime.fromisoformat(lease)+timedelta(microseconds=1))==1
+    with main.db() as con:
+        command=con.execute("SELECT status,cancel_requested_at,error_text FROM agent_commands WHERE command_id='capture'").fetchone()
+        build=con.execute("SELECT status,error_text FROM reference_builds WHERE build_id=?",(reliable_build.build_id,)).fetchone()
+    assert command['status']=='failed' and command['cancel_requested_at']
+    assert 'Lease de capture expirée' in command['error_text']
+    assert build['status']=='build_failed' and 'Lease de capture expirée' in build['error_text']
+    with patch.object(main,'authenticate_agent'):
+        heartbeat=json.loads(asyncio.run(main.agent_heartbeat('ouranos',JsonRequest({
+            'agent_version':'test','active_command_id':'capture','capabilities':capabilities}))).body)
+    assert heartbeat['cancel_active_command'] and heartbeat['active_command_state']=='terminal'
+    data=reference_archive(reliable_build.tmp).read_bytes()
+    class LateUpload:
+        headers={'X-Reference-SHA256':hashlib.sha256(data).hexdigest()}
+        async def stream(self): yield data
+    with patch.object(main,'authenticate_agent'),pytest.raises(main.HTTPException) as rejected:
+        asyncio.run(main.upload_reference_build_archive('ouranos',reliable_build.build_id,LateUpload()))
+    assert rejected.value.status_code==409
+    with main.db() as con:
+        assert con.execute('SELECT COUNT(*) FROM reference_image_versions').fetchone()[0]==0
+
+
 def test_expired_lease_fails_orphan_and_late_success_is_ignored(reliable_build):
     with main.db() as con:
         con.execute("UPDATE agent_commands SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE command_id='capture'")
@@ -81,6 +228,20 @@ def test_cancel_claimed_build_requests_cooperative_stop(reliable_build):
     with main.db() as con:
         assert con.execute("SELECT status FROM reference_builds WHERE build_id=?",(reliable_build.build_id,)).fetchone()[0]=='cancelling'
         assert con.execute("SELECT cancel_requested_at FROM agent_commands WHERE command_id='capture'").fetchone()[0]
+
+
+def test_cancel_unacknowledged_reference_offer_is_immediate(reliable_build):
+    enable_reference_delivery()
+    with patch.object(main,'authenticate_agent'):
+        offer=json.loads(main.agent_poll_commands('ouranos',JsonRequest({})).body)['command']
+    assert offer['status']=='offered'
+    response=main.cancel_reference_build(reliable_build.build_id)
+    assert response.status_code==303
+    with main.db() as con:
+        command=con.execute("SELECT status,cancel_requested_at FROM agent_commands WHERE command_id='capture'").fetchone()
+        build=con.execute("SELECT status FROM reference_builds WHERE build_id=?",(reliable_build.build_id,)).fetchone()
+    assert command['status']=='cancelled' and command['cancel_requested_at']
+    assert build['status']=='cancelled'
 
 
 def test_cancelled_agent_result_is_terminal_and_cleans_job(reliable_build):
@@ -120,6 +281,33 @@ def test_cancelled_capture_cleans_temporary_directory(tmp_path):
          patch.object(agent,'_capture_plex_reference',side_effect=agent.CommandCancelled('cancelled')):
         with pytest.raises(agent.CommandCancelled):
             agent.build_and_upload_plex_reference(config,{'upload_path':'/api/agent/v1/n/reference-builds/b/archive'})
+    assert not list(tmp_path.glob('appbox-reference-build-*'))
+
+
+def test_long_capture_observes_cancel_event_and_cleans_staging(tmp_path):
+    config={'reference_build_temp_dir':str(tmp_path),'control_plane_url':'http://invalid','token':'x'}
+    discovery={'preflight':{'can_build':True,'estimated_payload_bytes':100},
+               'configuration':{'config_path':str(tmp_path)},'instance':{'container_name':'plex'}}
+    entered=threading.Event(); cancel=threading.Event(); errors=[]
+    def capture(_config_path,workdir,_container_name,**kwargs):
+        (workdir/'partial-capture').write_bytes(b'partial')
+        entered.set()
+        assert kwargs['cancel_event'].wait(3)
+        raise agent.CommandCancelled('cancelled during long capture')
+    def run_capture():
+        try:
+            agent.build_and_upload_plex_reference(config,{
+                'upload_path':'/api/agent/v1/n/reference-builds/b/archive'},cancel_event=cancel)
+        except Exception as exc:
+            errors.append(exc)
+    with patch.object(agent,'discover_plex_instance',return_value=discovery), \
+         patch.object(agent,'_reference_storage_requirement',return_value={
+             'can_build':True,'required_free_bytes':100,'temporary_free_bytes':200,'missing_free_bytes':0}), \
+         patch.object(agent,'_capture_plex_reference',side_effect=capture):
+        worker=threading.Thread(target=run_capture); worker.start()
+        assert entered.wait(1); cancel.set(); worker.join(4)
+    assert not worker.is_alive()
+    assert len(errors)==1 and isinstance(errors[0],agent.CommandCancelled)
     assert not list(tmp_path.glob('appbox-reference-build-*'))
 
 
