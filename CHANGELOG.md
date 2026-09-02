@@ -3,6 +3,9 @@
 ## 1.6.0-alpha.5 — En développement
 
 ### Refresh RDAD ciblé multi-node
+- Séparation explicite des deux responsabilités historiques : nouveau `rdad_catalog_sync.py` pour répliquer par rsync/SSH les quatre catalogues centraux, tandis que `rdad_refresh.py` reste seul responsable des deltas, queues et appels Plex.
+- Sync configurable, persistée et temporisée, sans shell, avec racines/bibliothèques bornées, préservation des symlinks, `--delete` limité aux quatre destinations, isolation des erreurs et barrière commune tant que le timer/service legacy est actif.
+- Une sync réussie force le scan local partagé du même cycle ; les cycles sans sync conservent les cadences RDAD existantes et un node mal/non configuré n’effectue aucune connexion.
 - Nouveau moteur Python versionné dans l’agent : découverte locale des AppBox Plex par labels officiels, endpoint et `/config` résolus depuis Docker, token jamais journalisé et sections déterminées par leurs Locations `/data` plutôt que par IDs ou titres.
 - Files persistantes indépendantes adressées par identité node/client/conteneur, déduplication et timestamps, lecture FUSE réelle, defer/retry Plex busy ou indisponible, isolation complète entre AppBox et conservation explicite des queues orphelines.
 - Boucle agent indépendante sans nouvelle unité systemd. Le moteur reste inactif tant que le timer/service historique `sync-decypharr-catalogs` fonctionne, puis prend le relais après bascule opérateur; compatibilité temporaire isolée pour `plex-appb-34ah`.

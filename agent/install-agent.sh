@@ -22,6 +22,7 @@ install -d -m 755 /srv/appboxes
 install -m 755 "$SOURCE/marinos-appbox-agent.py" /usr/local/sbin/marinos-appbox-agent.py
 install -m 644 "$SOURCE/reference_contract.py" /usr/local/sbin/reference_contract.py
 install -m 644 "$SOURCE/rdad_refresh.py" /usr/local/sbin/rdad_refresh.py
+install -m 644 "$SOURCE/rdad_catalog_sync.py" /usr/local/sbin/rdad_catalog_sync.py
 install -m 644 "$SOURCE/upgrade_contract.py" /usr/local/sbin/upgrade_contract.py
 install -m 644 "$SOURCE/upgrade_client.py" /usr/local/sbin/upgrade_client.py
 install -m 644 "$SOURCE/marinos-appbox-agent.service" /etc/systemd/system/marinos-appbox-agent.service
@@ -42,6 +43,14 @@ config = {
     "rdad_refresh_interval": 60,
     "rdad_refresh_catalog_interval": 300,
     "rdad_refresh_mode": "readable",
+    "rdad_catalog_sync_enabled": "auto",
+    "rdad_catalog_sync_interval": 300,
+    "rdad_catalog_sync_host": "",
+    "rdad_catalog_sync_user": "root",
+    "rdad_catalog_sync_identity_file": "/root/.ssh/id_ed25519_decypharr_sync",
+    "rdad_catalog_sync_source_root": "/mnt/media/decypharr",
+    "rdad_catalog_sync_destination_root": "/mnt/decypharr-poc",
+    "rdad_catalog_sync_timeout": 180,
     "disk_path": "/",
     "appbox_base_dir": "/srv/appboxes",
 }

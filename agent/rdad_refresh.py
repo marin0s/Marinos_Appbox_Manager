@@ -396,6 +396,8 @@ class TargetedRefreshEngine:
     def legacy_runtime_active(self) -> bool:
         for unit in ("sync-decypharr-catalogs.timer", "sync-decypharr-catalogs.service"):
             code, output, _ = _run(["systemctl", "is-active", unit], timeout=10)
+            if code == 124:
+                return True
             if code == 0 and output.strip() == "active":
                 return True
         return False
@@ -474,7 +476,7 @@ class TargetedRefreshEngine:
                             library=library, section=section, path=path, result=_error_reason(exc))
         state["entries"] = remaining
 
-    def run_cycle(self) -> dict:
+    def run_cycle(self, force_scan: bool = False) -> dict:
         enabled, reason = self.enabled()
         if not enabled:
             self.logger("cycle_skipped", result=reason)
@@ -507,7 +509,7 @@ class TargetedRefreshEngine:
                             container=target.container, result=_error_reason(exc))
 
         now = float(self.clock())
-        scan_required = any(created or not state.get("baseline_complete")
+        scan_required = bool(force_scan) or any(created or not state.get("baseline_complete")
                             for _, state, created in target_states)
         if not scan_required:
             try:

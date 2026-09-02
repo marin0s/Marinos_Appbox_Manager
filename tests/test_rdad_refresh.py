@@ -262,6 +262,23 @@ def test_catalog_scan_interval_baseline_and_elapsed_scan(tmp_path):
     assert scans == [100.0, 400.0]
 
 
+def test_successful_sync_forces_shared_scan_and_queues_all_existing_targets(tmp_path):
+    one, two = tmp_path / 'one', tmp_path / 'two'
+    preferences(one, None); preferences(two, None)
+    docker = FakeDocker([
+        container('one', 'future-node-42', 32435, one),
+        container('two', 'future-node-42', 32436, two),
+    ])
+    plex = FakePlex(); catalog = {}; now = [100.0]; scans = []
+    engine, logs = make_engine(tmp_path, docker, plex, catalog, catalog_interval=300,
+        clock=lambda: now[0], catalog_scanner=lambda _root: scans.append(now[0]) or dict(catalog))
+    engine.run_cycle()
+    catalog['radarr/Iron Man (2008)/movie.strm'] = '1'; now[0] = 110
+    result = engine.run_cycle(force_scan=True)
+    assert result['catalog_scanned'] is True and scans == [100.0, 110]
+    assert sum(event == 'queue_add' for event, _ in logs) == 2
+
+
 def test_new_target_forces_one_shared_scan_and_preserves_existing_target_change(tmp_path):
     one, two = tmp_path / 'one', tmp_path / 'two'
     preferences(one, None); preferences(two, None)
@@ -482,3 +499,5 @@ def test_missing_published_endpoint_preserves_only_that_target_queue(tmp_path):
 
 def test_agent_package_contract_contains_versioned_refresh_component():
     assert 'rdad_refresh.py' in upgrade_contract.FILES
+    assert 'rdad_catalog_sync.py' in upgrade_contract.FILES
+    assert 'rdad_catalog_sync.py' not in upgrade_contract.BRIDGE_FILES

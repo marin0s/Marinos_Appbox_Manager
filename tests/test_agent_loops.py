@@ -20,12 +20,17 @@ class AgentLoopTests(unittest.TestCase):
         cycles = []
         class Engine:
             def __init__(self, config): self.config = config
-            def run_cycle(self):
-                cycles.append(self.config['node_id'])
+            def run_cycle(self, force_scan=False):
+                cycles.append(('refresh', self.config['node_id'], force_scan))
                 loops.stop.set()
-        with patch.object(agent, 'TargetedRefreshEngine', Engine):
+        class Sync:
+            def __init__(self, config): self.config = config
+            def run_cycle(self):
+                cycles.append(('sync', self.config['node_id']))
+                return {'succeeded': 1}
+        with patch.object(agent, 'TargetedRefreshEngine', Engine), patch.object(agent, 'CatalogSyncEngine', Sync):
             loops.rdad_refresh_loop()
-        self.assertEqual(cycles, ['test'])
+        self.assertEqual(cycles, [('sync','test'), ('refresh','test',True)])
 
     def test_heartbeat_does_not_collect_or_send_metrics(self):
         with patch.object(agent, 'collect_metrics', side_effect=AssertionError('heavy work')), patch.object(agent, 'api', return_value={}) as api:

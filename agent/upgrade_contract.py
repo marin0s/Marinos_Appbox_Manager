@@ -23,7 +23,7 @@ BRIDGE_FILES = (
 )
 FILES = (
     "install-agent.sh", "marinos-appbox-agent.py", "marinos-appbox-agent.service",
-    "reference_contract.py", "rdad_refresh.py", "upgrade_contract.py", "upgrade_client.py",
+    "reference_contract.py", "rdad_refresh.py", "rdad_catalog_sync.py", "upgrade_contract.py", "upgrade_client.py",
     "upgrade_helper.py", "marinos-appbox-updater.service", "marinos-appbox-updater.timer",
     "upgrade_launcher.py", "managed-agent.service",
 )

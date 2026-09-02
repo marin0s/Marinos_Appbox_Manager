@@ -444,7 +444,8 @@ def test_atomic_pointer_uses_replace(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('modules', [(), ('reference_contract.py',),
     ('reference_contract.py', 'upgrade_client.py', 'upgrade_contract.py'),
-    ('reference_contract.py', 'rdad_refresh.py', 'upgrade_client.py', 'upgrade_contract.py')])
+    ('reference_contract.py', 'rdad_refresh.py', 'upgrade_client.py', 'upgrade_contract.py'),
+    ('reference_contract.py', 'rdad_refresh.py', 'rdad_catalog_sync.py', 'upgrade_client.py', 'upgrade_contract.py')])
 def test_legacy_bootstrap_preserves_config_and_can_resume(tmp_path, monkeypatch, artifact, modules):
     data, _, _ = artifact
     legacy, root, state, spool, units = (tmp_path/name for name in ('legacy','root','state','spool','units'))
@@ -527,7 +528,8 @@ def test_legacy_snapshot_identity_uses_only_installed_files(tmp_path, modules):
 
 
 @pytest.mark.parametrize('name', ['marinos-appbox-agent.py', 'reference_contract.py',
-                                 'rdad_refresh.py', 'upgrade_client.py', 'upgrade_contract.py'])
+                                 'rdad_refresh.py', 'rdad_catalog_sync.py',
+                                 'upgrade_client.py', 'upgrade_contract.py'])
 @pytest.mark.parametrize('failure', ['permission', 'syntax', 'directory', 'symlink'])
 def test_legacy_bootstrap_rejects_invalid_present_files_before_changes(tmp_path, monkeypatch, artifact, name, failure):
     data, _, _ = artifact
@@ -1061,7 +1063,7 @@ def test_package_includes_dispatcher_abi_and_managed_components(artifact):
     _,manifest,contents=artifact
     assert manifest['launcher_abi']==1
     for name in ('upgrade_launcher.py','upgrade_helper.py','upgrade_client.py',
-                 'upgrade_contract.py','managed-agent.service'):
+                 'upgrade_contract.py','managed-agent.service','rdad_catalog_sync.py'):
         assert name in contents and name in manifest['files']
 
 

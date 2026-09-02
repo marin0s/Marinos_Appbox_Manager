@@ -42,6 +42,14 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         TargetedRefreshEngine = None  # bridge release: application modules arrive in the follow-up package
 
+try:
+    from agent.rdad_catalog_sync import CatalogSyncEngine
+except ModuleNotFoundError:
+    try:
+        from rdad_catalog_sync import CatalogSyncEngine
+    except ModuleNotFoundError:
+        CatalogSyncEngine = None  # bridge release contains only the upgrade root of trust
+
 # Capture once: resolving current again after activation would misidentify this process.
 RUNTIME_IDENTITY = runtime_identity(__file__)
 
@@ -2485,10 +2493,17 @@ class AgentLoops:
     def rdad_refresh_loop(self):
         if TargetedRefreshEngine is None:
             return
-        engine = TargetedRefreshEngine(self.config)
+        refresh_engine = TargetedRefreshEngine(self.config)
+        sync_engine = CatalogSyncEngine(self.config) if CatalogSyncEngine is not None else None
         while not self.stop.is_set():
+            sync_result = {"succeeded": 0}
             try:
-                engine.run_cycle()
+                if sync_engine is not None:
+                    sync_result = sync_engine.run_cycle()
+            except Exception as exc:
+                self.report_error('rdad-catalog-sync', exc)
+            try:
+                refresh_engine.run_cycle(force_scan=bool(sync_result.get("succeeded")))
             except Exception as exc:
                 self.report_error('rdad-refresh', exc)
             self.stop.wait(self.rdad_refresh_interval)
