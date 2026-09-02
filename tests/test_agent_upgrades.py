@@ -1067,6 +1067,47 @@ def test_package_includes_dispatcher_abi_and_managed_components(artifact):
         assert name in contents and name in manifest['files']
 
 
+def test_agent_units_keep_strict_sandbox_with_narrow_optional_rdad_write_path(artifact):
+    _, _, contents = artifact
+    expected = '/var/lib/marinos-appbox-agent /run /srv/appboxes -/mnt/decypharr-poc'
+    for name in ('marinos-appbox-agent.service', 'managed-agent.service'):
+        text = contents[name].decode('utf-8')
+        assert 'NoNewPrivileges=true' in text
+        assert 'ProtectSystem=strict' in text
+        assert f'ReadWritePaths={expected}' in text
+        assert 'ReadWritePaths=/mnt\n' not in text
+
+
+def test_install_agent_installs_the_hardened_versioned_unit():
+    installer = (SOURCE/'install-agent.sh').read_text(encoding='utf-8')
+    assert ('install -m 644 "$SOURCE/marinos-appbox-agent.service" '
+            '/etc/systemd/system/marinos-appbox-agent.service') in installer
+    unit = (SOURCE/'marinos-appbox-agent.service').read_text(encoding='utf-8')
+    assert 'ReadWritePaths=/var/lib/marinos-appbox-agent /run /srv/appboxes -/mnt/decypharr-poc' in unit
+
+
+def test_bridge_and_full_packages_carry_valid_rdad_writable_units():
+    bridge_data = contract.package_bytes(SOURCE, contract.BRIDGE_FILES)
+    bridge_manifest, bridge = contract.validate_package(bridge_data, contract.digest(bridge_data))
+    assert (b'ReadWritePaths=' + contract.LEGACY_READ_WRITE_PATHS.encode() + b'\n') in bridge['managed-agent.service']
+    assert b'/mnt/decypharr-poc' not in bridge['managed-agent.service']
+    assert bridge_manifest['files']['managed-agent.service'] == contract.digest(bridge['managed-agent.service'])
+
+    full_data = contract.package_bytes(SOURCE, contract.FILES)
+    full_manifest, full = contract.validate_package(full_data, contract.digest(full_data))
+    expected = (SOURCE/'managed-agent.service').read_bytes().replace(b'\r\n', b'\n')
+    assert full['managed-agent.service'] == expected
+    assert full_manifest['files']['managed-agent.service'] == contract.digest(expected)
+
+
+def test_legacy_rdad_write_policy_is_accepted_only_for_bridge_package():
+    old_unit = (SOURCE/'managed-agent.service').read_bytes().replace(
+        contract.MANAGED_READ_WRITE_PATHS.encode(), contract.LEGACY_READ_WRITE_PATHS.encode())
+    contract.validate_managed_unit(old_unit, allow_legacy_rdad=True)
+    with pytest.raises(ValueError, match='execution boundary'):
+        contract.validate_managed_unit(old_unit)
+
+
 @pytest.mark.parametrize('mode,output,success', [
     ('free', 'controller:tick\n', True),
     ('busy', '', True),

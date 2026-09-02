@@ -123,6 +123,14 @@ La réplication possède sa configuration indépendante :
 
 `auto` exige une configuration valide, notamment un host explicite et une clé existante. `false` désactive seulement la réplication ; le refresh peut continuer à traiter une queue existante. Le même fichier agent peut être utilisé sur tous les nodes, avec uniquement ces valeurs de transport adaptées localement.
 
+### Sandbox systemd et destination inscriptible
+
+L'agent conserve `ProtectSystem=strict` et `NoNewPrivileges=true`. L'unité livrée autorise en écriture uniquement la destination RDAD standard avec `ReadWritePaths=-/mnt/decypharr-poc`, en plus des répertoires runtime historiques. Le préfixe `-` est la syntaxe systemd qui ignore proprement ce chemin lorsqu'il n'existe pas : les nodes sans montage RDAD ne sont donc pas empêchés de démarrer. La racine `/mnt` n'est jamais rendue inscriptible.
+
+Pour alpha.5, `rdad_catalog_sync_destination_root=/mnt/decypharr-poc` est la destination supportée directement par l'unité packagée. Une autre destination absolue reste possible dans la configuration du moteur, mais elle exige un drop-in systemd opérateur ajoutant exactement ce chemin à `ReadWritePaths`, suivi de `systemctl daemon-reload` et d'un restart contrôlé de l'agent. Changer seulement `agent.json` ne suffit pas sous `ProtectSystem=strict`. Cet override élargit la frontière d'écriture et doit être audité node par node ; il ne doit jamais autoriser `/mnt` en entier.
+
+L'installeur legacy pose cette politique depuis `marinos-appbox-agent.service`. Une mise à jour managed full pose atomiquement la même politique depuis `managed-agent.service`, exécute `daemon-reload`, puis restaure l'unité précédente si l'activation ou la confirmation échoue. Le bridge de compatibilité conserve temporairement l'ancienne allowlist exacte afin d'être accepté par le contrat strict déjà déployé ; il ne contient pas le moteur RDAD. Son nouveau contrôleur accepte ensuite le package full et son ouverture étroite. La liste de fichiers et l'ABI bridge restent inchangées.
+
 Sans `rdad_refresh_catalog_root`, la racine est déduite de `rdad_path` : le parent lorsque celui-ci se termine par `.mnt`, sinon le chemin lui-même.
 
 ## Canary ARTEMIS
@@ -131,6 +139,7 @@ Ces commandes constituent une procédure terrain à exécuter ultérieurement pa
 
 1. Sauvegarder `agent.json`, l’état du timer legacy, ses files/timestamps historiques et `/var/lib/marinos-appbox-agent/rdad-refresh` s’il existe. Le format du script terrain n’étant pas versionné dans ce repository, ses files ne sont pas importées aveuglément dans le nouveau format.
 2. Déployer la release agent validée et configurer la sync native sans arrêter le moteur legacy. Les deux composants doivent indiquer `cycle_skipped` avec `legacy_timer_active` : le timer historique continue alors d’assurer sync et refresh sans concurrence.
+   Vérifier auparavant `systemctl cat marinos-appbox-agent.service` puis `systemctl show marinos-appbox-agent.service -p ProtectSystem -p NoNewPrivileges -p ReadWritePaths` : le sandbox doit rester strict et `/mnt/decypharr-poc` doit être la seule ouverture RDAD. Depuis le namespace du service, valider la création puis la suppression d'un fichier de sonde sous cette racine, sans modifier les catalogues.
 3. Vérifier les labels, bindings `32400/tcp` et mount `/config` de `plex-appb-34ah`, JDMRY et P0E2E01. Ne jamais afficher Preferences.xml ou le token.
 4. Laisser le moteur historique vider ses files. Si une entrée reste différée, conserver le moteur legacy et résoudre sa cause avant la bascule; ne jamais déclarer cette entrée migrée. Une fois les files vides, arrêter et désactiver le timer legacy, attendre la fin éventuelle du service, puis vérifier les deux unités inactives : `systemctl disable --now sync-decypharr-catalogs.timer` et `systemctl is-active sync-decypharr-catalogs.service`.
 5. Redémarrer l’agent ou attendre le cycle suivant. Vérifier quatre `catalog_sync_success`, puis la découverte de 34ah et JDMRY; P0E2E01 doit produire `token_missing` sans erreur globale. Comparer un échantillon de liens CRONOS/local avec `readlink` sans suivre leur cible.
@@ -147,6 +156,7 @@ Après un canary stable, répéter sur ORION ou un autre node compatible : sauve
 1. Passer d’abord `rdad_catalog_sync_enabled` et `rdad_refresh_enabled` à `false` dans `agent.json`, redémarrer l’agent et vérifier les deux `cycle_skipped/result=disabled`. Cette étape ferme la fenêtre où une sync ou un refresh déjà commencé pourrait chevaucher le moteur legacy.
 2. Réactiver ensuite le moteur historique : `systemctl enable --now sync-decypharr-catalogs.timer` et vérifier son état.
 3. Utiliser le rollback agent managed normal si le code doit revenir à la release précédente. Conserver la configuration/identité d’agent.
+   Le rollback restaure aussi les octets de l'unité précédente et exécute `daemon-reload`. Si un drop-in opérateur avait été ajouté pour une destination non standard, le retirer séparément, recharger systemd et redémarrer l'agent après avoir désactivé la sync native.
 4. Conserver les `queue.json`; ne pas les injecter dans le script legacy et ne pas les supprimer pendant l’analyse.
 5. Pour réessayer, laisser `rdad_refresh_enabled=false`, vider le moteur legacy, désactiver timer et service, puis seulement remettre `auto` et redémarrer l’agent.
 
@@ -155,6 +165,7 @@ Après un canary stable, répéter sur ORION ou un autre node compatible : sauve
 - `legacy_timer_active` : coexistence protégée, arrêter l’ancien timer seulement pendant une migration approuvée.
 - `configuration_invalid` / `identity_unavailable` : corriger host/user/racines ou la clé locale sans jamais afficher son contenu.
 - `destination_root_unavailable` : monter/créer explicitement la racine attendue ; l’agent refuse de la créer pour éviter un rsync sur le filesystem racine après perte de mount.
+- `rsync_failed` avec `Permission denied` malgré les permissions Unix : contrôler `ProtectSystem` et `ReadWritePaths` dans `systemctl show`. Le chemin configuré doit correspondre à l'ouverture systemd ; ne pas corriger avec `chmod`, `chown` ou une autorisation globale de `/mnt`.
 - `rsync_failed` / `timeout` : vérifier réseau, known_hosts, source distante et permissions. Les autres bibliothèques continuent et un nouvel essai aura lieu à l’échéance persistée.
 - `token_missing` / `preferences_missing` : réclamer Plex ou réparer son mount `/config`; ne jamais copier un token dans la configuration agent.
 - `plex_endpoint_unavailable` : vérifier le binding Docker `32400/tcp`.

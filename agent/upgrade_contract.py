@@ -30,6 +30,8 @@ FILES = (
 REQUIRED_FILES = frozenset(BRIDGE_FILES)
 HELPER_FILES = ("upgrade_helper.py", "upgrade_contract.py", "upgrade_client.py")
 MANIFEST = "agent-manifest.json"
+LEGACY_READ_WRITE_PATHS = "/var/lib/marinos-appbox-agent /run /srv/appboxes"
+MANAGED_READ_WRITE_PATHS = LEGACY_READ_WRITE_PATHS + " -/mnt/decypharr-poc"
 TERMINAL = {"success", "upgrade_failed", "rolled_back", "rollback_failed"}
 PHASES = ("queued", "downloading", "verifying", "prepared", "installing",
           "restarting", "awaiting_heartbeat", "rolling_back", *sorted(TERMINAL))
@@ -88,8 +90,11 @@ def manifest_for(contents):
 
 def package_bytes(source, files=FILES):
     contents = {}
+    bridge = tuple(files) == BRIDGE_FILES
     for name in files:
         data = (Path(source) / name).read_bytes().replace(b"\r\n", b"\n")
+        if bridge and name == "managed-agent.service":
+            data = data.replace(MANAGED_READ_WRITE_PATHS.encode(), LEGACY_READ_WRITE_PATHS.encode())
         if b"\r" in data:
             raise ValueError("Bare CR in package")
         contents[name] = data
@@ -172,7 +177,10 @@ def validate_package(data, expected_sha):
     if any(digest(contents[name]) != checksum for name, checksum in files.items()):
         raise PackageValidationError("package_file_checksum_mismatch")
     try:
-        validate_managed_unit(contents["managed-agent.service"])
+        validate_managed_unit(
+            contents["managed-agent.service"],
+            allow_legacy_rdad=set(contents) == set(BRIDGE_FILES),
+        )
     except (UnicodeDecodeError, ValueError):
         raise PackageValidationError("manifest_invalid") from None
     for name, data in contents.items():
@@ -186,7 +194,7 @@ def validate_package(data, expected_sha):
     return manifest, contents
 
 
-def validate_managed_unit(data):
+def validate_managed_unit(data, allow_legacy_rdad=False):
     """A versioned runtime unit, not an unrestricted root script delivery channel."""
     parser = configparser.ConfigParser(interpolation=None, strict=True)
     parser.optionxform = str
@@ -210,9 +218,14 @@ def validate_managed_unit(data):
             raise ValueError('Unsupported managed unit directive')
     required = {'Type':'simple', 'User':'root', 'Restart':'always',
                 'ExecStart':'/usr/bin/python3 /opt/marinos-appbox-agent/current/marinos-appbox-agent.py',
-                'NoNewPrivileges':'true', 'ProtectSystem':'strict',
-                'ReadWritePaths':'/var/lib/marinos-appbox-agent /run /srv/appboxes'}
+                'NoNewPrivileges':'true', 'ProtectSystem':'strict'}
     if any(parser['Service'].get(k) != v for k,v in required.items()):
+        raise ValueError('Managed unit violates execution boundary')
+    writable = parser['Service'].get('ReadWritePaths')
+    accepted_writable = {MANAGED_READ_WRITE_PATHS}
+    if allow_legacy_rdad:
+        accepted_writable.add(LEGACY_READ_WRITE_PATHS)
+    if writable not in accepted_writable:
         raise ValueError('Managed unit violates execution boundary')
     if parser['Install'].get('WantedBy') != 'multi-user.target':
         raise ValueError('Invalid managed unit target')

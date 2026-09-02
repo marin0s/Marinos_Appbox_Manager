@@ -3,6 +3,7 @@
 ## 1.6.0-alpha.5 — En développement
 
 ### Refresh RDAD ciblé multi-node
+- Le sandbox systemd reste strict mais autorise désormais uniquement `-/mnt/decypharr-poc` en écriture pour la sync native. Le chemin facultatif préserve les nodes sans RDAD ; les unités legacy/managed, leur validation d'upgrade, les packages bridge/full et la procédure de rollback restent cohérents.
 - Séparation explicite des deux responsabilités historiques : nouveau `rdad_catalog_sync.py` pour répliquer par rsync/SSH les quatre catalogues centraux, tandis que `rdad_refresh.py` reste seul responsable des deltas, queues et appels Plex.
 - Sync configurable, persistée et temporisée, sans shell, avec racines/bibliothèques bornées, préservation des symlinks, `--delete` limité aux quatre destinations, isolation des erreurs et barrière commune tant que le timer/service legacy est actif.
 - Une sync réussie force le scan local partagé du même cycle ; les cycles sans sync conservent les cadences RDAD existantes et un node mal/non configuré n’effectue aucune connexion.
