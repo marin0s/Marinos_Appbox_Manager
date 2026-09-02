@@ -1,12 +1,36 @@
 {% extends "base.html" %}
 {% block title %}Déploiements — Marinos AppBox{% endblock %}
 {% block page_title %}Déploiements{% endblock %}
+{% macro deployment_card(d) %}
+<article class="card deployment-card">
+ <div class="card-top"><div><div class="eyebrow">{{d.deployment_id[:8]}}</div><h3>{{d.client_id|upper if d.client_id else 'Sans AppBox'}}</h3></div><span class="pill {{'ok' if d.lifecycle_state=='terminal' and d.status in ['success','completed'] else 'bad' if d.lifecycle_state in ['stale','inconsistent'] else 'warn'}}">{{d.lifecycle_label}} · {{d.status_label}}</span></div>
+ <div class="progress-track"><span style="width:{{d.progress}}%"></span></div>
+ <div class="info-row"><span>Node</span><strong>{{d.node_name or d.node_id}}</strong></div>
+ <div class="info-row"><span>Référence</span><strong>{{d.reference_image_name or 'Vierge'}}{% if d.reference_version %} · {{d.reference_version}}{% endif %}</strong></div>
+ <div class="info-row"><span>Étape</span><strong>{{d.current_step}}</strong></div>
+ <div class="info-row"><span>Créé / mis à jour</span><strong>{{d.created_at}} / {{d.updated_at}}</strong></div>
+ <div class="info-row"><span>Début / fin</span><strong>{{d.started_at or '—'}} / {{d.completed_at or '—'}}</strong></div>
+ {% if d.detail %}<p class="metric-sub timeline-message">{{d.detail_preview}}</p>{% if d.detail_truncated %}<details class="job-details"><summary>Afficher les détails</summary><pre class="log-box">{{d.detail}}</pre></details>{% endif %}{% endif %}
+ {% if d.related_activity %}<p class="metric-sub">Activité liée : {{d.related_activity|join(', ')}}</p>{% endif %}
+ {% if d.reconcilable %}<form method="post" action="/deployments/{{d.deployment_id}}/reconcile-success"><button>Régulariser comme terminé</button></form>{% elif d.closable %}<form method="post" action="/deployments/{{d.deployment_id}}/cancel"><button class="danger-subtle">Clôturer comme annulé</button></form>{% endif %}
+</article>
+{% endmacro %}
 {% block content %}
 <section class="hero"><div><div class="eyebrow">Orchestration</div><h1>Déploiements Control Plane</h1><p>Historique des préparations et des décisions de placement, séparé des jobs Docker détaillés.</p></div></section>
 <div class="grid two deployment-columns">
- <section><div class="section-head"><div><h2>Déploiements</h2><p>{{deployments|length}} opération(s)</p></div></div>
-  <div class="deployment-list">{% for d in deployments %}<article class="card deployment-card"><div class="card-top"><div><div class="eyebrow">{{d.deployment_id[:8]}}</div><h3>{{d.client_id|upper if d.client_id else 'Sans AppBox'}}</h3></div><span class="pill {{'ok' if d.lifecycle_state=='terminal' and d.status in ['success','completed'] else 'bad' if d.lifecycle_state in ['stale','inconsistent'] else 'warn'}}">{{d.lifecycle_label}} · {{d.status_label}}</span></div><div class="progress-track"><span style="width:{{d.progress}}%"></span></div><div class="info-row"><span>Node</span><strong>{{d.node_name or d.node_id}}</strong></div><div class="info-row"><span>Référence</span><strong>{{d.reference_image_name or 'Vierge'}}{% if d.reference_version %} · {{d.reference_version}}{% endif %}</strong></div><div class="info-row"><span>Étape</span><strong>{{d.current_step}}</strong></div><div class="info-row"><span>Créé / mis à jour</span><strong>{{d.created_at}} / {{d.updated_at}}</strong></div><div class="info-row"><span>Début / fin</span><strong>{{d.started_at or '—'}} / {{d.completed_at or '—'}}</strong></div><p class="metric-sub">{{d.detail}}</p>{% if d.related_activity %}<p class="metric-sub">Activité liée : {{d.related_activity|join(', ')}}</p>{% endif %}{% if d.closable %}<form method="post" action="/deployments/{{d.deployment_id}}/cancel"><button class="danger-subtle">Clôturer comme annulé</button></form>{% endif %}</article>{% else %}<div class="card empty">Aucun déploiement Control Plane.</div>{% endfor %}</div>
- </section>
+ <div>
+  <section class="section-block"><div class="section-head"><div><h2>À traiter</h2><p>{{attention_deployments|length}} opération(s) active(s) ou nécessitant une décision</p></div></div>
+   <div class="deployment-list">{% for d in attention_deployments %}{{deployment_card(d)}}{% else %}<div class="card empty">Aucun déploiement ne nécessite d’attention.</div>{% endfor %}</div>
+  </section>
+  <details class="card section-block"><summary><strong>Terminés ({{completed_deployments|length}})</strong></summary>
+   <div class="deployment-list">{% for d in completed_deployments %}{{deployment_card(d)}}{% else %}<div class="empty">Aucun déploiement terminé.</div>{% endfor %}</div>
+  </details>
+  <details class="card section-block"><summary><strong>Historique obsolète ({{obsolete_deployments|length}})</strong></summary>
+   <p class="metric-sub">Ces opérations anciennes n’ont aucune activité ni AppBox opérationnelle correspondante.</p>
+   {% if obsolete_deployments %}<details class="reference-details"><summary>Prévisualiser la clôture en masse</summary><ul>{% for d in obsolete_deployments %}<li><strong>{{d.deployment_id}} · {{d.client_id|upper if d.client_id else 'Sans AppBox'}}</strong><span>{{d.node_name or d.node_id}} · {{d.status_label}} · {{(d.age_seconds // 86400) if d.age_seconds is not none else '?'}} jour(s) · sans activité et sans AppBox opérationnelle</span></li>{% endfor %}</ul><form method="post" action="/deployments/actions/cancel-obsolete"><input type="hidden" name="confirmed" value="true"><button class="danger-subtle">Confirmer : clôturer les opérations obsolètes</button></form></details>{% endif %}
+   <div class="deployment-list">{% for d in obsolete_deployments %}{{deployment_card(d)}}{% else %}<div class="empty">Aucun historique obsolète.</div>{% endfor %}</div>
+  </details>
+ </div>
  <section><div class="section-head"><div><h2>Décisions de placement</h2><p>Traçabilité manuelle et automatique</p></div></div>
   <div class="decision-list">{% for d in decisions %}<article class="card decision-card"><div class="card-top"><strong>{{d.client_id|upper if d.client_id else 'Prévisualisation'}}</strong><span class="pill">{{d.requested_mode|upper}}</span></div><div class="info-row"><span>Node retenu</span><strong>{{d.selected_node_name or d.selected_node_id}}</strong></div><p>{{d.reason}}</p><small>{{d.created_at}}</small></article>{% else %}<div class="card empty">Aucune décision enregistrée.</div>{% endfor %}</div>
  </section>

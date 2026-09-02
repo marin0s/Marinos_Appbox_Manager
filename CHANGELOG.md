@@ -3,6 +3,8 @@
 ## 1.6.0-alpha.5 — En développement
 
 ### Lifecycle du catalogue de références
+- Les déploiements historiques réellement aboutis peuvent être régularisés volontairement en `success` à partir de preuves fortes sur l’AppBox (même node et référence, runtime running/in_sync, aucune activité corrélée). Les vrais zombies restent annulables séparément, à l’unité ou après une prévisualisation bulk restrictive ; aucune action distante ni réécriture automatique au démarrage.
+- La page Déploiements sépare les éléments à traiter, les terminés et l’historique obsolète dans des sections repliables. Les longs détails sont tronqués dans la carte et restent intégralement consultables.
 - Une Reference Image publiée peut désormais être retirée du catalogue sans toucher à sa version courante, son archive centrale, ses caches, ses snapshots ni ses AppBox, puis republiée sans rebuild et sans changement de checksum.
 - Les références retirées restent consultables mais sont refusées pour tout nouveau déploiement. Leur suppression définitive réutilise le preflight existant et reste bloquée par toute AppBox, opération, build, distribution ou purge active.
 - La page Déploiements distingue les opérations actives, terminales, anciennes et incohérentes. Une clôture manuelle vers `cancelled` est proposée seulement en l’absence de job ou commande agent active ; l’historique est conservé et aucune action distante n’est lancée.

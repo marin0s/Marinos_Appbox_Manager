@@ -36,6 +36,198 @@ def _deployment(status, *, deployment_id='dep', completed_at=None):
             (deployment_id, status, completed_at))
 
 
+def _operational_appbox(*, client_id='client-ok', node_id='node-a', reference_version_id='keep-v1',
+                        desired_state='running', observed_state='running',
+                        reconciliation_status='in_sync', status='running'):
+    stamp = main.now_iso()
+    with main.db() as con:
+        con.execute("""INSERT INTO appboxes(client_id,node_id,path,status,containers_json,created_at,updated_at,
+            reference_image_id,reference_version_id,desired_state,observed_state,reconciliation_status)
+            VALUES(?,?,?,?, '[]',?,?,?,?,?,?,?)""",
+            (client_id, node_id, f'/tmp/{client_id}', status, stamp, stamp, 'keep-ref',
+             reference_version_id, desired_state, observed_state, reconciliation_status))
+
+
+def _attach_deployment(client_id='client-ok', *, deployment_id='dep', status='awaiting_claim', node_id='node-a'):
+    with main.db() as con:
+        con.execute("""UPDATE control_plane_deployments SET client_id=?,node_id=?,status=?,
+            current_step='health',progress=95 WHERE deployment_id=?""",
+            (client_id, node_id, status, deployment_id))
+
+
+def test_incomplete_deployment_with_strong_runtime_evidence_is_reconcilable(admin_catalogue):
+    _deployment('awaiting_claim')
+    _operational_appbox()
+    _attach_deployment()
+    with main.db() as con:
+        deployment = dict(con.execute("SELECT * FROM control_plane_deployments WHERE deployment_id='dep'").fetchone())
+        evidence = main.deployment_success_evidence(con, deployment)
+        main._decorate_deployment(con, deployment)
+    assert evidence['eligible'] is True
+    assert deployment['lifecycle_state'] == 'reconcilable'
+    html = admin_catalogue.get('/deployments').text
+    assert 'À RÉGULARISER · AWAITING_CLAIM' in html
+    assert 'Régulariser comme terminé' in html
+    assert 'action="/deployments/dep/cancel"' not in html
+
+
+def test_reconcile_success_is_local_audited_and_idempotent(admin_catalogue):
+    _deployment('awaiting_claim')
+    _operational_appbox()
+    _attach_deployment()
+    with main.db() as con:
+        before_box = tuple(con.execute("SELECT * FROM appboxes WHERE client_id='client-ok'").fetchone())
+        before_commands = con.execute("SELECT COUNT(*) FROM agent_commands").fetchone()[0]
+        before_jobs = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert admin_catalogue.post('/deployments/dep/reconcile-success', follow_redirects=False).status_code == 303
+    assert admin_catalogue.post('/deployments/dep/reconcile-success', follow_redirects=False).status_code == 303
+    with main.db() as con:
+        row = con.execute("""SELECT status,current_step,progress,completed_at,detail,created_at,
+            reference_version_id,node_id,client_id FROM control_plane_deployments WHERE deployment_id='dep'""").fetchone()
+        assert tuple(row[:3]) == ('success', 'reconciled', 100)
+        assert row['completed_at'] and 'régularisé' in row['detail']
+        assert (row['created_at'], row['reference_version_id'], row['node_id'], row['client_id']) == (
+            '2000-01-01T00:00:00+00:00', 'keep-v1', 'node-a', 'client-ok')
+        assert tuple(con.execute("SELECT * FROM appboxes WHERE client_id='client-ok'").fetchone()) == before_box
+        assert con.execute("SELECT COUNT(*) FROM agent_commands").fetchone()[0] == before_commands
+        assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == before_jobs
+        assert con.execute("SELECT COUNT(*) FROM audit_log WHERE action='control_plane_deployment_reconciled'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('mutation,expected_reason', [
+    ({'reference_version_id': 'keep-v2'}, 'reference_version_differente'),
+    ({'node_id': 'node-b'}, 'node_different'),
+    ({'desired_state': 'stopped'}, 'etat_runtime_non_running'),
+    ({'observed_state': 'stopped'}, 'etat_runtime_non_running'),
+    ({'reconciliation_status': 'drift'}, 'reconciliation_non_conforme'),
+])
+def test_success_evidence_rejects_mismatched_runtime(admin_catalogue, mutation, expected_reason):
+    _deployment('awaiting_claim')
+    if mutation.get('reference_version_id') == 'keep-v2':
+        with main.db() as con:
+            con.execute("""INSERT INTO reference_image_versions(version_id,image_id,version,snapshot_id,state,created_at,published_at)
+                VALUES('keep-v2','keep-ref','2','snap','published',?,?)""", (main.now_iso(), main.now_iso()))
+    if mutation.get('node_id') == 'node-b':
+        stamp = main.now_iso()
+        with main.db() as con:
+            con.execute("INSERT INTO nodes(node_id,name,mode,status,created_at,updated_at) VALUES('node-b','NODE B','remote','online',?,?)", (stamp, stamp))
+    _operational_appbox(
+        node_id=mutation.get('node_id', 'node-a'),
+        reference_version_id=mutation.get('reference_version_id', 'keep-v1'),
+        desired_state=mutation.get('desired_state', 'running'),
+        observed_state=mutation.get('observed_state', 'running'),
+        reconciliation_status=mutation.get('reconciliation_status', 'in_sync'),
+    )
+    _attach_deployment()
+    with main.db() as con:
+        deployment = dict(con.execute("SELECT * FROM control_plane_deployments WHERE deployment_id='dep'").fetchone())
+        evidence = main.deployment_success_evidence(con, deployment)
+    assert evidence['eligible'] is False and evidence['reason'] == expected_reason
+    assert admin_catalogue.post('/deployments/dep/reconcile-success').status_code == 409
+
+
+@pytest.mark.parametrize('activity_kind', ['job', 'command'])
+def test_exact_active_activity_blocks_success_reconciliation(admin_catalogue, activity_kind):
+    _deployment('awaiting_claim')
+    _operational_appbox()
+    _attach_deployment()
+    stamp = main.now_iso()
+    with main.db() as con:
+        if activity_kind == 'job':
+            con.execute("""INSERT INTO jobs(job_id,client_id,node_id,action,title,status,created_at,updated_at,options_json)
+                VALUES('active','client-ok','node-a','deploy','Deploy','running',?,?,?)""",
+                (stamp, stamp, json.dumps({'deployment_id': 'dep'})))
+        else:
+            con.execute("""INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,created_at)
+                VALUES('active','node-a','appbox_action',?,'claimed',?)""",
+                (json.dumps({'deployment_id': 'dep', 'client_id': 'client-ok', 'action': 'deploy'}), stamp))
+    assert admin_catalogue.post('/deployments/dep/reconcile-success').status_code == 409
+
+
+def test_unrelated_activity_does_not_block_success_reconciliation(admin_catalogue):
+    _deployment('awaiting_claim')
+    _operational_appbox()
+    _attach_deployment()
+    stamp = main.now_iso()
+    with main.db() as con:
+        con.execute("""INSERT INTO jobs(job_id,client_id,node_id,action,title,status,created_at,updated_at,options_json)
+            VALUES('other-job','client-ok','node-a','deploy','Other deploy','running',?,?,?)""",
+            (stamp, stamp, json.dumps({'deployment_id': 'another-deployment'})))
+        con.execute("""INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,created_at)
+            VALUES('restart','node-a','appbox_action',?,'claimed',?)""",
+            (json.dumps({'client_id': 'client-ok', 'action': 'restart'}), stamp))
+    assert admin_catalogue.post('/deployments/dep/reconcile-success', follow_redirects=False).status_code == 303
+
+
+def test_cancel_refuses_success_evidence_and_terminal_failure_cannot_be_reconciled(admin_catalogue):
+    _deployment('awaiting_claim')
+    _operational_appbox()
+    _attach_deployment()
+    assert admin_catalogue.post('/deployments/dep/cancel').status_code == 409
+    with main.db() as con:
+        con.execute("UPDATE control_plane_deployments SET status='failed' WHERE deployment_id='dep'")
+    assert admin_catalogue.post('/deployments/dep/reconcile-success').status_code == 409
+
+
+def test_planned_deployment_is_never_inferred_success(admin_catalogue):
+    _deployment('planned')
+    _operational_appbox()
+    _attach_deployment(status='planned')
+    assert admin_catalogue.post('/deployments/dep/reconcile-success').status_code == 409
+
+
+def test_bulk_preview_and_cancel_only_true_obsolete_zombies(admin_catalogue):
+    _deployment('prepared', deployment_id='obsolete')
+    _deployment('deploying', deployment_id='golden-evidence')
+    _deployment('awaiting_claim', deployment_id='p0-evidence')
+    _operational_appbox(client_id='golden-test-orion')
+    _operational_appbox(client_id='p0e2e01')
+    _attach_deployment('golden-test-orion', deployment_id='golden-evidence', status='deploying')
+    _attach_deployment('p0e2e01', deployment_id='p0-evidence', status='awaiting_claim')
+    _deployment('prepared', deployment_id='active-job')
+    stamp = main.now_iso()
+    with main.db() as con:
+        con.execute("""INSERT INTO jobs(job_id,node_id,action,title,status,created_at,updated_at,options_json)
+            VALUES('busy','node-a','deploy','Busy','running',?,?,?)""",
+            (stamp, stamp, json.dumps({'deployment_id': 'active-job'})))
+        before_boxes = [tuple(row) for row in con.execute(
+            "SELECT * FROM appboxes WHERE client_id IN ('golden-test-orion','p0e2e01') ORDER BY client_id"
+        )]
+        before_reference = tuple(con.execute("SELECT * FROM reference_images WHERE image_id='keep-ref'").fetchone())
+    html = admin_catalogue.get('/deployments').text
+    assert 'Historique obsolète (1)' in html and 'obsolete' in html
+    assert 'Prévisualiser la clôture en masse' in html
+    assert admin_catalogue.post('/deployments/actions/cancel-obsolete').status_code == 400
+    assert admin_catalogue.post('/deployments/actions/cancel-obsolete', data={'confirmed': 'true'}, follow_redirects=False).status_code == 303
+    with main.db() as con:
+        states = dict(con.execute("SELECT deployment_id,status FROM control_plane_deployments"))
+        assert states == {
+            'obsolete': 'cancelled', 'golden-evidence': 'deploying',
+            'p0-evidence': 'awaiting_claim', 'active-job': 'prepared',
+        }
+        assert [tuple(row) for row in con.execute(
+            "SELECT * FROM appboxes WHERE client_id IN ('golden-test-orion','p0e2e01') ORDER BY client_id"
+        )] == before_boxes
+        assert tuple(con.execute("SELECT * FROM reference_images WHERE image_id='keep-ref'").fetchone()) == before_reference
+        assert con.execute("SELECT COUNT(*) FROM agent_commands").fetchone()[0] == 0
+        audit = con.execute("SELECT detail FROM audit_log WHERE action='control_plane_deployments_bulk_cancelled'").fetchone()
+        assert json.loads(audit['detail'])['deployment_ids'] == ['obsolete']
+
+
+def test_deployments_ui_sections_and_long_detail_disclosure(admin_catalogue):
+    _deployment('prepared', deployment_id='old')
+    _deployment('success', deployment_id='done')
+    long_detail = 'Downloading...\n' * 40
+    with main.db() as con:
+        con.execute("UPDATE control_plane_deployments SET detail=? WHERE deployment_id='old'", (long_detail,))
+    html = admin_catalogue.get('/deployments').text
+    assert 'À traiter' in html and 'Terminés (1)' in html and 'Historique obsolète (1)' in html
+    assert '<details class="card section-block"><summary><strong>Terminés (1)' in html
+    assert '<details class="card section-block"><summary><strong>Historique obsolète (1)' in html
+    assert 'Afficher les détails' in html
+    assert long_detail.strip() in html
+
+
 @pytest.mark.parametrize('status,completed_at', [
     ('prepared', None),
     ('deploying', '2026-01-01T00:00:00+00:00'),

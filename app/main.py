@@ -61,6 +61,9 @@ DEPLOYMENT_ACTIVE_STATUSES = frozenset({
     "planned", "queued", "preparing", "prepared", "deploying", "running",
     "restoring", "awaiting_claim",
 })
+DEPLOYMENT_RECONCILABLE_STATUSES = frozenset({
+    "preparing", "prepared", "deploying", "running", "awaiting_claim",
+})
 JOB_ACTIVE_STATUSES = frozenset({'queued', 'running'})
 JOB_TERMINAL_STATUSES = frozenset({'success', 'failed', 'cancelled', 'error'})  # error is legacy-only
 COMMAND_TERMINAL_STATUSES = frozenset({'success', 'failed', 'cancelled'})
@@ -6104,6 +6107,14 @@ def deployments_page(request: Request):
         """).fetchall()]
         for deployment in deployments:
             _decorate_deployment(con, deployment)
+        obsolete_deployments = [item for item in deployments if item["bulk_cancel_eligible"]]
+        completed_deployments = [item for item in deployments if item["lifecycle_state"] == "terminal"]
+        attention_deployments = [
+            item for item in deployments
+            if item["lifecycle_state"] != "terminal" and not item["bulk_cancel_eligible"]
+        ]
+        attention_priority = {"reconcilable": 0, "inconsistent": 1, "stale": 2, "active": 3}
+        attention_deployments.sort(key=lambda item: attention_priority[item["lifecycle_state"]])
         decisions = [dict(row) for row in con.execute("""
             SELECT p.*,n.name AS selected_node_name
             FROM placement_decisions p
@@ -6114,6 +6125,9 @@ def deployments_page(request: Request):
         "mode": APPBOX_MODE,
         "hostname": HOSTNAME,
         "deployments": deployments,
+        "attention_deployments": attention_deployments,
+        "completed_deployments": completed_deployments,
+        "obsolete_deployments": obsolete_deployments,
         "decisions": decisions,
         "active_page": "deployments",
     })
@@ -6149,8 +6163,6 @@ def _deployment_related_activity(con: sqlite3.Connection, deployment: dict[str, 
             activity.append(f"job:{row['job_id']}:{row['status']}")
     for row in con.execute("""SELECT command_id,node_id,command_type,status,created_at,payload_json
             FROM agent_commands WHERE status IN ('queued','offered','claimed')"""):
-        if deployment.get("node_id") and row["node_id"] != deployment["node_id"]:
-            continue
         try:
             payload = json.loads(row["payload_json"] or "{}")
         except (TypeError, ValueError):
@@ -6159,6 +6171,7 @@ def _deployment_related_activity(con: sqlite3.Connection, deployment: dict[str, 
         legacy = (
             not payload.get("deployment_id") and row["command_type"] == "appbox_action"
             and payload.get("action") == "deploy" and client_id
+            and row["node_id"] == deployment.get("node_id")
             and payload.get("client_id") == client_id
             and legacy_owner(payload.get("client_id"), row["node_id"], row["created_at"]) == deployment_id
         )
@@ -6167,28 +6180,127 @@ def _deployment_related_activity(con: sqlite3.Connection, deployment: dict[str, 
     return activity
 
 
+def _deployment_appbox(con: sqlite3.Connection, deployment: dict[str, Any]) -> dict[str, Any] | None:
+    client_id = deployment.get("client_id")
+    if not client_id:
+        return None
+    row = con.execute("""SELECT client_id,node_id,status,desired_state,observed_state,
+            reconciliation_status,reference_image_id,reference_version_id
+        FROM appboxes WHERE client_id=?""", (client_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def deployment_success_evidence(
+    con: sqlite3.Connection,
+    deployment: dict[str, Any],
+    related_activity: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return strong, local-only evidence that an incomplete deployment succeeded."""
+    status = str(deployment.get("status") or "")
+    if status not in DEPLOYMENT_RECONCILABLE_STATUSES:
+        return {"eligible": False, "reason": "status_source_non_regulisable", "appbox": None}
+    appbox = _deployment_appbox(con, deployment)
+    if not appbox:
+        return {"eligible": False, "reason": "appbox_absente", "appbox": None}
+    if appbox.get("node_id") != deployment.get("node_id"):
+        return {"eligible": False, "reason": "node_different", "appbox": appbox}
+    if appbox.get("status") != "running":
+        return {"eligible": False, "reason": "appbox_non_operationnelle", "appbox": appbox}
+    if appbox.get("desired_state") != "running" or appbox.get("observed_state") != "running":
+        return {"eligible": False, "reason": "etat_runtime_non_running", "appbox": appbox}
+    if appbox.get("reconciliation_status") != "in_sync":
+        return {"eligible": False, "reason": "reconciliation_non_conforme", "appbox": appbox}
+    expected_version = deployment.get("reference_version_id")
+    if expected_version and appbox.get("reference_version_id") != expected_version:
+        return {"eligible": False, "reason": "reference_version_differente", "appbox": appbox}
+    if expected_version:
+        version = con.execute(
+            "SELECT image_id FROM reference_image_versions WHERE version_id=?", (expected_version,),
+        ).fetchone()
+        expected_image = version["image_id"] if version else None
+        actual_image = appbox.get("reference_image_id")
+        if expected_image and actual_image and actual_image != expected_image:
+            return {"eligible": False, "reason": "reference_image_differente", "appbox": appbox}
+    activity = related_activity if related_activity is not None else _deployment_related_activity(con, deployment)
+    if activity:
+        return {"eligible": False, "reason": "activite_associee", "appbox": appbox}
+    return {"eligible": True, "reason": "appbox_running_in_sync", "appbox": appbox}
+
+
+def _deployment_age_seconds(deployment: dict[str, Any]) -> float | None:
+    try:
+        updated = datetime.fromisoformat(deployment.get("updated_at") or deployment["created_at"])
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - updated).total_seconds())
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _decorate_deployment(con: sqlite3.Connection, deployment: dict[str, Any]) -> None:
     active = deployment.get("status") in DEPLOYMENT_ACTIVE_STATUSES
     inconsistent = active and bool(deployment.get("completed_at"))
     activity = _deployment_related_activity(con, deployment) if active else []
-    stale = False
-    if active and not activity:
-        try:
-            updated = datetime.fromisoformat(deployment.get("updated_at") or deployment["created_at"])
-            if updated.tzinfo is None:
-                updated = updated.replace(tzinfo=timezone.utc)
-            stale = (datetime.now(timezone.utc) - updated).total_seconds() >= DEPLOYMENT_STALE_SECONDS
-        except (TypeError, ValueError):
-            stale = True
+    age_seconds = _deployment_age_seconds(deployment)
+    stale = active and not activity and (age_seconds is None or age_seconds >= DEPLOYMENT_STALE_SECONDS)
+    evidence = deployment_success_evidence(con, deployment, activity) if active else {
+        "eligible": False, "reason": "deployment_terminal", "appbox": None,
+    }
+    appbox = evidence.get("appbox") or (_deployment_appbox(con, deployment) if active else None)
+    appbox_operational = bool(appbox and appbox.get("status") == "running")
     deployment["related_activity"] = activity
     deployment["lifecycle_state"] = (
+        "reconcilable" if evidence["eligible"] else
         "inconsistent" if inconsistent else "stale" if stale else "active" if active else "terminal"
     )
     deployment["lifecycle_label"] = {
-        "inconsistent": "INCOHÉRENT", "stale": "STALE", "active": "ACTIF", "terminal": "TERMINÉ",
+        "reconcilable": "À RÉGULARISER", "inconsistent": "INCOHÉRENT",
+        "stale": "STALE", "active": "ACTIF", "terminal": "TERMINÉ",
     }[deployment["lifecycle_state"]]
     deployment["status_label"] = "ANNULÉ" if deployment.get("status") == "cancelled" else str(deployment.get("status") or "unknown").upper()
-    deployment["closable"] = active and not activity and (stale or inconsistent)
+    deployment["reconcilable"] = bool(evidence["eligible"])
+    deployment["success_evidence_reason"] = evidence["reason"]
+    deployment["closable"] = active and not activity and (stale or inconsistent) and not evidence["eligible"]
+    deployment["bulk_cancel_eligible"] = bool(
+        deployment["closable"] and age_seconds is not None
+        and age_seconds >= DEPLOYMENT_STALE_SECONDS and not appbox_operational
+    )
+    deployment["age_seconds"] = int(age_seconds) if age_seconds is not None else None
+    detail = str(deployment.get("detail") or "")
+    deployment["detail_preview"] = detail[:240] + ("…" if len(detail) > 240 else "")
+    deployment["detail_truncated"] = len(detail) > 240 or "\n" in detail
+
+
+@app.post("/deployments/{deployment_id}/reconcile-success")
+def reconcile_control_plane_deployment_success(deployment_id: str):
+    stamp = now_iso()
+    with db_lock, immediate_transaction() as con:
+        row = con.execute("SELECT * FROM control_plane_deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Déploiement introuvable.")
+        deployment = dict(row)
+        if deployment["status"] in {"success", "completed"}:
+            return RedirectResponse("/deployments", status_code=303)
+        if deployment["status"] not in DEPLOYMENT_ACTIVE_STATUSES:
+            raise HTTPException(409, "Un déploiement terminal en échec ou annulé ne peut pas être régularisé.")
+        activity = _deployment_related_activity(con, deployment)
+        evidence = deployment_success_evidence(con, deployment, activity)
+        if not evidence["eligible"]:
+            raise HTTPException(409, f"Preuves de réussite insuffisantes : {evidence['reason']}.")
+        detail = "Déploiement régularisé depuis l’état observé de l’AppBox."
+        changed = con.execute("""UPDATE control_plane_deployments
+            SET status='success',current_step='reconciled',progress=100,
+                detail=CASE WHEN detail IS NULL OR detail='' THEN ? ELSE detail || char(10) || ? END,
+                completed_at=COALESCE(completed_at,?),updated_at=?
+            WHERE deployment_id=? AND status IN ('preparing','prepared','deploying','running','awaiting_claim')""",
+            (detail, detail, stamp, stamp, deployment_id)).rowcount
+        if changed != 1:
+            raise HTTPException(409, "Le déploiement a changé pendant la régularisation.")
+        con.execute("""INSERT INTO audit_log(actor,action,client_id,node_id,result,detail,created_at)
+            VALUES('admin','control_plane_deployment_reconciled',?,?, 'success',?,?)""",
+            (deployment.get("client_id"), deployment.get("node_id"),
+             json.dumps({"deployment_id": deployment_id, "evidence": evidence["reason"]}, ensure_ascii=False), stamp))
+    return RedirectResponse("/deployments", status_code=303)
 
 
 @app.post("/deployments/{deployment_id}/cancel")
@@ -6202,17 +6314,49 @@ def cancel_control_plane_deployment(deployment_id: str):
         if deployment["status"] not in DEPLOYMENT_ACTIVE_STATUSES:
             return RedirectResponse("/deployments", status_code=303)
         _decorate_deployment(con, deployment)
+        if deployment["reconcilable"]:
+            raise HTTPException(409, "Ce déploiement possède des preuves fortes de réussite ; régularisez-le comme terminé.")
         if deployment["related_activity"]:
             raise HTTPException(409, "Ce déploiement possède encore un job ou une commande agent active.")
         if not deployment["closable"]:
             raise HTTPException(409, "Ce déploiement est encore récent et cohérent ; sa clôture est refusée.")
+        cancel_detail = 'Clôturé manuellement sans action distante.'
         con.execute("""UPDATE control_plane_deployments SET status='cancelled',current_step='cancelled',
-            detail='Clôturé manuellement sans action distante.',completed_at=?,updated_at=?
+            detail=CASE WHEN detail IS NULL OR detail='' THEN ? ELSE detail || char(10) || ? END,
+            completed_at=?,updated_at=?
             WHERE deployment_id=? AND status IN ('planned','queued','preparing','prepared','deploying','running','restoring','awaiting_claim')""",
-            (stamp, stamp, deployment_id))
+            (cancel_detail, cancel_detail, stamp, stamp, deployment_id))
         con.execute("""INSERT INTO audit_log(actor,action,result,detail,created_at)
             VALUES('admin','control_plane_deployment_cancelled','success',?,?)""",
             (json.dumps({"deployment_id": deployment_id}, ensure_ascii=False), stamp))
+    return RedirectResponse("/deployments", status_code=303)
+
+
+@app.post("/deployments/actions/cancel-obsolete")
+def cancel_obsolete_control_plane_deployments(confirmed: str = Form("")):
+    if confirmed != "true":
+        raise HTTPException(400, "Confirmation explicite requise.")
+    stamp = now_iso()
+    cancelled: list[str] = []
+    with db_lock, immediate_transaction() as con:
+        rows = con.execute("SELECT * FROM control_plane_deployments ORDER BY created_at DESC").fetchall()
+        for row in rows:
+            deployment = dict(row)
+            _decorate_deployment(con, deployment)
+            if not deployment["bulk_cancel_eligible"]:
+                continue
+            cancel_detail = 'Opération historique obsolète clôturée manuellement, sans action distante.'
+            changed = con.execute("""UPDATE control_plane_deployments
+                SET status='cancelled',current_step='cancelled',
+                    detail=CASE WHEN detail IS NULL OR detail='' THEN ? ELSE detail || char(10) || ? END,
+                    completed_at=COALESCE(completed_at,?),updated_at=?
+                WHERE deployment_id=? AND status IN ('planned','queued','preparing','prepared','deploying','running','restoring','awaiting_claim')""",
+                (cancel_detail, cancel_detail, stamp, stamp, deployment["deployment_id"])).rowcount
+            if changed:
+                cancelled.append(deployment["deployment_id"])
+        con.execute("""INSERT INTO audit_log(actor,action,result,detail,created_at)
+            VALUES('admin','control_plane_deployments_bulk_cancelled','success',?,?)""",
+            (json.dumps({"count": len(cancelled), "deployment_ids": cancelled}, ensure_ascii=False), stamp))
     return RedirectResponse("/deployments", status_code=303)
 
 
