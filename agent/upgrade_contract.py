@@ -15,7 +15,7 @@ LAUNCHER_ABI = 1
 MAX_PACKAGE_BYTES = 8 * 1024 * 1024
 FILES = (
     "install-agent.sh", "marinos-appbox-agent.py", "marinos-appbox-agent.service",
-    "reference_contract.py", "upgrade_contract.py", "upgrade_client.py",
+    "reference_contract.py", "rdad_refresh.py", "upgrade_contract.py", "upgrade_client.py",
     "upgrade_helper.py", "marinos-appbox-updater.service", "marinos-appbox-updater.timer",
     "upgrade_launcher.py", "managed-agent.service",
 )

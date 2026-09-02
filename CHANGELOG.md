@@ -2,6 +2,13 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Refresh RDAD ciblé multi-node
+- Nouveau moteur Python versionné dans l’agent : découverte locale des AppBox Plex par labels officiels, endpoint et `/config` résolus depuis Docker, token jamais journalisé et sections déterminées par leurs Locations `/data` plutôt que par IDs ou titres.
+- Files persistantes indépendantes adressées par identité node/client/conteneur, déduplication et timestamps, lecture FUSE réelle, defer/retry Plex busy ou indisponible, isolation complète entre AppBox et conservation explicite des queues orphelines.
+- Boucle agent indépendante sans nouvelle unité systemd. Le moteur reste inactif tant que le timer/service historique `sync-decypharr-catalogs` fonctionne, puis prend le relais après bascule opérateur; compatibilité temporaire isolée pour `plex-appb-34ah`.
+- Cadences séparées : les queues restent traitées toutes les 60 s tandis que le scan catalogue partagé est limité à 300 s par défaut, avec baseline immédiat pour toute nouvelle cible et zéro parcours catalogue sur un node sans AppBox Plex locale.
+- Package agent régénéré avec `rdad_refresh.py`; architecture, canary, second node, rollback et interface du futur watchdog documentés dans `docs/rdad-targeted-refresh.md`.
+
 ### Lifecycle du catalogue de références
 - Les déploiements historiques réellement aboutis peuvent être régularisés volontairement en `success` à partir de preuves fortes sur l’AppBox (même node et référence, runtime running/in_sync, aucune activité corrélée). Les vrais zombies restent annulables séparément, à l’unité ou après une prévisualisation bulk restrictive ; aucune action distante ni réécriture automatique au démarrage.
 - La page Déploiements sépare les éléments à traiter, les terminés et l’historique obsolète dans des sections repliables. Les longs détails sont tronqués dans la carte et restent intégralement consultables.

@@ -34,6 +34,11 @@ try:
 except ModuleNotFoundError:
     from upgrade_client import runtime_identity, stage_upgrade
 
+try:
+    from agent.rdad_refresh import TargetedRefreshEngine
+except ModuleNotFoundError:
+    from rdad_refresh import TargetedRefreshEngine
+
 # Capture once: resolving current again after activation would misidentify this process.
 RUNTIME_IDENTITY = runtime_identity(__file__)
 
@@ -2418,6 +2423,7 @@ class AgentLoops:
         self.heartbeat_interval = min(60, max(1, float(config.get('heartbeat_interval', 60))))
         self.inventory_interval = max(1, float(config.get('inventory_interval', 30)))
         self.command_interval = max(0.1, float(config.get('command_poll_interval', 2)))
+        self.rdad_refresh_interval = max(5, float(config.get('rdad_refresh_interval', 60)))
 
     def report_error(self, loop, exc):
         # Never print HTTP bodies (which may contain credentials).
@@ -2472,6 +2478,15 @@ class AgentLoops:
                 self.report_error('command', exc)
             self.stop.wait(self.command_interval)
 
+    def rdad_refresh_loop(self):
+        engine = TargetedRefreshEngine(self.config)
+        while not self.stop.is_set():
+            try:
+                engine.run_cycle()
+            except Exception as exc:
+                self.report_error('rdad-refresh', exc)
+            self.stop.wait(self.rdad_refresh_interval)
+
     def begin_command(self, command_id):
         with self.lock:
             self.active_command_id = str(command_id)
@@ -2484,8 +2499,15 @@ class AgentLoops:
                 self.cancel_event = Event()
 
     def run(self):
-        workers = [Thread(target=target, name=name, daemon=True) for name, target in (
-            ('agent-heartbeat', self.heartbeat_loop), ('agent-telemetry', self.telemetry_loop))]
+        background = [
+            ('agent-heartbeat', self.heartbeat_loop),
+            ('agent-telemetry', self.telemetry_loop),
+        ]
+        # The real node runtime is POSIX. Tests and diagnostic imports on other
+        # platforms start this loop only when explicitly requested.
+        if os.name == 'posix' or 'rdad_refresh_enabled' in self.config:
+            background.append(('agent-rdad-refresh', self.rdad_refresh_loop))
+        workers = [Thread(target=target, name=name, daemon=True) for name, target in background]
         for worker in workers:
             worker.start()
         try:

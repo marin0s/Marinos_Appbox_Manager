@@ -15,6 +15,18 @@ from app import main
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_rdad_refresh_has_an_independent_agent_loop(self):
+        loops = agent.AgentLoops({'node_id':'test', 'rdad_refresh_enabled':True, 'rdad_refresh_interval':1})
+        cycles = []
+        class Engine:
+            def __init__(self, config): self.config = config
+            def run_cycle(self):
+                cycles.append(self.config['node_id'])
+                loops.stop.set()
+        with patch.object(agent, 'TargetedRefreshEngine', Engine):
+            loops.rdad_refresh_loop()
+        self.assertEqual(cycles, ['test'])
+
     def test_heartbeat_does_not_collect_or_send_metrics(self):
         with patch.object(agent, 'collect_metrics', side_effect=AssertionError('heavy work')), patch.object(agent, 'api', return_value={}) as api:
             agent.heartbeat({'node_id':'test'}, {'docker_ok':True, 'cpu_count':8})

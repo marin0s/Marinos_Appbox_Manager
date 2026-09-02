@@ -77,7 +77,8 @@ def read_legacy(legacy):
     """Read only installed runtime files; missing optional modules are not synthesized."""
     legacy = Path(legacy)
     contents = {}
-    for name in ("marinos-appbox-agent.py", "reference_contract.py", "upgrade_client.py", "upgrade_contract.py"):
+    for name in ("marinos-appbox-agent.py", "reference_contract.py", "rdad_refresh.py",
+                 "upgrade_client.py", "upgrade_contract.py"):
         path = legacy / name
         try:
             info = path.lstat()
