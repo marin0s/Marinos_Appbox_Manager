@@ -1,7 +1,12 @@
 import json
+import hashlib
+import shutil
+import sqlite3
+import tarfile
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import main
@@ -146,3 +151,132 @@ def test_reference_layout_has_mobile_breakpoint():
     js=(Path(__file__).parents[1]/'app/static/app.js').read_text(encoding='utf-8')
     assert '@media(max-width:620px)' in css
     assert 'data-reference-wizard' in js and 'reportValidity' in js
+
+
+def test_reference_retire_hides_catalogue_preserves_dependencies_and_republishes(lifecycle):
+    client, make = lifecycle
+    version_id = make()[0]
+    with main.db() as con:
+        checksum_before = con.execute("SELECT checksum FROM reference_image_versions WHERE version_id=?", (version_id,)).fetchone()[0]
+        stamp = main.now_iso()
+        con.execute("""INSERT INTO appboxes(client_id,node_id,path,status,containers_json,reference_image_id,
+            reference_version_id,created_at,updated_at) VALUES('existing-box','uxnode','/tmp/existing','running','[]',
+            'plex-one',?,?,?)""", (version_id, stamp, stamp))
+    assert client.post('/reference-images/plex-one/retire', data={}).status_code == 400
+    response = client.post('/reference-images/plex-one/retire', data={'confirmed':'true'}, follow_redirects=False)
+    assert response.status_code == 303
+    assert all(item.get('reference_version_id') != version_id for item in main.deployment_images('plex'))
+    assert client.post('/reference-images/plex-one/retire', data={'confirmed':'true'}, follow_redirects=False).status_code == 303
+    with pytest.raises(HTTPException) as exc:
+        main.parse_deployment_image(f'reference:{version_id}', 'plex')
+    assert exc.value.status_code == 409
+    with main.db() as con:
+        image = con.execute("SELECT status,current_version_id FROM reference_images WHERE image_id='plex-one'").fetchone()
+        box = con.execute("SELECT status,reference_version_id FROM appboxes WHERE client_id='existing-box'").fetchone()
+    assert tuple(image) == ('retired', version_id)
+    assert tuple(box) == ('running', version_id)
+    assert client.post('/reference-images/plex-one/republish', data={'confirmed':'true'}, follow_redirects=False).status_code == 303
+    with main.db() as con:
+        image = con.execute("SELECT status,current_version_id FROM reference_images WHERE image_id='plex-one'").fetchone()
+        checksum_after = con.execute("SELECT checksum FROM reference_image_versions WHERE version_id=?", (version_id,)).fetchone()[0]
+    assert tuple(image) == ('published', version_id) and checksum_after == checksum_before
+
+
+def test_retired_delete_preflight_and_ui_actions(lifecycle):
+    client, make = lifecycle
+    make()
+    client.post('/reference-images/plex-one/retire', data={'confirmed':'true'})
+    preview = client.get('/api/reference-images/plex-one/deletion').json()
+    assert not any('active/publiée' in item for item in preview['blockers'])
+    html = client.get('/reference-images/plex-one').text
+    assert 'RETIRÉE' in html and 'Republier' in html and 'Supprimer définitivement' in html
+
+
+def test_retire_is_catalogue_only_and_preserves_archive_cache_and_version_state(lifecycle):
+    client, make = lifecycle
+    version_id = make()[0]
+    archive = main.REFERENCE_ROOT / 'preserved.tar.gz'
+    archive.write_bytes(b'preserved bytes')
+    stamp = main.now_iso()
+    with main.db() as con:
+        con.execute("UPDATE reference_image_versions SET archive_path=?,checksum=? WHERE version_id=?",
+                    (str(archive), hashlib.sha256(archive.read_bytes()).hexdigest(), version_id))
+        con.execute("""INSERT INTO node_reference_cache(node_id,version_id,local_path,checksum,status,size_bytes,updated_at)
+            VALUES('uxnode',?,'/agent/cache.tar.gz',?,'ready',10,?)""", (version_id, 'a'*64, stamp))
+    assert client.post('/reference-images/plex-one/retire', data={'confirmed':'true'}, follow_redirects=False).status_code == 303
+    assert archive.read_bytes() == b'preserved bytes'
+    with main.db() as con:
+        assert con.execute("SELECT state FROM reference_image_versions WHERE version_id=?", (version_id,)).fetchone()[0] == 'published'
+        assert con.execute("SELECT 1 FROM node_reference_cache WHERE node_id='uxnode' AND version_id=?", (version_id,)).fetchone()
+
+
+def test_republish_rejects_missing_current_archive_and_source(lifecycle):
+    client, make = lifecycle
+    version_id = make()[0]
+    client.post('/reference-images/plex-one/retire', data={'confirmed':'true'})
+    with main.db() as con:
+        source = Path(con.execute("""SELECT s.source_path FROM reference_image_versions v
+            JOIN catalog_snapshots s ON s.snapshot_id=v.snapshot_id WHERE v.version_id=?""", (version_id,)).fetchone()[0])
+    source.rmdir()
+    response = client.post('/reference-images/plex-one/republish', data={'confirmed':'true'})
+    assert response.status_code == 409
+
+
+def test_republish_accepts_immutable_archive_without_source(lifecycle):
+    client, make = lifecycle
+    version_id = make()[0]
+    with main.db() as con:
+        source = Path(con.execute("""SELECT s.source_path FROM reference_image_versions v
+            JOIN catalog_snapshots s ON s.snapshot_id=v.snapshot_id WHERE v.version_id=?""", (version_id,)).fetchone()[0])
+    plex = source / 'Library' / 'Application Support' / 'Plex Media Server'
+    (plex / 'Metadata').mkdir(parents=True)
+    (plex / 'Media').mkdir()
+    database = plex / 'Plug-in Support' / 'Databases' / 'com.plexapp.plugins.library.db'
+    database.parent.mkdir(parents=True)
+    database_connection = sqlite3.connect(database)
+    try:
+        con = database_connection
+        con.execute('CREATE TABLE metadata_items(id INTEGER PRIMARY KEY)')
+        con.commit()
+    finally:
+        database_connection.close()
+    (plex / 'Preferences.xml').write_text('<Preferences/>', encoding='utf-8')
+    archive = main.REFERENCE_ROOT / 'archive-only.tar.gz'
+    with tarfile.open(archive, 'w:gz') as output:
+        output.add(source / 'Library', arcname='Library')
+    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+    with main.db() as con:
+        con.execute("UPDATE reference_image_versions SET archive_path=?,checksum=? WHERE version_id=?", (str(archive), checksum, version_id))
+    shutil.rmtree(source)
+    client.post('/reference-images/plex-one/retire', data={'confirmed':'true'})
+    assert client.post('/reference-images/plex-one/republish', data={'confirmed':'true'}, follow_redirects=False).status_code == 303
+    assert main.parse_deployment_image(f'reference:{version_id}', 'plex') == ('plex-one', version_id)
+
+
+def test_republish_rejects_missing_current_and_corrupt_archive(lifecycle):
+    client, make = lifecycle
+    version_id = make()[0]
+    client.post('/reference-images/plex-one/retire', data={'confirmed':'true'})
+    with main.db() as con:
+        con.execute("UPDATE reference_images SET current_version_id=NULL WHERE image_id='plex-one'")
+    assert client.post('/reference-images/plex-one/republish', data={'confirmed':'true'}).status_code == 409
+    with main.db() as con:
+        con.execute("UPDATE reference_images SET current_version_id=? WHERE image_id='plex-one'", (version_id,))
+        source = Path(con.execute("""SELECT s.source_path FROM reference_image_versions v JOIN catalog_snapshots s
+            ON s.snapshot_id=v.snapshot_id WHERE v.version_id=?""", (version_id,)).fetchone()[0])
+    archive = main.REFERENCE_ROOT / 'corrupt.tar.gz'
+    archive.write_bytes(b'not a tar archive')
+    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+    shutil.rmtree(source)
+    with main.db() as con:
+        con.execute("UPDATE reference_image_versions SET archive_path=?,checksum=? WHERE version_id=?", (str(archive), checksum, version_id))
+    assert client.post('/reference-images/plex-one/republish', data={'confirmed':'true'}).status_code == 409
+
+
+def test_republish_already_published_is_idempotent(lifecycle):
+    client, make = lifecycle
+    version_id = make()[0]
+    response = client.post('/reference-images/plex-one/republish', data={'confirmed':'true'}, follow_redirects=False)
+    assert response.status_code == 303
+    with main.db() as con:
+        assert tuple(con.execute("SELECT status,current_version_id FROM reference_images WHERE image_id='plex-one'").fetchone()) == ('published', version_id)

@@ -87,23 +87,17 @@ def test_multiple_versions_artifacts_cache_and_audit(catalogue, monkeypatch):
 
 
 @pytest.mark.parametrize('fields', [{'reference_image_id': 'image'}, {'reference_version_id': 'v1'}, {'snapshot_id': 's1'}])
-def test_appbox_is_autonomous_and_preserved_in_plan(catalogue, fields):
-    files = catalogue(1)
+def test_appbox_dependency_blocks_catalogue_deletion(catalogue, fields):
+    catalogue(1)
     with main.db() as con:
         appbox(con, **fields)
     preview = deletion.preview('image')
-    assert not preview['blockers']
-    assert any('AppBox autonome' in item for item in preview['preserved'])
+    assert any('AppBox dépendante : ab-test' in item for item in preview['blockers'])
     response = TestClient(main.app).get('/reference-images/image/delete')
     assert response.status_code == 200
     assert 'Plex Test' in response.text and '1 version(s)' in response.text
-    assert 'Éléments conservés' in response.text and 'AppBox autonome' in response.text
-    assert 'type="submit"' in response.text
-    deletion.delete('image', preview['confirmation'], confirmed_name='Plex Test')
-    assert not any(file.exists() for file in files)
-    with main.db() as con:
-        detached=con.execute("SELECT reference_image_id,reference_version_id,snapshot_id FROM appboxes WHERE client_id='ab-test'").fetchone()
-    assert tuple(detached)==(None,None,None)
+    assert 'AppBox dépendante' in response.text
+    assert 'type="submit"' not in response.text
 
 
 @pytest.mark.parametrize('status,blocked', [('planned',True),('running',True),('success',False),('failed',False)])
@@ -425,3 +419,122 @@ def test_version_deletion_serializes_other_deletions_for_same_image(catalogue,tm
         deletion.delete('image',image_plan['confirmation'],confirmed_name='Plex Test')
     with main.db() as con:
         assert con.execute("SELECT COUNT(*) FROM reference_image_deletions").fetchone()[0]==1
+
+
+def test_manual_cache_purge_online_is_scoped_idempotent_and_preserves_catalogue(catalogue,tmp_path,monkeypatch):
+    root,cached,_,_ = _online_cache(catalogue,tmp_path,monkeypatch)
+    stamp=main.now_iso()
+    with main.db() as con:
+        appbox(con, reference_version_id='v1')
+        con.execute("INSERT INTO nodes(node_id,name,mode,status,created_at,updated_at) VALUES('node-b','NODE B','remote','online',?,?)", (stamp,stamp))
+        con.execute("""INSERT INTO node_reference_cache(node_id,version_id,local_path,checksum,status,size_bytes,updated_at)
+            VALUES('node-b','v1','/node-b/cache.tar.gz',?,'ready',1,?)""", ('b'*64,stamp))
+    first=deletion.purge_cache(main.HOSTNAME,'v1')
+    assert first['state']=='running' and first['nodes'][0]['status']=='queued'
+    with main.db() as con:
+        command=con.execute("SELECT * FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()
+    payload=json.loads(command['payload_json'])
+    assert payload['local_path']==str(cached)
+    remote=agent.delete_reference_cache({'reference_cache_dir':str(root)},payload)
+    deletion.finalize_remote_command(command,'success',remote,None)
+    second=deletion.purge_cache(main.HOSTNAME,'v1')
+    assert second['state']=='deleted' and second['operation_id']==first['operation_id']
+    assert 'PURGE TERMINÉE' in TestClient(main.app).get('/reference-caches').text
+    with main.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()[0]==1
+        assert con.execute("SELECT status,current_version_id FROM reference_images WHERE image_id='image'").fetchone()[1] is None
+        assert con.execute("SELECT 1 FROM reference_image_versions WHERE version_id='v1'").fetchone()
+        assert con.execute("SELECT 1 FROM appboxes WHERE client_id='ab-test'").fetchone()
+        assert con.execute("SELECT 1 FROM node_reference_cache WHERE node_id='node-b' AND version_id='v1'").fetchone()
+
+
+def test_manual_cache_purge_failure_is_visible_and_blocks_catalogue_delete(catalogue,tmp_path,monkeypatch):
+    _online_cache(catalogue,tmp_path,monkeypatch)
+    operation=deletion.purge_cache(main.HOSTNAME,'v1')
+    with main.db() as con:
+        command=con.execute("SELECT * FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()
+    deletion.finalize_remote_command(command,'failed',{},'permission denied')
+    assert deletion.operation(operation['operation_id'])['state']=='partial'
+    assert any('Purge cache non finalisée' in item for item in deletion.preview('image')['blockers'])
+    assert 'PURGE ÉCHOUÉE' in TestClient(main.app).get('/reference-caches').text
+
+
+def test_manual_cache_purge_resumes_from_real_agent_poll_after_restart(catalogue,tmp_path,monkeypatch):
+    _,cached,_,availability=_online_cache(catalogue,tmp_path,monkeypatch,online=False)
+    pending=deletion.purge_cache(main.HOSTNAME,'v1')
+    assert pending['state']=='purge_pending' and cached.exists()
+    main.init_database()  # Simulated Manager restart/migration on the same durable DB.
+    availability['online']=True
+    monkeypatch.setattr(main,'authenticate_agent',lambda *_: None)
+    response=TestClient(main.app).get(f'/api/agent/v1/{main.HOSTNAME}/commands')
+    assert response.status_code==200
+    command=response.json()['command']
+    assert command['command_type']=='reference_cache_delete'
+    assert command['payload']['operation_id']==pending['operation_id']
+    assert cached.exists()
+
+
+def test_cache_identity_replacement_is_preserved_and_operation_fails(catalogue,tmp_path,monkeypatch):
+    _,cached,_,_=_online_cache(catalogue,tmp_path,monkeypatch)
+    operation=deletion.purge_cache(main.HOSTNAME,'v1')
+    with main.db() as con:
+        command=con.execute("SELECT * FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()
+        con.execute("""UPDATE node_reference_cache SET local_path=?,checksum=?,size_bytes=99,updated_at=?
+            WHERE node_id=? AND version_id='v1'""",('/replacement/B.tar.gz','b'*64,main.now_iso(),main.HOSTNAME))
+    deletion.finalize_remote_command(command,'success',{'cache_absent':True,'output':'A absent'},None)
+    result=deletion.operation(operation['operation_id'])
+    assert result['state']=='partial' and result['phase']=='failed'
+    assert result['error_code']=='cache_identity_changed'
+    with main.db() as con:
+        replacement=con.execute("SELECT local_path,checksum FROM node_reference_cache WHERE node_id=? AND version_id='v1'",(main.HOSTNAME,)).fetchone()
+        assert tuple(replacement)==('/replacement/B.tar.gz','b'*64)
+        assert con.execute("SELECT state FROM reference_image_versions WHERE version_id='v1'").fetchone()[0]=='published'
+    assert cached.exists()
+
+
+@pytest.mark.parametrize('checksum',[None,'not-a-sha'])
+def test_manual_cache_purge_rejects_missing_or_invalid_registered_checksum(catalogue,tmp_path,monkeypatch,checksum):
+    _online_cache(catalogue,tmp_path,monkeypatch)
+    with main.db() as con:
+        con.execute("UPDATE node_reference_cache SET checksum=? WHERE node_id=? AND version_id='v1'",(checksum,main.HOSTNAME))
+    result=deletion.purge_cache(main.HOSTNAME,'v1')
+    assert result['state']=='partial' and result['nodes'][0]['status']=='failed'
+    with main.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM agent_commands WHERE command_type='reference_cache_delete'").fetchone()[0]==0
+
+
+def test_distinct_cache_purges_do_not_collide(catalogue,tmp_path,monkeypatch):
+    _online_cache(catalogue,tmp_path,monkeypatch)
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("INSERT INTO nodes(node_id,name,mode,status,created_at,updated_at) VALUES('node-b','NODE B','remote','online',?,?)",(stamp,stamp))
+        con.execute("""INSERT INTO node_reference_cache(node_id,version_id,local_path,checksum,status,size_bytes,updated_at)
+            VALUES('node-b','v1','/node-b/cache.tar.gz',?,'ready',1,?)""",('b'*64,stamp))
+    first=deletion.purge_cache(main.HOSTNAME,'v1')
+    second=deletion.purge_cache('node-b','v1')
+    assert first['operation_id']!=second['operation_id']
+    with main.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM reference_image_deletions WHERE target_type='cache'").fetchone()[0]==2
+
+
+def test_catalogue_finalizer_is_a_noop_for_cache_operation(catalogue,tmp_path,monkeypatch):
+    _online_cache(catalogue,tmp_path,monkeypatch,online=False)
+    operation=deletion.purge_cache(main.HOSTNAME,'v1')
+    deletion._finish_catalogue(operation['operation_id'])
+    with main.db() as con:
+        assert con.execute("SELECT state FROM reference_image_versions WHERE version_id='v1'").fetchone()[0]=='published'
+        assert con.execute("SELECT 1 FROM reference_images WHERE image_id='image'").fetchone()
+        assert con.execute("SELECT 1 FROM node_reference_cache WHERE node_id=? AND version_id='v1'",(main.HOSTNAME,)).fetchone()
+
+
+def test_manual_purge_refuses_cache_owned_by_catalogue_deletion(catalogue,tmp_path,monkeypatch):
+    _online_cache(catalogue,tmp_path,monkeypatch,online=False)
+    stamp=main.now_iso()
+    with main.db() as con:
+        con.execute("""INSERT INTO reference_image_deletions(deletion_id,image_id,name,version_count,storage_root,
+            manifest_json,state,errors_json,created_at,target_type,target_version_id)
+            VALUES('catalogue-running','image','Plex Test',1,?,'{}','running','[]',?,'version','v1')""",
+            (str(main.REFERENCE_ROOT),stamp))
+    with pytest.raises(HTTPException) as exc:
+        deletion.purge_cache(main.HOSTNAME,'v1')
+    assert exc.value.status_code==409

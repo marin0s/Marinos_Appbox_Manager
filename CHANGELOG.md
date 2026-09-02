@@ -2,6 +2,13 @@
 
 ## 1.6.0-alpha.5 — En développement
 
+### Lifecycle du catalogue de références
+- Une Reference Image publiée peut désormais être retirée du catalogue sans toucher à sa version courante, son archive centrale, ses caches, ses snapshots ni ses AppBox, puis republiée sans rebuild et sans changement de checksum.
+- Les références retirées restent consultables mais sont refusées pour tout nouveau déploiement. Leur suppression définitive réutilise le preflight existant et reste bloquée par toute AppBox, opération, build, distribution ou purge active.
+- La page Déploiements distingue les opérations actives, terminales, anciennes et incohérentes. Une clôture manuelle vers `cancelled` est proposée seulement en l’absence de job ou commande agent active ; l’historique est conservé et aucune action distante n’est lancée.
+- La page dédiée aux caches de références expose les copies par node et leur identité. Une purge manuelle utilise exclusivement `reference_cache_delete`, demeure durable lorsqu’un node est offline et ne modifie jamais le catalogue central ni les AppBox.
+- Le seuil d’ancienneté des déploiements sans activité est configurable par `APPBOX_DEPLOYMENT_STALE_SECONDS` (86 400 s par défaut, minimum 300 s). Documentation : `docs/reference-catalog-operations.md`.
+
 ### Topologie distribuée des Volume Mounts
 - Les définitions `storage_mounts` sont désormais des ressources logiques réutilisables ; leur ancien `node_id` est conservé pour compatibilité mais ne détermine plus la disponibilité.
 - Les agents observent les chemins demandés dans la boucle inventory/metrics indépendante et publient existence, état mountpoint et métadonnées optionnelles. Le heartbeat reste léger et transmet seulement la configuration des chemins à observer.

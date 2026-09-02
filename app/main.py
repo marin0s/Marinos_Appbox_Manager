@@ -56,6 +56,11 @@ APPBOX_COMMAND_MAX_RUNTIME_SECONDS = max(
     APPBOX_COMMAND_LEASE_SECONDS,
     int(os.getenv("APPBOX_COMMAND_MAX_RUNTIME_SECONDS", "7200")),
 )
+DEPLOYMENT_STALE_SECONDS = max(300, int(os.getenv("APPBOX_DEPLOYMENT_STALE_SECONDS", "86400")))
+DEPLOYMENT_ACTIVE_STATUSES = frozenset({
+    "planned", "queued", "preparing", "prepared", "deploying", "running",
+    "restoring", "awaiting_claim",
+})
 JOB_ACTIVE_STATUSES = frozenset({'queued', 'running'})
 JOB_TERMINAL_STATUSES = frozenset({'success', 'failed', 'cancelled', 'error'})  # error is legacy-only
 COMMAND_TERMINAL_STATUSES = frozenset({'success', 'failed', 'cancelled'})
@@ -2922,6 +2927,7 @@ def list_reference_images(media_type: str | None = None) -> list[dict[str, Any]]
                     version.get("source_path")
                     and Path(version["source_path"]).exists()
                 )
+                version["deployment_available"] = _reference_version_available(version)
             image["versions"] = versions
             image["source_available"] = bool(
                 image.get("source_path")
@@ -2949,7 +2955,15 @@ def list_reference_versions(media_type: str | None = None) -> list[dict[str, Any
         row["source_available"] = bool(
             row.get("source_path") and Path(row["source_path"]).exists()
         )
+        row["deployment_available"] = _reference_version_available(row)
     return rows
+
+
+def _reference_version_available(version: dict[str, Any] | sqlite3.Row) -> bool:
+    return bool(
+        (version["archive_path"] and Path(version["archive_path"]).is_file())
+        or (version["source_path"] and Path(version["source_path"]).exists())
+    )
 
 
 def get_reference_image(image_id: str) -> dict[str, Any] | None:
@@ -2961,7 +2975,7 @@ def get_reference_version(version_id: str | None) -> dict[str, Any] | None:
         return None
     with db() as con:
         row = con.execute("""
-            SELECT v.*,i.name AS image_name,i.media_type,
+            SELECT v.*,i.name AS image_name,i.media_type,i.status AS image_status,
                    s.source_path,s.status AS snapshot_status
             FROM reference_image_versions v
             JOIN reference_images i ON i.image_id=v.image_id
@@ -2974,6 +2988,7 @@ def get_reference_version(version_id: str | None) -> dict[str, Any] | None:
     result["source_available"] = bool(
         result.get("source_path") and Path(result["source_path"]).exists()
     )
+    result["deployment_available"] = _reference_version_available(result)
     return result
 
 
@@ -3266,7 +3281,7 @@ def deployment_images(media_type: str | None = None) -> list[dict[str, Any]]:
             "name": version["image_name"],
             "version": version["version"],
             "reference_version_id": version["version_id"],
-            "available": bool(version.get("source_available")),
+            "available": bool(version.get("deployment_available", version.get("source_available"))),
         })
     return result
 
@@ -3282,7 +3297,9 @@ def parse_deployment_image(value: str, media_type: str) -> tuple[str | None, str
         reference = get_reference_version(version_id)
         if not reference or reference.get("media_type") != media_type:
             raise HTTPException(400, "Image de déploiement incompatible avec l’AppBox.")
-        if reference.get("state") != "published" or not reference.get("source_available"):
+        if (reference.get("state") != "published"
+                or reference.get("image_status") != "published"
+                or not reference.get("deployment_available", reference.get("source_available"))):
             raise HTTPException(409, "Cette image de déploiement n’est pas disponible.")
         return reference.get("image_id"), version_id
     raise HTTPException(400, "Image de déploiement invalide.")
@@ -4484,6 +4501,7 @@ def execute_remote_job(job: dict[str, Any], item: dict[str, Any]) -> None:
         update_step(job_id,'prepare_reference','skipped','Aucune Reference Image sélectionnée.',100)
     payload = {
         "_job_id": job_id,
+        "deployment_id": job_options.get("deployment_id"),
         "client_id": client_id,
         "action": action,
         "compose": control_plane_compose if action in {"deploy", "recreate"} else "",
@@ -6075,12 +6093,17 @@ def distribution_page(request: Request):
 def deployments_page(request: Request):
     with db() as con:
         deployments = [dict(row) for row in con.execute("""
-            SELECT d.*,n.name AS node_name,a.media_type
+            SELECT d.*,n.name AS node_name,a.media_type,i.name AS reference_image_name,
+                   v.version AS reference_version
             FROM control_plane_deployments d
             LEFT JOIN nodes n ON n.node_id=d.node_id
             LEFT JOIN appboxes a ON a.client_id=d.client_id
+            LEFT JOIN reference_image_versions v ON v.version_id=d.reference_version_id
+            LEFT JOIN reference_images i ON i.image_id=v.image_id
             ORDER BY d.created_at DESC LIMIT 250
         """).fetchall()]
+        for deployment in deployments:
+            _decorate_deployment(con, deployment)
         decisions = [dict(row) for row in con.execute("""
             SELECT p.*,n.name AS selected_node_name
             FROM placement_decisions p
@@ -6094,6 +6117,103 @@ def deployments_page(request: Request):
         "decisions": decisions,
         "active_page": "deployments",
     })
+
+
+def _deployment_related_activity(con: sqlite3.Connection, deployment: dict[str, Any]) -> list[str]:
+    activity = []
+    client_id = deployment.get("client_id")
+    deployment_id = deployment.get("deployment_id")
+
+    def legacy_owner(candidate_client: str | None, candidate_node: str, created_at: str | None) -> str | None:
+        if not candidate_client:
+            return None
+        row = con.execute("""SELECT deployment_id FROM control_plane_deployments
+            WHERE client_id=? AND node_id=? AND created_at<=?
+            ORDER BY created_at DESC,deployment_id DESC LIMIT 1""",
+            (candidate_client, candidate_node, created_at or "")).fetchone()
+        return row["deployment_id"] if row else None
+
+    for row in con.execute("""SELECT job_id,client_id,node_id,action,status,created_at,options_json
+            FROM jobs WHERE status IN ('queued','running')"""):
+        try:
+            options = json.loads(row["options_json"] or "{}")
+        except (TypeError, ValueError):
+            options = {}
+        exact = options.get("deployment_id") == deployment_id
+        legacy = (
+            not options.get("deployment_id") and row["action"] == "deploy" and client_id
+            and row["client_id"] == client_id and row["node_id"] == deployment.get("node_id")
+            and legacy_owner(row["client_id"], row["node_id"], row["created_at"]) == deployment_id
+        )
+        if exact or legacy:
+            activity.append(f"job:{row['job_id']}:{row['status']}")
+    for row in con.execute("""SELECT command_id,node_id,command_type,status,created_at,payload_json
+            FROM agent_commands WHERE status IN ('queued','offered','claimed')"""):
+        if deployment.get("node_id") and row["node_id"] != deployment["node_id"]:
+            continue
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        exact = payload.get("deployment_id") == deployment_id
+        legacy = (
+            not payload.get("deployment_id") and row["command_type"] == "appbox_action"
+            and payload.get("action") == "deploy" and client_id
+            and payload.get("client_id") == client_id
+            and legacy_owner(payload.get("client_id"), row["node_id"], row["created_at"]) == deployment_id
+        )
+        if exact or legacy:
+            activity.append(f"command:{row['command_id']}:{row['status']}")
+    return activity
+
+
+def _decorate_deployment(con: sqlite3.Connection, deployment: dict[str, Any]) -> None:
+    active = deployment.get("status") in DEPLOYMENT_ACTIVE_STATUSES
+    inconsistent = active and bool(deployment.get("completed_at"))
+    activity = _deployment_related_activity(con, deployment) if active else []
+    stale = False
+    if active and not activity:
+        try:
+            updated = datetime.fromisoformat(deployment.get("updated_at") or deployment["created_at"])
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            stale = (datetime.now(timezone.utc) - updated).total_seconds() >= DEPLOYMENT_STALE_SECONDS
+        except (TypeError, ValueError):
+            stale = True
+    deployment["related_activity"] = activity
+    deployment["lifecycle_state"] = (
+        "inconsistent" if inconsistent else "stale" if stale else "active" if active else "terminal"
+    )
+    deployment["lifecycle_label"] = {
+        "inconsistent": "INCOHÉRENT", "stale": "STALE", "active": "ACTIF", "terminal": "TERMINÉ",
+    }[deployment["lifecycle_state"]]
+    deployment["status_label"] = "ANNULÉ" if deployment.get("status") == "cancelled" else str(deployment.get("status") or "unknown").upper()
+    deployment["closable"] = active and not activity and (stale or inconsistent)
+
+
+@app.post("/deployments/{deployment_id}/cancel")
+def cancel_control_plane_deployment(deployment_id: str):
+    stamp = now_iso()
+    with db_lock, immediate_transaction() as con:
+        row = con.execute("SELECT * FROM control_plane_deployments WHERE deployment_id=?", (deployment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Déploiement introuvable.")
+        deployment = dict(row)
+        if deployment["status"] not in DEPLOYMENT_ACTIVE_STATUSES:
+            return RedirectResponse("/deployments", status_code=303)
+        _decorate_deployment(con, deployment)
+        if deployment["related_activity"]:
+            raise HTTPException(409, "Ce déploiement possède encore un job ou une commande agent active.")
+        if not deployment["closable"]:
+            raise HTTPException(409, "Ce déploiement est encore récent et cohérent ; sa clôture est refusée.")
+        con.execute("""UPDATE control_plane_deployments SET status='cancelled',current_step='cancelled',
+            detail='Clôturé manuellement sans action distante.',completed_at=?,updated_at=?
+            WHERE deployment_id=? AND status IN ('planned','queued','preparing','prepared','deploying','running','restoring','awaiting_claim')""",
+            (stamp, stamp, deployment_id))
+        con.execute("""INSERT INTO audit_log(actor,action,result,detail,created_at)
+            VALUES('admin','control_plane_deployment_cancelled','success',?,?)""",
+            (json.dumps({"deployment_id": deployment_id}, ensure_ascii=False), stamp))
+    return RedirectResponse("/deployments", status_code=303)
 
 
 @app.get("/api/placement/preview")
@@ -6487,6 +6607,36 @@ def reference_images_page(request: Request):
     })
 
 
+@app.get("/reference-caches", response_class=HTMLResponse)
+def reference_caches_page(request: Request):
+    with db() as con:
+        operations = [dict(row) for row in con.execute("""SELECT d.*,n.node_id,n.version_id,
+            n.status AS task_status,n.detail AS task_detail
+            FROM reference_image_deletions d JOIN reference_image_deletion_nodes n ON n.deletion_id=d.deletion_id
+            WHERE d.target_type='cache' ORDER BY d.created_at DESC LIMIT 100""")]
+    for operation in operations:
+        operation["ui_status"] = (
+            "success" if operation["state"] == "deleted" else
+            "failed" if operation["state"] == "partial" else
+            "in_progress" if operation["task_status"] == "queued" else "pending"
+        )
+    return templates.TemplateResponse(request, "reference_caches.html", {
+        "mode": APPBOX_MODE,
+        "hostname": HOSTNAME,
+        "caches": reference_deletion.list_caches(),
+        "operations": operations,
+        "active_page": "reference_images",
+    })
+
+
+@app.post("/reference-caches/{node_id}/{version_id}/purge")
+def purge_reference_cache(node_id: str, version_id: str, confirmed: bool = Form(False)):
+    if not confirmed:
+        raise HTTPException(400, "Confirmez la purge du cache distant.")
+    reference_deletion.purge_cache(node_id, version_id)
+    return RedirectResponse("/reference-caches", status_code=303)
+
+
 def _reference_wizard_page(request: Request, image: dict[str, Any] | None = None):
     return templates.TemplateResponse(request, "reference_wizard.html", {
         "mode": APPBOX_MODE,
@@ -6755,6 +6905,93 @@ def publish_reference_image_version(image_id: str, version_id: str, confirmed: b
         f"{image_id} utilise maintenant {version_id}.",
         "success",
     )
+    return RedirectResponse(f"/reference-images/{image_id}", status_code=303)
+
+
+@app.post("/reference-images/{image_id}/retire")
+def retire_reference_image(image_id: str, confirmed: bool = Form(False)):
+    if not confirmed:
+        raise HTTPException(400, "Confirmez le retrait de la référence.")
+    stamp = now_iso()
+    changed = False
+    with db_lock, immediate_transaction() as con:
+        image = con.execute("SELECT * FROM reference_images WHERE image_id=?", (image_id,)).fetchone()
+        if not image:
+            raise HTTPException(404, "Référence introuvable.")
+        if con.execute("""SELECT 1 FROM reference_image_deletions WHERE image_id=?
+                AND target_type IN ('image','version') AND state!='deleted'""", (image_id,)).fetchone():
+            raise HTTPException(409, "Une suppression de cette référence est déjà active.")
+        if image["status"] != "retired":
+            if image["status"] != "published":
+                raise HTTPException(409, "Seule une référence publiée peut être retirée.")
+            con.execute("UPDATE reference_images SET status='retired',updated_at=? WHERE image_id=?", (stamp, image_id))
+            changed = True
+            con.execute("""INSERT INTO audit_log(actor,action,result,detail,created_at)
+                VALUES('admin','reference_image_retired','success',?,?)""",
+                (json.dumps({"image_id": image_id, "current_version_id": image["current_version_id"]}), stamp))
+    if changed:
+        record_event(None, "reference_image_retired", f"Référence {image_id} retirée du catalogue de déploiement.", "success")
+    return RedirectResponse(f"/reference-images/{image_id}", status_code=303)
+
+
+@app.post("/reference-images/{image_id}/republish")
+def republish_reference_image(image_id: str, confirmed: bool = Form(False)):
+    if not confirmed:
+        raise HTTPException(400, "Confirmez la republication de la référence.")
+    stamp = now_iso()
+    with db_lock, db() as con:
+        image = con.execute("SELECT * FROM reference_images WHERE image_id=?", (image_id,)).fetchone()
+        if not image:
+            raise HTTPException(404, "Référence introuvable.")
+        if con.execute("""SELECT 1 FROM reference_image_deletions WHERE image_id=?
+                AND target_type IN ('image','version') AND state!='deleted'""", (image_id,)).fetchone():
+            raise HTTPException(409, "Une suppression de cette référence est déjà active.")
+        if image["status"] == "published":
+            return RedirectResponse(f"/reference-images/{image_id}", status_code=303)
+        if image["status"] != "retired" or not image["current_version_id"]:
+            raise HTTPException(409, "Cette référence retirée n’a pas de version courante publiable.")
+        version = con.execute("""SELECT v.*,s.source_path,i.media_type FROM reference_image_versions v
+            JOIN catalog_snapshots s ON s.snapshot_id=v.snapshot_id
+            JOIN reference_images i ON i.image_id=v.image_id
+            WHERE v.version_id=? AND v.image_id=?""", (image["current_version_id"], image_id)).fetchone()
+        if not version or version["state"] != "published":
+            raise HTTPException(409, "La version courante n’est pas publiée.")
+        candidate = dict(version)
+    archive = Path(str(candidate.get("archive_path") or ""))
+    if archive.is_file():
+        expected = str(candidate.get("checksum") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise HTTPException(409, "Le checksum publié de l’archive est absent ou invalide.")
+        try:
+            actual = sha256_file(archive)
+            if not secrets.compare_digest(actual, expected):
+                raise HTTPException(409, "Le checksum de l’archive centrale ne correspond plus à la version publiée.")
+            validate_archive(archive, plex=candidate.get("media_type") == "plex")
+        except HTTPException:
+            raise
+        except (OSError, RuntimeError, tarfile.TarError, EOFError) as exc:
+            raise HTTPException(409, "L’archive centrale est corrompue ou invalide.") from exc
+    elif not (candidate.get("source_path") and Path(candidate["source_path"]).is_dir()):
+        raise HTTPException(409, "L’archive et la source de la version courante sont indisponibles.")
+    with db_lock, immediate_transaction() as con:
+        current = con.execute("""SELECT i.status,i.current_version_id,v.state,v.archive_path,v.checksum,s.source_path
+            FROM reference_images i JOIN reference_image_versions v ON v.version_id=i.current_version_id
+            JOIN catalog_snapshots s ON s.snapshot_id=v.snapshot_id WHERE i.image_id=?""", (image_id,)).fetchone()
+        if (not current or current["status"] != "retired"
+                or current["current_version_id"] != candidate["version_id"]
+                or current["state"] != "published"
+                or str(current["archive_path"] or "") != str(candidate.get("archive_path") or "")
+                or str(current["checksum"] or "") != str(candidate.get("checksum") or "")
+                or str(current["source_path"] or "") != str(candidate.get("source_path") or "")):
+            raise HTTPException(409, "La référence a changé pendant la vérification ; rechargez la page.")
+        if con.execute("""SELECT 1 FROM reference_image_deletions WHERE image_id=?
+                AND target_type IN ('image','version') AND state!='deleted'""", (image_id,)).fetchone():
+            raise HTTPException(409, "Une suppression de cette référence est déjà active.")
+        con.execute("UPDATE reference_images SET status='published',updated_at=? WHERE image_id=?", (stamp, image_id))
+        con.execute("""INSERT INTO audit_log(actor,action,result,detail,created_at)
+            VALUES('admin','reference_image_republished','success',?,?)""",
+            (json.dumps({"image_id": image_id, "current_version_id": image["current_version_id"]}), stamp))
+    record_event(None, "reference_image_republished", f"Référence {image_id} republiée.", "success")
     return RedirectResponse(f"/reference-images/{image_id}", status_code=303)
 
 
@@ -7250,6 +7487,10 @@ def create_appbox(
         reference = get_reference_version(reference_version_id)
         if not reference or reference["media_type"] != media_type:
             raise HTTPException(400, "Image de référence incompatible avec l’AppBox.")
+        if (reference.get("state") != "published"
+                or reference.get("image_status") != "published"
+                or not reference.get("deployment_available", reference.get("source_available"))):
+            raise HTTPException(409, "Cette image de déploiement n’est plus publiée ou disponible.")
         snapshot_id = reference["snapshot_id"]
         reference_image_id = reference["image_id"]
 
@@ -7285,6 +7526,13 @@ def create_appbox(
         with db_lock, immediate_transaction() as con:
             if con.execute("SELECT 1 FROM appboxes WHERE client_id=?", (client_id,)).fetchone():
                 raise HTTPException(409, "Cette AppBox existe déjà.")
+            if reference_version_id:
+                current_reference = con.execute("""SELECT v.state,i.status AS image_status
+                    FROM reference_image_versions v JOIN reference_images i ON i.image_id=v.image_id
+                    WHERE v.version_id=?""", (reference_version_id,)).fetchone()
+                if (not current_reference or current_reference["state"] != "published"
+                        or current_reference["image_status"] != "published"):
+                    raise HTTPException(409, "La référence a été retirée avant la création de l’AppBox.")
             occupied = {int(row[0]) for row in con.execute("""
                 SELECT port FROM port_reservations
                 WHERE node_id=? AND protocol='tcp' AND status='reserved'
@@ -7449,6 +7697,7 @@ def create_appbox(
                 deploy_job_id = _insert_job(
                     con, client_id, "deploy", "Déploiement de l’AppBox",
                     "Opération placée dans la file globale.", selected_node_id,
+                    {"deployment_id": deployment_id},
                 )
     except sqlite3.IntegrityError:
         if workspace_created:
@@ -7523,7 +7772,15 @@ def enqueue_action(request: Request, client_id: str, action: str):
     if desired:
         with db_lock, db() as con:
             con.execute("UPDATE appboxes SET desired_state=?,updated_at=? WHERE client_id=?", (desired, now_iso(), client_id))
-    job_id = create_job(client_id, action, titles[action], f"Opération placée dans la file du node {item['node_id']}.", node_id=str(item["node_id"]))
+    options = None
+    if action == "deploy":
+        with db() as con:
+            deployment = con.execute("""SELECT deployment_id FROM control_plane_deployments
+                WHERE client_id=? AND status IN ('planned','queued','preparing','prepared','deploying','running','restoring','awaiting_claim')
+                ORDER BY created_at DESC LIMIT 1""", (client_id,)).fetchone()
+        if deployment:
+            options = {"deployment_id": deployment["deployment_id"]}
+    job_id = create_job(client_id, action, titles[action], f"Opération placée dans la file du node {item['node_id']}.", node_id=str(item["node_id"]), options=options)
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         return JSONResponse({"job_id": job_id, "client_id": client_id, "action": action})
     return RedirectResponse(f"/appboxes/{client_id}?job={job_id}", status_code=303)

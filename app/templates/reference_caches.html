@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Caches références — Marinos AppBox{% endblock %}
+{% block page_title %}Caches références{% endblock %}
+{% block content %}
+<section class="hero"><div><div class="eyebrow">Références distribuées</div><h1>Caches par node</h1><p>Une purge agit uniquement sur la copie identifiée sur le node choisi. Elle ne retire ni la référence, ni sa version, ni l’archive centrale.</p></div><a class="button secondary" href="/reference-images">Bibliothèque</a></section>
+<div class="section-head"><div><h2>Copies connues</h2><p>{{caches|length}} cache(s) enregistré(s)</p></div></div>
+<div class="deployment-list">
+{% for cache in caches %}<article class="card deployment-card">
+ <div class="card-top"><div><div class="eyebrow">{{cache.node_name}} · {{cache.node_status|upper}}</div><h3>{{cache.image_name}} · {{cache.version}}</h3></div><span class="pill {{'ok' if cache.status=='ready' else 'warn'}}">{{'CACHE PRÊT' if cache.status=='ready' else cache.status|upper}}</span></div>
+ <div class="info-row"><span>Taille</span><strong>{{'%.2f Go'|format((cache.size_bytes or 0)/1073741824)}}</strong></div>
+ <div class="info-row"><span>SHA-256</span><strong>{{cache.checksum[:12] if cache.checksum else '—'}}</strong></div>
+ <div class="info-row"><span>Chemin agent déclaré</span><strong>{{cache.local_path or '—'}}</strong></div>
+ <div class="info-row"><span>Dernière vérification</span><strong>{{cache.last_checked_at or cache.updated_at}}</strong></div>
+ {% if cache.purge_status %}<p class="metric-sub">{{'Purge terminée' if cache.purge_status=='success' else 'Purge échouée' if cache.purge_status=='failed' else 'Purge en cours' if cache.purge_status=='in_progress' else 'Purge en attente'}}</p>{% endif %}
+ <form method="post" action="/reference-caches/{{cache.node_id}}/{{cache.version_id}}/purge"><label class="inline-confirm"><input type="checkbox" name="confirmed" value="true" required> Confirmer la purge de cette copie</label><button class="danger-subtle">Purger ce cache</button></form>
+</article>{% else %}<div class="card empty">Aucun cache de Reference Image connu.</div>{% endfor %}
+</div>
+{% if operations %}<section class="section-block"><div class="section-head"><div><h2>Historique des purges</h2><p>État durable des demandes manuelles.</p></div></div><div class="deployment-list">
+{% for operation in operations %}<article class="card"><div class="card-top"><strong>{{operation.name}} · {{operation.node_id}}</strong><span class="pill {{'ok' if operation.ui_status=='success' else 'bad' if operation.ui_status=='failed' else 'warn'}}">{{'PURGE TERMINÉE' if operation.ui_status=='success' else 'PURGE ÉCHOUÉE' if operation.ui_status=='failed' else 'PURGE EN COURS' if operation.ui_status=='in_progress' else 'PURGE EN ATTENTE'}}</span></div><p class="metric-sub">{{operation.detail}}</p><small>{{operation.created_at}}</small></article>{% endfor %}
+</div></section>{% endif %}
+{% endblock %}

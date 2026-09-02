@@ -4,7 +4,7 @@
 {% block content %}
 <section class="hero reference-library-hero">
  <div><div class="eyebrow">Bibliothèque de références</div><h1>Vos modèles de déploiement</h1><p>Créez, publiez et faites évoluer les références utilisées pour déployer vos AppBox.</p></div>
- <a class="button" href="/reference-images/new">Créer une référence</a>
+ <div class="actions"><a class="button secondary" href="/reference-caches">Voir les caches</a><a class="button" href="/reference-images/new">Créer une référence</a></div>
 </section>
 {% for deletion in pending_deletions %}
 <div class="reference-blocked"><strong>{{'Purge distante en attente' if deletion.state=='purge_pending' else 'Suppression à reprendre'}} · {{deletion.name}}</strong><span>{{deletion.detail}}</span><a class="button secondary" href="/reference-images/{{deletion.image_id}}{% if deletion.version_id %}/versions/{{deletion.version_id}}{% endif %}/delete">Voir l’opération</a></div>
@@ -19,7 +19,7 @@
  <article class="card reference-card reference-library-card">
   <div class="card-top">
    <div class="reference-heading"><span class="reference-brand {{image.media_type}}"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M8.2 2h4.2l5.4 10-5.4 10H8.2l5.4-10L8.2 2Z"/></svg></span><div><div class="eyebrow">{{image.media_type|upper}}</div><h3>{{image.name}}</h3></div></div>
-   <span class="pill {{'ok' if image.current_version_id else 'warn'}}">{{'DISPONIBLE' if image.current_version_id else 'À FINALISER'}}</span>
+   <span class="pill {{'ok' if image.status=='published' else 'warn'}}">{{'PUBLIÉE' if image.status=='published' else 'RETIRÉE' if image.status=='retired' else 'À FINALISER'}}</span>
   </div>
   <div class="reference-library-facts">
    <div><span>Version active</span><strong>{{image.current_version or 'Aucune'}}</strong></div>
@@ -28,7 +28,7 @@
    <div><span>Versions</span><strong>{{image.version_count}}</strong></div>
   </div>
   {% if image.usage_count %}<p class="metric-sub">Utilisée par {{image.usage_count}} AppBox</p>{% endif %}
-  <div class="actions"><a class="button secondary" href="/reference-images/{{image.image_id}}">Gérer</a>{% if image.current_version_id %}<a class="button" href="/appboxes?deployment_image_id=reference:{{image.current_version_id}}">Déployer</a>{% else %}<button disabled>Déployer</button>{% endif %}</div>
+  <div class="actions"><a class="button secondary" href="/reference-images/{{image.image_id}}">Gérer</a>{% if image.current_version_id and image.status=='published' %}<a class="button" href="/appboxes?deployment_image_id=reference:{{image.current_version_id}}">Déployer</a>{% else %}<button disabled>Déployer</button>{% endif %}</div>
  </article>
 {% else %}
  <div class="card empty reference-empty"><strong>Aucune référence</strong><span>Le wizard vous guide depuis le choix de l’application jusqu’à la capture.</span><a class="button" href="/reference-images/new">Créer la première référence</a></div>

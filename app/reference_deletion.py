@@ -64,9 +64,11 @@ def init_schema(con):
                 END""")
     # Reusing a human-readable image ID is allowed once cleanup completes. Until
     # then a new publication must not overwrite files scheduled for deletion.
-    con.execute("""CREATE TRIGGER IF NOT EXISTS reference_pending_reuse
+    con.execute("DROP TRIGGER IF EXISTS reference_pending_reuse")
+    con.execute("""CREATE TRIGGER reference_pending_reuse
         BEFORE INSERT ON reference_images WHEN EXISTS (
-        SELECT 1 FROM reference_image_deletions WHERE image_id=NEW.image_id AND state!='deleted')
+        SELECT 1 FROM reference_image_deletions WHERE image_id=NEW.image_id
+        AND target_type!='cache' AND state!='deleted')
         BEGIN SELECT RAISE(ABORT,'Reference cleanup pending'); END""")
     # A deletion first marks versions unavailable under the SQLite writer lock.
     # Late deploy/distribution writers cannot reattach them after preflight.
@@ -177,12 +179,13 @@ def _mentions(value, targets):
 def _plan(con, image_id, version_id=None):
     main = host()
     active = con.execute('''SELECT * FROM reference_image_deletions WHERE image_id=?
+        AND target_type!='cache'
         AND target_version_id IS ? AND state!='deleted' ORDER BY created_at DESC LIMIT 1''',
         (image_id,version_id)).fetchone()
     if active:
         return _result(active,con)
     competing = con.execute('''SELECT deletion_id,target_version_id,state
-        FROM reference_image_deletions WHERE image_id=? AND state!='deleted'
+        FROM reference_image_deletions WHERE image_id=? AND target_type!='cache' AND state!='deleted'
         ORDER BY created_at LIMIT 1''', (image_id,)).fetchone()
     image = con.execute('SELECT * FROM reference_images WHERE image_id=?', (image_id,)).fetchone()
     if not image:
@@ -194,7 +197,7 @@ def _plan(con, image_id, version_id=None):
     versions = [dict(row) for row in con.execute('''SELECT * FROM reference_image_versions
         WHERE image_id=? AND (? IS NULL OR version_id=?) ORDER BY version_id''', (image_id, version_id, version_id))]
     if version_id and not versions:
-        previous = con.execute('''SELECT * FROM reference_image_deletions WHERE image_id=?
+        previous = con.execute('''SELECT * FROM reference_image_deletions WHERE image_id=? AND target_type!='cache'
             AND target_version_id=? ORDER BY created_at DESC LIMIT 1''', (image_id, version_id)).fetchone()
         if previous:
             return _result(previous)
@@ -205,25 +208,31 @@ def _plan(con, image_id, version_id=None):
     if competing:
         target = competing['target_version_id'] or image_id
         blockers.append(f"Suppression déjà active : {target} ({competing['state']}, {competing['deletion_id']})")
+    placeholders = ','.join('?' for _ in version_ids) or "''"
+    snapshot_placeholders = ','.join('?' for _ in snapshots) or "''"
+    cache_operations = con.execute(f'''SELECT d.deletion_id,d.state,n.node_id,n.version_id
+        FROM reference_image_deletions d JOIN reference_image_deletion_nodes n ON n.deletion_id=d.deletion_id
+        WHERE d.target_type='cache' AND d.state!='deleted' AND n.version_id IN ({placeholders})''',
+        tuple(version_ids)).fetchall() if version_ids else []
+    blockers.extend(
+        f"Purge cache non finalisée : {row['node_id']}/{row['version_id']} ({row['state']}, {row['deletion_id']})"
+        for row in cache_operations
+    )
     preserved = []
     if version_id and image['current_version_id'] == version_id:
         blockers.append(f'Version active/default de l’image : {version_id}')
-    if not version_id and (image['current_version_id'] or image['status'] == 'published'):
+    if not version_id and image['status'] == 'published':
         blockers.append('Image active/publiée : transition explicite requise avant suppression.')
-    placeholders = ','.join('?' for _ in version_ids) or "''"
-    snapshot_placeholders = ','.join('?' for _ in snapshots) or "''"
-    # Existing AppBoxes no longer read the archive: deploy restored it once and
-    # recreate uses the existing configuration. They are detached at finalization.
     rows = con.execute(f'''SELECT client_id FROM appboxes WHERE reference_image_id=?
         OR reference_version_id IN ({placeholders}) OR snapshot_id IN ({snapshot_placeholders})''',
         (image_id, *version_ids, *snapshots))
-    preserved.extend(f'AppBox autonome (lien catalogue détaché) : {row[0]}' for row in rows)
+    blockers.extend(f'AppBox dépendante : {row[0]}' for row in rows)
     rows = con.execute(f'''SELECT profile_id FROM provisioning_profiles WHERE reference_image_id=?
         OR reference_version_id IN ({placeholders}) OR snapshot_id IN ({snapshot_placeholders})''',
         (image_id, *version_ids, *snapshots))
     blockers.extend(f'Profil de provisioning : {row[0]}' for row in rows)
     for table, key, clause, label in (
-        ('control_plane_deployments', 'deployment_id', f"reference_version_id IN ({placeholders}) AND status IN ('planned','queued','preparing','prepared','running','restoring','awaiting_claim')", 'Déploiement actif'),
+        ('control_plane_deployments', 'deployment_id', f"reference_version_id IN ({placeholders}) AND status IN ('planned','queued','preparing','prepared','deploying','running','restoring','awaiting_claim')", 'Déploiement actif'),
         ('snapshot_deployments', 'deployment_id', f"snapshot_id IN ({snapshot_placeholders}) AND status IN ('planned','queued','running','restoring','restored_unclaimed')", 'Déploiement snapshot actif'),
         ('reference_builds', 'build_id', f"(image_id=? OR version_id IN ({placeholders})) AND status NOT IN ('published','completed','failed','build_failed','discovery_failed')", 'Build actif'),
         ('reference_image_distribution', 'node_id', f"version_id IN ({placeholders}) AND status='transferring'", 'Distribution active sur le node'),
@@ -331,7 +340,7 @@ def preview(image_id, version_id=None):
 
 def pending():
     with host().db() as con:
-        return [_result(row, con) for row in con.execute("SELECT * FROM reference_image_deletions WHERE state!='deleted' ORDER BY created_at")]
+        return [_result(row, con) for row in con.execute("SELECT * FROM reference_image_deletions WHERE target_type!='cache' AND state!='deleted' ORDER BY created_at")]
 
 
 def operation(deletion_id):
@@ -390,7 +399,7 @@ def _finish_catalogue(deletion_id):
     main=host()
     with main.db_lock,main.immediate_transaction() as con:
         row=con.execute('SELECT * FROM reference_image_deletions WHERE deletion_id=?',(deletion_id,)).fetchone()
-        if not row or row['phase']=='done': return
+        if not row or row['phase']=='done' or row['target_type']=='cache': return
         if con.execute("SELECT 1 FROM reference_image_deletion_nodes WHERE deletion_id=? AND status='queued'",(deletion_id,)).fetchone(): return
         manifest=json.loads(row['manifest_json']); root=Path(row['storage_root']); errors=[]
         targets=[item['version_id'] for item in manifest['versions']]; marks=','.join('?' for _ in targets)
@@ -462,6 +471,130 @@ def _finish_catalogue(deletion_id):
                 'nodes':sorted({item['node_id'] for item in tasks})})
 
 
+def _finish_cache(deletion_id):
+    main = host()
+    with main.db_lock, main.immediate_transaction() as con:
+        row = con.execute("SELECT * FROM reference_image_deletions WHERE deletion_id=?", (deletion_id,)).fetchone()
+        if not row or row["target_type"] != "cache" or row["state"] == "deleted":
+            return
+        task = con.execute("SELECT * FROM reference_image_deletion_nodes WHERE deletion_id=?", (deletion_id,)).fetchone()
+        if not task:
+            _update(con, deletion_id, "partial", "failed", 100, "Tâche de purge absente.", ["Tâche absente"], "missing_task")
+            return
+        if task["status"] == "queued":
+            _update(con, deletion_id, "running", "in_progress", 50, "Purge distante en cours.")
+            return
+        if task["status"] == "pending":
+            _update(con, deletion_id, "purge_pending", "pending", 20, "Node indisponible ; purge en attente.")
+            return
+        if task["status"] == "failed":
+            _update(con, deletion_id, "partial", "failed", 100, task["detail"], [task["detail"]], "remote_cleanup_failed")
+            return
+        if task["status"] != "success":
+            return
+        # Delete only the row whose immutable identity was sent to the agent.
+        removed = con.execute("""DELETE FROM node_reference_cache WHERE node_id=? AND version_id=?
+            AND local_path IS ? AND checksum IS ?""",
+            (task["node_id"], task["version_id"], task["local_path"], task["checksum"])).rowcount
+        if not removed and con.execute("SELECT 1 FROM node_reference_cache WHERE node_id=? AND version_id=?",
+                                      (task["node_id"], task["version_id"])).fetchone():
+            message = "Le cache a changé d’identité pendant la purge ; la nouvelle copie est conservée."
+            _update(con, deletion_id, "partial", "failed", 100, message, [message], "cache_identity_changed")
+            return
+        con.execute("""UPDATE reference_image_distribution SET status='missing',local_path=NULL,
+            actual_checksum=NULL,bytes_transferred=0,completed_at=?,last_error=NULL,updated_at=?
+            WHERE node_id=? AND version_id=?""",
+            (main.now_iso(), main.now_iso(), task["node_id"], task["version_id"]))
+        _update(con, deletion_id, "deleted", "done", 100, "Cache distant confirmé absent.", completed_at=main.now_iso())
+        _audit(con, "reference_cache_purged", "success", {
+            "operation_id": deletion_id, "node_id": task["node_id"], "version_id": task["version_id"],
+        })
+
+
+def purge_cache(node_id, version_id):
+    main = host()
+    with main.db_lock, main.immediate_transaction() as con:
+        cache = con.execute("""SELECT c.*,v.image_id,v.version,i.name FROM node_reference_cache c
+            JOIN reference_image_versions v ON v.version_id=c.version_id
+            JOIN reference_images i ON i.image_id=v.image_id
+            WHERE c.node_id=? AND c.version_id=?""", (node_id, version_id)).fetchone()
+        previous = con.execute("""SELECT d.* FROM reference_image_deletions d
+            JOIN reference_image_deletion_nodes n ON n.deletion_id=d.deletion_id
+            WHERE d.target_type='cache' AND n.node_id=? AND n.version_id=?
+            ORDER BY d.created_at DESC LIMIT 1""", (node_id, version_id)).fetchone()
+        if not cache:
+            if previous:
+                return _result(previous, con)
+            raise HTTPException(404, "Cache de référence introuvable.")
+        catalogue_deletion = con.execute("""SELECT deletion_id,state FROM reference_image_deletions
+            WHERE image_id=? AND target_type IN ('image','version') AND state!='deleted'
+              AND (target_version_id IS NULL OR target_version_id=?)
+            ORDER BY created_at DESC LIMIT 1""", (cache["image_id"], version_id)).fetchone()
+        if catalogue_deletion:
+            raise HTTPException(409, "Une suppression du catalogue prend déjà en charge ce cache.")
+        if previous and previous["state"] != "deleted":
+            if previous["state"] == "partial":
+                con.execute("""UPDATE reference_image_deletion_nodes SET status='pending',command_id=NULL,
+                    detail='Retry demandé.',updated_at=? WHERE deletion_id=? AND status='failed'""",
+                    (main.now_iso(), previous["deletion_id"]))
+            deletion_id = previous["deletion_id"]
+        else:
+            stamp = main.now_iso()
+            deletion_id = hashlib.sha256(
+                f"cache\0{node_id}\0{version_id}\0{cache['local_path']}\0{cache['checksum']}\0{stamp}".encode()
+            ).hexdigest()
+            existing = con.execute("SELECT * FROM reference_image_deletions WHERE deletion_id=?", (deletion_id,)).fetchone()
+            if existing:
+                return _result(existing, con)
+            manifest = {"target_label": f"Cache {cache['name']} {cache['version']} sur {node_id}",
+                        "versions": [{"version_id": version_id, "size_bytes": cache["size_bytes"]}], "files": []}
+            con.execute("""INSERT INTO reference_image_deletions(deletion_id,image_id,name,version_count,
+                storage_root,manifest_json,state,errors_json,created_at,target_type,target_version_id,
+                phase,progress,detail,started_at,operator)
+                VALUES(?,?,?,?,?,?,'running','[]',?,'cache',?,'pending',10,?,?, 'admin')""",
+                (deletion_id, cache["image_id"], cache["name"], 1, str(main.REFERENCE_ROOT),
+                 json.dumps(manifest), stamp, version_id, "Purge manuelle demandée.", stamp))
+            con.execute("""INSERT INTO reference_image_deletion_nodes(deletion_id,version_id,node_id,
+                local_path,checksum,size_bytes,status,detail,updated_at)
+                VALUES(?,?,?,?,?,?,'pending','Node à contacter.',?)""",
+                (deletion_id, version_id, node_id, cache["local_path"], cache["checksum"], cache["size_bytes"], stamp))
+            _audit(con, "reference_cache_purge_started", "running", {
+                "operation_id": deletion_id, "node_id": node_id, "version_id": version_id,
+            })
+    _schedule(deletion_id)
+    _finish_cache(deletion_id)
+    return operation(deletion_id)
+
+
+def list_caches():
+    main = host()
+    nodes = {item["node_id"]: item for item in main.list_control_nodes()}
+    with main.db() as con:
+        rows = [dict(row) for row in con.execute("""SELECT c.*,v.version,i.image_id,i.name AS image_name,
+            d.status AS distribution_status,d.updated_at AS distribution_updated_at
+            FROM node_reference_cache c JOIN reference_image_versions v ON v.version_id=c.version_id
+            JOIN reference_images i ON i.image_id=v.image_id
+            LEFT JOIN reference_image_distribution d ON d.node_id=c.node_id AND d.version_id=c.version_id
+            ORDER BY c.node_id,i.name,v.version""")]
+        for row in rows:
+            operation_row = con.execute("""SELECT d.*,n.status AS task_status,n.detail AS task_detail
+                FROM reference_image_deletions d JOIN reference_image_deletion_nodes n ON n.deletion_id=d.deletion_id
+                WHERE d.target_type='cache' AND n.node_id=? AND n.version_id=?
+                ORDER BY d.created_at DESC LIMIT 1""", (row["node_id"], row["version_id"])).fetchone()
+            operation = dict(operation_row) if operation_row else None
+            row["operation"] = operation
+            row["purge_status"] = (
+                "success" if operation and operation["state"] == "deleted" else
+                "failed" if operation and operation["state"] == "partial" else
+                "in_progress" if operation and operation["task_status"] == "queued" else
+                "pending" if operation else None
+            )
+            node = nodes.get(row["node_id"], {})
+            row["node_name"] = node.get("name") or row["node_id"]
+            row["node_status"] = node.get("status", "unknown")
+    return rows
+
+
 def delete(image_id,confirmation,version_id=None,confirmed_name=None):
     main=host(); refusal=None
     with main.db_lock,main.immediate_transaction() as con:
@@ -524,14 +657,20 @@ def finalize_remote_command(command,status,result,error):
         con.execute('''UPDATE reference_image_deletion_nodes SET status=?,detail=?,updated_at=? WHERE deletion_id=?
             AND version_id=? AND node_id=? AND command_id=? AND status='queued' ''',(final,str(detail)[:2000],main.now_iso(),
             deletion_id,version_id,command['node_id'],command['command_id']))
-    _finish_catalogue(deletion_id)
+    with main.db() as con:
+        deletion = con.execute("SELECT target_type FROM reference_image_deletions WHERE deletion_id=?", (deletion_id,)).fetchone()
+    (_finish_cache if deletion and deletion["target_type"] == "cache" else _finish_catalogue)(deletion_id)
 
 
 def reconcile_node(node_id):
     main=host()
     with main.db_lock,main.db() as con:
         deletions=[row[0] for row in con.execute("SELECT DISTINCT deletion_id FROM reference_image_deletion_nodes WHERE node_id=? AND status='pending'",(node_id,))]
-    for deletion_id in deletions: _schedule(deletion_id,node_id); _finish_catalogue(deletion_id)
+    for deletion_id in deletions:
+        _schedule(deletion_id,node_id)
+        with main.db() as con:
+            deletion = con.execute("SELECT target_type FROM reference_image_deletions WHERE deletion_id=?", (deletion_id,)).fetchone()
+        (_finish_cache if deletion and deletion["target_type"] == "cache" else _finish_catalogue)(deletion_id)
 
 
 class Confirmation(BaseModel):
