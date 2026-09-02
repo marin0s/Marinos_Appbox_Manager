@@ -11,9 +11,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 try:
-    from agent.upgrade_contract import MAX_PACKAGE_BYTES, TERMINAL, atomic_file, atomic_json, digest, fsync_directory, prepare_release, validate_package
+    from agent.upgrade_contract import MAX_PACKAGE_BYTES, TERMINAL, PackageValidationError, atomic_file, atomic_json, digest, fsync_directory, prepare_release, validate_package
 except ModuleNotFoundError:
-    from upgrade_contract import MAX_PACKAGE_BYTES, TERMINAL, atomic_file, atomic_json, digest, fsync_directory, prepare_release, validate_package
+    from upgrade_contract import MAX_PACKAGE_BYTES, TERMINAL, PackageValidationError, atomic_file, atomic_json, digest, fsync_directory, prepare_release, validate_package
 
 ROOT = Path("/opt/marinos-appbox-agent")
 SPOOL = Path("/var/lib/marinos-appbox-agent/upgrades")
@@ -264,12 +264,31 @@ def stage_upgrade(config, payload):
     # Reserve durable supervision before network/download work; a reboot cannot lose it.
     atomic_json(SPOOL / "request.json", {"operation_id": operation_id})
     handoff_started = False
+    error_code = "package_preparation_failed"
     try:
         request(config, base + "/events", {"phase": "downloading"})
-        data = request(config, base + "/archive", binary=True)
+        try:
+            data = request(config, base + "/archive", binary=True)
+        except ValueError as exc:
+            error_code = "package_too_large" if "too large" in str(exc).lower() else "package_download_failed"
+            raise
+        except Exception:
+            error_code = "package_download_failed"
+            raise
         request(config, base + "/events", {"phase": "verifying"})
-        validate_package(data, op["package_sha256"])
-        prepare_release(work / "candidate", data, op["package_sha256"])
+        try:
+            validate_package(data, op["package_sha256"])
+        except PackageValidationError as exc:
+            error_code = exc.code
+            raise
+        try:
+            prepare_release(work / "candidate", data, op["package_sha256"])
+        except PackageValidationError as exc:
+            error_code = exc.code
+            raise
+        except Exception:
+            error_code = "package_preparation_failed"
+            raise
         archive = work / "agent.zip"
         with archive.open("wb") as stream:
             stream.write(data)
@@ -281,7 +300,7 @@ def stage_upgrade(config, payload):
     except Exception:
         try:
             if not handoff_started:
-                request(config, base + "/events", {"phase": "upgrade_failed", "error_code": "preparation_failed"})
+                request(config, base + "/events", {"phase": "upgrade_failed", "error_code": error_code})
         except Exception:
             pass
         raise RuntimeError("Agent upgrade preparation interrupted; inspect external supervisor state") from None

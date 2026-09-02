@@ -19,6 +19,20 @@ from app import main, agent_upgrades as upgrades
 SOURCE = Path(__file__).resolve().parents[1] / 'agent'
 
 
+def package_from_contents(contents, manifest=None):
+    contents = dict(contents)
+    manifest = manifest or contract.manifest_for(contents)
+    contents[contract.MANIFEST] = contract.canonical(manifest)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_STORED) as archive:
+        for name, data in contents.items():
+            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            archive.writestr(info, data)
+    return output.getvalue()
+
+
 @pytest.fixture
 def artifact():
     data = contract.package_bytes(SOURCE)
@@ -44,6 +58,21 @@ def test_same_version_build_identity():
     assert contract.update_status('1.6.0-alpha.5-dev', '1.6.0-alpha.5-dev', 'old', 'new') == 'update_available'
 
 
+def test_upgrade_schema_migration_is_additive_and_idempotent():
+    con = main.sqlite3.connect(':memory:')
+    con.execute("CREATE TABLE nodes(node_id TEXT PRIMARY KEY)")
+    con.execute("""CREATE TABLE agent_upgrades (
+        operation_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, phase TEXT NOT NULL,
+        version TEXT NOT NULL, build_id TEXT NOT NULL, package_sha256 TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL, before_process TEXT, deadline_epoch REAL NOT NULL,
+        error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    con.execute("INSERT INTO nodes VALUES('node')")
+    con.execute("INSERT INTO agent_upgrades VALUES('op','node','success','1','b','s',1,NULL,0,NULL,'a','a')")
+    upgrades.init_schema(con); upgrades.init_schema(con)
+    row = con.execute("SELECT artifact_kind,parent_operation_id,followup_package_sha256 FROM agent_upgrades").fetchone()
+    assert row == ('full', None, None)
+
+
 def test_checksum_candidate_and_immutable_release(tmp_path, artifact):
     data, manifest, _ = artifact
     target, actual = contract.prepare_release(tmp_path, data, contract.digest(data))
@@ -51,7 +80,7 @@ def test_checksum_candidate_and_immutable_release(tmp_path, artifact):
     assert target.name == contract.digest(data)
     assert json.loads((target/'release-receipt.json').read_text())['sha256'] == target.name
     before = (target/'marinos-appbox-agent.py').read_bytes()
-    with pytest.raises(ValueError, match='checksum'):
+    with pytest.raises(contract.PackageValidationError, match='package_sha256_mismatch'):
         contract.prepare_release(tmp_path, data, '0'*64)
     assert (target/'marinos-appbox-agent.py').read_bytes() == before
     assert contract.prepare_release(tmp_path, data, target.name)[0] == target
@@ -87,6 +116,90 @@ def test_malicious_zip_rejected(artifact, attack):
         contract.validate_package(data, contract.digest(data))
 
 
+def test_manifest_authorizes_declared_extension_but_nothing_undeclared(artifact):
+    _, _, base = artifact
+    extended = {**base, 'future_component.py': b'VALUE = 1\n'}
+    data = package_from_contents(extended)
+    manifest, contents = contract.validate_package(data, contract.digest(data))
+    assert contents['future_component.py'] == b'VALUE = 1\n'
+    assert manifest['files']['future_component.py'] == contract.digest(b'VALUE = 1\n')
+
+    undeclared = dict(base)
+    manifest = contract.manifest_for(undeclared)
+    data = package_from_contents({**undeclared, 'hidden.py': b'VALUE = 2\n'}, manifest)
+    with pytest.raises(contract.PackageValidationError, match='package_file_set_invalid'):
+        contract.validate_package(data, contract.digest(data))
+
+
+def test_manifest_missing_file_bad_checksum_and_missing_core_are_rejected(artifact):
+    _, _, base = artifact
+    declared = contract.manifest_for(base)
+    declared['files']['declared_only.py'] = contract.digest(b'absent')
+    declared['build_id'] = contract.digest(contract.canonical(declared['files']))
+    data = package_from_contents(base, declared)
+    with pytest.raises(contract.PackageValidationError, match='package_file_set_invalid'):
+        contract.validate_package(data, contract.digest(data))
+
+    wrong = contract.manifest_for(base)
+    wrong['files']['reference_contract.py'] = '0' * 64
+    wrong['build_id'] = contract.digest(contract.canonical(wrong['files']))
+    data = package_from_contents(base, wrong)
+    with pytest.raises(contract.PackageValidationError, match='package_file_checksum_mismatch'):
+        contract.validate_package(data, contract.digest(data))
+
+    incomplete = dict(base); incomplete.pop('upgrade_launcher.py')
+    data = package_from_contents(incomplete)
+    with pytest.raises(contract.PackageValidationError, match='package_file_set_invalid'):
+        contract.validate_package(data, contract.digest(data))
+
+
+@pytest.mark.parametrize('field,value,code', [
+    ('protocol', 999, 'protocol_incompatible'),
+    ('launcher_abi', 999, 'launcher_abi_incompatible'),
+    ('build_id', '0' * 64, 'manifest_invalid'),
+])
+def test_manifest_protocol_abi_and_identity_are_explicitly_validated(artifact, field, value, code):
+    _, _, base = artifact
+    manifest = contract.manifest_for(base); manifest[field] = value
+    data = package_from_contents(base, manifest)
+    with pytest.raises(contract.PackageValidationError, match=code):
+        contract.validate_package(data, contract.digest(data))
+
+
+def test_package_file_count_and_size_are_bounded(artifact, monkeypatch):
+    data, _, base = artifact
+    monkeypatch.setattr(contract, 'MAX_PACKAGE_BYTES', len(data) - 1)
+    with pytest.raises(contract.PackageValidationError, match='package_too_large'):
+        contract.validate_package(data, contract.digest(data))
+    monkeypatch.setattr(contract, 'MAX_PACKAGE_BYTES', 8 * 1024 * 1024)
+    excessive = {**base, **{f'extra-{index}.txt': b'x' for index in range(contract.MAX_PACKAGE_FILES)}}
+    data = package_from_contents(excessive)
+    with pytest.raises(contract.PackageValidationError, match='package_file_set_invalid'):
+        contract.validate_package(data, contract.digest(data))
+
+
+def test_strict_n_accepts_bridge_then_bridge_contract_accepts_extensible_n_plus_one():
+    bridge = contract.package_bytes(SOURCE, contract.BRIDGE_FILES)
+    full = contract.package_bytes(SOURCE, contract.FILES)
+
+    def strict_n_validate(data):
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            assert set(archive.namelist()) == set(contract.BRIDGE_FILES) | {contract.MANIFEST}
+            contents = {name: archive.read(name) for name in archive.namelist()}
+        manifest = json.loads(contents.pop(contract.MANIFEST))
+        assert manifest == contract.manifest_for(contents)
+        return contents
+
+    with pytest.raises(AssertionError):
+        strict_n_validate(full)
+    bridge_contents = strict_n_validate(bridge)
+    namespace = {'__name__': 'bridge_upgrade_contract'}
+    exec(compile(bridge_contents['upgrade_contract.py'], 'upgrade_contract.py', 'exec'), namespace)
+    manifest, contents = namespace['validate_package'](full, namespace['digest'](full))
+    assert 'rdad_refresh.py' in contents
+    assert manifest['launcher_abi'] == contract.LAUNCHER_ABI
+
+
 @pytest.fixture
 def cp(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'DB_FILE', tmp_path/'cp.db')
@@ -97,7 +210,7 @@ def cp(tmp_path, monkeypatch):
     stamp = main.now_iso()
     with main.db() as con:
         con.execute("INSERT INTO nodes(node_id,name,mode,status,created_at,updated_at) VALUES('testnode','TEST','remote','online',?,?)", (stamp,stamp))
-        con.execute("INSERT INTO node_agents(node_id,status,agent_version,last_heartbeat,capabilities_json,updated_at) VALUES('testnode','online','1.6.0-alpha.4-dev',?,?,?)", (stamp,json.dumps({'deployment_executor':True,'remote_upgrade':True}),stamp))
+        con.execute("INSERT INTO node_agents(node_id,status,agent_version,last_heartbeat,capabilities_json,updated_at) VALUES('testnode','online','1.6.0-alpha.4-dev',?,?,?)", (stamp,json.dumps({'deployment_executor':True,'remote_upgrade':True,'upgrade_manifest_files':True}),stamp))
     return TestClient(main.app)
 
 
@@ -120,6 +233,39 @@ def test_official_artifact_pin_and_download_authorization(cp):
     assert cp.get(url.replace('/testnode/','/cronos/'), headers={'Authorization':'Bearer '+token}).status_code in {401,403}
     info['path'].write_bytes(b'corrupted')
     assert cp.get(url, headers={'Authorization':'Bearer '+token}).status_code == 503
+
+
+def test_control_plane_atomically_chains_bridge_then_full_package_for_strict_node(cp):
+    with main.db() as con:
+        con.execute("UPDATE node_agents SET capabilities_json=? WHERE node_id='testnode'",
+                    (json.dumps({'deployment_executor':True, 'remote_upgrade':True}),))
+    bridge = upgrades.start('testnode')['operation']
+    full = upgrades.official_artifact()
+    assert bridge['artifact_kind'] == 'bridge'
+    assert bridge['package_sha256'] != full['sha256']
+    assert bridge['followup_package_sha256'] == full['sha256']
+    advance(bridge, 'downloading', 'verifying', 'prepared', 'installing', 'restarting', 'awaiting_heartbeat')
+    runtime = {'build_id':bridge['build_id'], 'package_sha256':bridge['package_sha256'],
+               'process_id':'bridge-process', 'pid':202}
+    with main.db() as con:
+        upgrades.observe_heartbeat(con, 'testnode',
+            {'agent_version':bridge['version'], 'runtime':runtime}, main.now_iso())
+        con.execute("UPDATE node_agents SET capabilities_json=? WHERE node_id='testnode'",
+                    (json.dumps({'deployment_executor':True, 'remote_upgrade':True,
+                                 'upgrade_manifest_files':True}),))
+    result = upgrades.event('testnode', bridge['operation_id'], {'phase':'success', 'runtime':runtime})
+    followup = result['followup_operation_id']
+    with main.db() as con:
+        child = con.execute("SELECT * FROM agent_upgrades WHERE operation_id=?", (followup,)).fetchone()
+        command = con.execute("SELECT * FROM agent_commands WHERE command_id=?", (followup,)).fetchone()
+        assert child['artifact_kind'] == 'full' and child['parent_operation_id'] == bridge['operation_id']
+        assert child['package_sha256'] == full['sha256'] and child['before_process'] == 'bridge-process'
+        assert command['status'] == 'queued'
+    # Lost success acknowledgement cannot create a second follow-up operation.
+    upgrades.event('testnode', bridge['operation_id'], {'phase':'success', 'runtime':runtime})
+    with main.db() as con:
+        assert con.execute("SELECT count(*) FROM agent_upgrades WHERE parent_operation_id=?",
+                           (bridge['operation_id'],)).fetchone()[0] == 1
 
 
 def test_busy_and_reverse_exclusion(cp):
@@ -563,11 +709,11 @@ def test_agent_prepares_only_then_external_helper_handoff(short_spool, monkeypat
 
 def test_agent_checksum_failure_does_not_handoff(tmp_path, monkeypatch):
     monkeypatch.setattr(client,'SPOOL',tmp_path)
-    phases = []
+    events = []
     def transport(config,path,payload=None,binary=False):
         if binary: return b'corrupt'
         if payload:
-            phases.append(payload['phase'])
+            events.append(payload)
             return {}
         return {'operation':{'phase':'queued','node_id':'testnode','package_sha256':'0'*64}}
     monkeypatch.setattr(client,'request',transport)
@@ -575,7 +721,7 @@ def test_agent_checksum_failure_does_not_handoff(tmp_path, monkeypatch):
         client.stage_upgrade({'node_id':'testnode'},{'operation_id':'00000000-0000-0000-0000-000000000003'})
     assert (tmp_path/'request.json').exists()  # helper owns durable cleanup; no prepared candidate
     assert not list(tmp_path.glob('*/agent.zip'))
-    assert phases[-1]=='upgrade_failed'
+    assert events[-1] == {'phase':'upgrade_failed', 'error_code':'package_sha256_mismatch'}
     with pytest.raises(ValueError): client.operation_path({'node_id':'testnode'},'../../etc')
     with pytest.raises(RuntimeError): client.NoRedirect().redirect_request(None,None,302,'',{},'https://other')
 

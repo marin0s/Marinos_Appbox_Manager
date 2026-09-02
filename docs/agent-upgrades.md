@@ -12,11 +12,15 @@ Le CP crée automatiquement deux tables SQLite additives, `agent_upgrades` et
 `agent_upgrade_runtime`. Sauvegarder sa base avant déploiement. Aucun changement des
 tables de tokens, aucun réenrôlement. Conserver le volume DATA_DIR et son sous-répertoire
 `agent-upgrades/artifacts`, qui contient les ZIP immuables `<sha256>.zip`.
+La migration forward-compatible ajoute seulement à `agent_upgrades` les métadonnées
+`artifact_kind`, `parent_operation_id` et `followup_*`; elle est idempotente et les lignes
+historiques prennent `artifact_kind=full`.
 
 ## Contrat du package
 
-`python scripts/package_agent.py` génère `agent/appbox-agent-latest.zip` ; `--check`
-vérifie sa reproductibilité. Ordre, LF, permissions, dates ZIP et manifeste sont fixes.
+`python scripts/package_agent.py` génère `agent/appbox-agent-latest.zip` et
+`agent/appbox-agent-bridge.zip` ; `--check` vérifie ensemble leur reproductibilité.
+Ordre, LF, permissions, dates ZIP et manifeste sont fixes.
 `agent-manifest.json` contient protocole, version, SHA-256 de chaque fichier et build_id.
 Le SHA-256 de l'archive complète l'identifie indépendamment de sa version affichée.
 Deux builds différents portant la même version `-dev` sont distingués. Les versions
@@ -24,11 +28,25 @@ numériques et alpha/beta/rc/dev sont ordonnées explicitement ; un downgrade n'
 
 Le CP compare l'archive aux sources distribuées avant de l'offrir. Il en fige une copie
 par checksum au démarrage de l'opération. L'agent et le helper vérifient chacun le SHA,
-la liste exacte des fichiers, leur type régulier, les doublons, le manifeste, les hashes
-et la syntaxe Python. Taille archive et contenu décompressé limités à 8 Mio. Ni traversal,
-ni liens, ni fichiers spéciaux, ni script supplémentaire. Aucun `extractall`, aucune
+la correspondance exacte entre les entrées ZIP et `manifest.files`, leur type régulier,
+les doublons, le manifeste, les hashes et la syntaxe Python. Taille archive et contenu
+décompressé limités à 8 Mio, chaque fichier à 4 Mio et le package à 64 fichiers applicatifs.
+Les noms sont plats et bornés : ni traversal, chemin absolu, séparateur, lien, fichier
+spécial ou entrée cachée non déclarée. Aucun `extractall`, aucune
 exécution de `install-agent.sh` ou d'un hook arbitraire fourni par le ZIP lors de l'upgrade.
 Les entrées agent, lanceur et réconciliation systemd sont définies par le code validé.
+
+Le manifeste authentifié par le SHA-256 immuable de l'opération est l'autorité sur les
+modules applicatifs extensibles. Tous ses fichiers sont individuellement hashés et le ZIP
+doit contenir exactement cet ensemble plus `agent-manifest.json`. Une racine de confiance
+minimale reste obligatoire : agent principal, contrat/client/helper/launcher d'upgrade,
+installeur et unités systemd actuelles. Un nouveau module déclaré peut donc être ajouté,
+mais un package incomplet ou contenant un fichier non déclaré reste refusé.
+
+`protocol=1` et `launcher_abi=1` sont contrôlés explicitement avant toute préparation.
+Une valeur différente produit respectivement `protocol_incompatible` ou
+`launcher_abi_incompatible`. Étendre la liste des modules ne change ni le protocole HTTP,
+ni les points d'entrée `tick/recover/probe`, donc cette livraison conserve les deux valeurs.
 
 La logique d'upgrade est désormais versionnée : `upgrade_helper.py`, `upgrade_client.py`
 et `upgrade_contract.py` évoluent avec chaque release. La comparaison octet pour octet
@@ -176,12 +194,34 @@ Un état illisible conserve le timer rapide pour permettre diagnostic/récupéra
 défaut de migration ne déclenche pas un rollback tardif de l'agent déjà confirmé et ne
 remplace pas son contrôleur par rescue : la migration reste à reprendre.
 
+### Bridge automatique depuis un validateur à allowlist stricte
+
+Les releases managed antérieures à cette correction annoncent `remote_upgrade=true` mais
+pas `upgrade_manifest_files`. Le Control Plane leur propose d'abord
+`appbox-agent-bridge.zip`. Ce ZIP contient exactement l'ancienne allowlist, sans
+`rdad_refresh.py`; l'ancien validateur peut donc vérifier normalement son SHA, son manifeste
+et tous ses fichiers. L'agent de bridge tolère temporairement l'absence du module RDAD,
+mais embarque le nouveau contrat et annonce `upgrade_manifest_files=true`.
+
+Le SHA et les métadonnées du package complet sont épinglés dès la demande initiale. Lorsque
+le heartbeat et le helper confirment la bridge, la même transaction SQLite qui termine
+l'opération crée une seconde opération `full` et sa commande agent, liée par
+`parent_operation_id`. Une réponse de succès perdue est idempotente et ne peut pas dupliquer
+ce follow-up. Le nouvel agent télécharge alors le package complet, dont le manifeste déclare
+`rdad_refresh.py`, et le valide avec le contrat extensible. Les garanties current/previous,
+controller/rescue, confirmation et rollback s'appliquent séparément aux deux activations.
+
+Ainsi un node comme ARTEMIS suit `N strict → bridge → N+1 complet` depuis une seule demande
+manuelle au Control Plane, sans SSH, copie ou modification de configuration sur le node.
+Un échec de bridge laisse N actif ou déclenche son rollback habituel; un échec du package
+complet revient à la bridge confirmée, qui reste capable de retenter l'opération.
+
 ### Migration automatique depuis les nodes au timer 5 s
 
-1. Le contrôleur déjà installé active ce package par le protocole existant ; la liste
-   stricte des fichiers ZIP, `protocol=1` et `launcher_abi=1` sont inchangés. `.path` et
-   drop-in sont générés depuis le module client livré, sans ajouter d'entrée ZIP que
-   l'ancien validateur refuserait.
+1. Le contrôleur déjà installé active soit directement le package extensible s'il annonce
+   la capacité correspondante, soit la bridge compatible avec son ancienne liste stricte.
+   `protocol=1` et `launcher_abi=1` restent inchangés. `.path` et drop-in sont générés depuis
+   le module client livré.
 2. Après heartbeat confirmé, probe et acquittement CP, controller passe à la nouvelle
    release. Le prochain tick de l'ancien timer exécute ce nouveau helper.
 3. Il journalise les unités précédentes, remplace les fichiers, fait daemon-reload,
@@ -236,6 +276,12 @@ le node refuse les nouvelles commandes/jobs métier, le placement et le provisio
 Les trois boucles de l'agent restent séparées. Le statut ONLINE/OFFLINE et les métriques
 restent ceux du lot 2 ; `restart_expected` indique une courte interruption attendue
 sans transformer un agent réellement offline en online.
+
+Les erreurs de préparation persistées distinguent : `package_download_failed`,
+`package_too_large`, `package_sha256_mismatch`, `manifest_invalid`,
+`package_file_set_invalid`, `package_file_checksum_mismatch`, `protocol_incompatible`,
+`launcher_abi_incompatible`, `package_path_unsafe` et `package_preparation_failed`.
+Ces codes ne contiennent ni URL, token, contenu reçu ou exception interne.
 
 ## API et UI
 

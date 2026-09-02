@@ -6,7 +6,7 @@ import uuid
 import zipfile
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from agent.upgrade_contract import (MAX_PACKAGE_BYTES, PHASES, TERMINAL, digest,
+from agent.upgrade_contract import (BRIDGE_FILES, FILES, MAX_PACKAGE_BYTES, PHASES, TERMINAL, digest,
     fsync_directory, package_bytes, update_status, validate_package)
 
 
@@ -31,6 +31,18 @@ def init_schema(con):
         );
         CREATE INDEX IF NOT EXISTS agent_upgrades_node ON agent_upgrades(node_id, created_at);
     """)
+    columns = {row[1] for row in con.execute("PRAGMA table_info(agent_upgrades)")}
+    additions = {
+        "artifact_kind": "TEXT NOT NULL DEFAULT 'full'",
+        "parent_operation_id": "TEXT",
+        "followup_version": "TEXT",
+        "followup_build_id": "TEXT",
+        "followup_package_sha256": "TEXT",
+        "followup_size_bytes": "INTEGER",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            con.execute(f"ALTER TABLE agent_upgrades ADD COLUMN {name} {definition}")
 
 
 def active(con, node_id):
@@ -56,15 +68,18 @@ def require_idle(con, node_id):
         raise HTTPException(409, "Mise à jour agent en cours : nouvelle commande interdite.")
 
 
-def official_artifact(pin=False):
+def official_artifact(pin=False, kind="full"):
     main = host()
     source = main.AGENT_ASSET_DIR
-    path = source / "appbox-agent-latest.zip"
+    if kind not in {"full", "bridge"}:
+        raise HTTPException(503, "Type de package agent invalide.")
+    path = source / ("appbox-agent-latest.zip" if kind == "full" else "appbox-agent-bridge.zip")
+    expected_files = FILES if kind == "full" else BRIDGE_FILES
     try:
         if path.stat().st_size > MAX_PACKAGE_BYTES:
             raise ValueError("Oversize package")
         data = path.read_bytes()
-        if data != package_bytes(source):
+        if data != package_bytes(source, expected_files):
             raise ValueError("Package differs from shipped sources")
         sha = digest(data)
         manifest, _ = validate_package(data, sha)
@@ -86,7 +101,7 @@ def official_artifact(pin=False):
                 finally:
                     temporary.unlink(missing_ok=True)
         return {"version":manifest["version"], "build_id":manifest["build_id"],
-                "sha256":sha, "size_bytes":len(data), "path":path}
+                "sha256":sha, "size_bytes":len(data), "path":path, "kind":kind}
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, SyntaxError):
         raise HTTPException(503, "Package agent absent, incohérent ou invalide.") from None
 
@@ -131,19 +146,21 @@ def decorate_nodes(nodes):
 
 def start(node_id, bootstrap=False, expected_sha=None):
     main = host()
-    artifact = official_artifact(pin=True)
-    if (bootstrap or expected_sha is not None) and expected_sha != artifact["sha256"]:
+    full_artifact = official_artifact(pin=True)
+    if (bootstrap or expected_sha is not None) and expected_sha != full_artifact["sha256"]:
         raise HTTPException(409, "Le bootstrap ne correspond pas au package officiel.")
     node = next((n for n in main.list_control_nodes() if n["node_id"] == node_id), None)
     if not node or not node["agent_online"] or node["status"] != "online" or node["is_local"] or node_id.lower() == "cronos":
         raise HTTPException(409, "Agent indisponible, en maintenance ou Control Plane.")
     if not bootstrap and not node.get("capabilities", {}).get("remote_upgrade"):
         raise HTTPException(409, "Bootstrap opérateur requis : cet agent ne sait pas se mettre à jour.")
-    if update_status(node["upgrade"]["installed_version"], artifact["version"]) == "unknown":
+    if update_status(node["upgrade"]["installed_version"], full_artifact["version"]) == "unknown":
         raise HTTPException(409, "Version installée inconnue : vérification opérateur requise.")
-    if update_status(node["upgrade"]["installed_version"], artifact["version"],
-                     node["upgrade"].get("installed_build_id"), artifact["build_id"]) == "up_to_date":
+    if update_status(node["upgrade"]["installed_version"], full_artifact["version"],
+                     node["upgrade"].get("installed_build_id"), full_artifact["build_id"]) == "up_to_date":
         raise HTTPException(409, "Agent déjà à jour ; aucun downgrade automatique.")
+    needs_bridge = not bootstrap and not node.get("capabilities", {}).get("upgrade_manifest_files")
+    artifact = official_artifact(pin=True, kind="bridge") if needs_bridge else full_artifact
     operation_id = str(uuid.uuid4())
     stamp = main.now_iso()
     with main.db_lock, main.db() as con:
@@ -152,10 +169,15 @@ def start(node_id, bootstrap=False, expected_sha=None):
             raise HTTPException(409, "Une opération incompatible est en cours ou en attente.")
         runtime = con.execute("SELECT process_id FROM agent_upgrade_runtime WHERE node_id=?", (node_id,)).fetchone()
         con.execute("""INSERT INTO agent_upgrades(operation_id,node_id,phase,version,build_id,package_sha256,
-                    size_bytes,before_process,deadline_epoch,created_at,updated_at)
-                    VALUES(?,?,'queued',?,?,?,?,?,?,?,?)""",
+                    size_bytes,before_process,deadline_epoch,created_at,updated_at,artifact_kind,
+                    followup_version,followup_build_id,followup_package_sha256,followup_size_bytes)
+                    VALUES(?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (operation_id,node_id,artifact["version"],artifact["build_id"],artifact["sha256"],
-                     artifact["size_bytes"],runtime["process_id"] if runtime else None,time.time()+900,stamp,stamp))
+                     artifact["size_bytes"],runtime["process_id"] if runtime else None,time.time()+900,stamp,stamp,
+                     artifact["kind"],full_artifact["version"] if needs_bridge else None,
+                     full_artifact["build_id"] if needs_bridge else None,
+                     full_artifact["sha256"] if needs_bridge else None,
+                     full_artifact["size_bytes"] if needs_bridge else None))
         if not bootstrap:
             con.execute("""INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,created_at)
                          VALUES(?,?,'agent_upgrade',?,'queued',?)""",
@@ -221,7 +243,10 @@ def event(node_id, operation_id, payload):
                     or proof.get("process_id") != runtime["process_id"] or proof.get("pid") != runtime["pid"]):
                 raise HTTPException(409, "Nouveau heartbeat non confirmé.")
         error = payload.get("error_code")
-        codes = {"preparation_failed","candidate_rejected","installation_failed","confirmation_timeout",
+        codes = {"preparation_failed","package_download_failed","package_too_large","package_sha256_mismatch",
+                 "manifest_invalid","package_file_set_invalid","package_file_checksum_mismatch",
+                 "protocol_incompatible","launcher_abi_incompatible","package_path_unsafe",
+                 "package_preparation_failed","candidate_rejected","installation_failed","confirmation_timeout",
                  "activation_or_confirmation_failed","previous_agent_return_unconfirmed","rollback_unconfirmed",
                  "controller_failed","candidate_controller_failed"}
         error = error if error in codes else None
@@ -230,7 +255,25 @@ def event(node_id, operation_id, payload):
         if phase in TERMINAL:
             con.execute("UPDATE agent_commands SET status=?,completed_at=? WHERE command_id=? AND node_id=?",
                         ("success" if phase == "success" else "failed",main.now_iso(),operation_id,node_id))
-    return {"status":"ok"}
+        followup_operation_id = None
+        if phase == "success" and row["followup_package_sha256"]:
+            existing = con.execute("SELECT operation_id FROM agent_upgrades WHERE parent_operation_id=?", (operation_id,)).fetchone()
+            if existing:
+                followup_operation_id = existing["operation_id"]
+            else:
+                followup_operation_id = str(uuid.uuid4())
+                stamp = main.now_iso()
+                runtime = con.execute("SELECT process_id FROM agent_upgrade_runtime WHERE node_id=?", (node_id,)).fetchone()
+                con.execute("""INSERT INTO agent_upgrades(operation_id,node_id,phase,version,build_id,
+                    package_sha256,size_bytes,before_process,deadline_epoch,created_at,updated_at,
+                    artifact_kind,parent_operation_id) VALUES(?,?,'queued',?,?,?,?,?,?,?,?, 'full',?)""",
+                    (followup_operation_id,node_id,row["followup_version"],row["followup_build_id"],
+                     row["followup_package_sha256"],row["followup_size_bytes"],
+                     runtime["process_id"] if runtime else None,time.time()+900,stamp,stamp,operation_id))
+                con.execute("""INSERT INTO agent_commands(command_id,node_id,command_type,payload_json,status,created_at)
+                    VALUES(?,?,'agent_upgrade',?,'queued',?)""",
+                    (followup_operation_id,node_id,json.dumps({"operation_id":followup_operation_id}),stamp))
+    return {"status":"ok", "followup_operation_id":followup_operation_id}
 
 
 def install_routes(app):

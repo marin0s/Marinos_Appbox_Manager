@@ -37,7 +37,10 @@ except ModuleNotFoundError:
 try:
     from agent.rdad_refresh import TargetedRefreshEngine
 except ModuleNotFoundError:
-    from rdad_refresh import TargetedRefreshEngine
+    try:
+        from rdad_refresh import TargetedRefreshEngine
+    except ModuleNotFoundError:
+        TargetedRefreshEngine = None  # bridge release: application modules arrive in the follow-up package
 
 # Capture once: resolving current again after activation would misidentify this process.
 RUNTIME_IDENTITY = runtime_identity(__file__)
@@ -1626,6 +1629,7 @@ def heartbeat(config, metrics=None, active_command_id=""):
             "reference_build_command_lease": True,
             "reference_build_delivery_ack": True,
             "remote_upgrade": RUNTIME_IDENTITY["managed"],
+            "upgrade_manifest_files": True,
         },
     }
     return api(
@@ -2479,6 +2483,8 @@ class AgentLoops:
             self.stop.wait(self.command_interval)
 
     def rdad_refresh_loop(self):
+        if TargetedRefreshEngine is None:
+            return
         engine = TargetedRefreshEngine(self.config)
         while not self.stop.is_set():
             try:
@@ -2505,7 +2511,7 @@ class AgentLoops:
         ]
         # The real node runtime is POSIX. Tests and diagnostic imports on other
         # platforms start this loop only when explicitly requested.
-        if os.name == 'posix' or 'rdad_refresh_enabled' in self.config:
+        if TargetedRefreshEngine is not None and (os.name == 'posix' or 'rdad_refresh_enabled' in self.config):
             background.append(('agent-rdad-refresh', self.rdad_refresh_loop))
         workers = [Thread(target=target, name=name, daemon=True) for name, target in background]
         for worker in workers:

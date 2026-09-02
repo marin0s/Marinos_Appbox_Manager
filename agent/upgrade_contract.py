@@ -13,17 +13,32 @@ from pathlib import Path
 PROTOCOL = 1
 LAUNCHER_ABI = 1
 MAX_PACKAGE_BYTES = 8 * 1024 * 1024
+MAX_PACKAGE_FILES = 64
+MAX_PACKAGE_FILE_BYTES = 4 * 1024 * 1024
+BRIDGE_FILES = (
+    "install-agent.sh", "marinos-appbox-agent.py", "marinos-appbox-agent.service",
+    "reference_contract.py", "upgrade_contract.py", "upgrade_client.py",
+    "upgrade_helper.py", "marinos-appbox-updater.service", "marinos-appbox-updater.timer",
+    "upgrade_launcher.py", "managed-agent.service",
+)
 FILES = (
     "install-agent.sh", "marinos-appbox-agent.py", "marinos-appbox-agent.service",
     "reference_contract.py", "rdad_refresh.py", "upgrade_contract.py", "upgrade_client.py",
     "upgrade_helper.py", "marinos-appbox-updater.service", "marinos-appbox-updater.timer",
     "upgrade_launcher.py", "managed-agent.service",
 )
+REQUIRED_FILES = frozenset(BRIDGE_FILES)
 HELPER_FILES = ("upgrade_helper.py", "upgrade_contract.py", "upgrade_client.py")
 MANIFEST = "agent-manifest.json"
 TERMINAL = {"success", "upgrade_failed", "rolled_back", "rollback_failed"}
 PHASES = ("queued", "downloading", "verifying", "prepared", "installing",
           "restarting", "awaiting_heartbeat", "rolling_back", *sorted(TERMINAL))
+
+
+class PackageValidationError(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
 
 
 def digest(data):
@@ -71,9 +86,9 @@ def manifest_for(contents):
             "build_id": digest(canonical(hashes)), "files": hashes}
 
 
-def package_bytes(source):
+def package_bytes(source, files=FILES):
     contents = {}
-    for name in FILES:
+    for name in files:
         data = (Path(source) / name).read_bytes().replace(b"\r\n", b"\n")
         if b"\r" in data:
             raise ValueError("Bare CR in package")
@@ -91,30 +106,83 @@ def package_bytes(source):
 
 
 def validate_package(data, expected_sha):
-    if not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha)) or digest(data) != expected_sha:
-        raise ValueError("Agent package checksum mismatch")
     if not 0 < len(data) <= MAX_PACKAGE_BYTES:
-        raise ValueError("Agent package size rejected")
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        members = archive.infolist()
-        names = [m.filename for m in members]
-        if len(names) != len(set(names)) or set(names) != set(FILES) | {MANIFEST}:
-            raise ValueError("Agent package file allowlist mismatch")
-        if sum(m.file_size for m in members) > MAX_PACKAGE_BYTES:
-            raise ValueError("Expanded agent package too large")
-        for member in members:
-            if member.flag_bits & 1 or stat.S_IFMT(member.external_attr >> 16) != stat.S_IFREG:
-                raise ValueError("Agent package file type rejected")
-        contents = {m.filename: archive.read(m) for m in members}
-    manifest = json.loads(contents.pop(MANIFEST))
-    if manifest != manifest_for(contents):
-        raise ValueError("Agent manifest inconsistent")
-    validate_managed_unit(contents["managed-agent.service"])
+        raise PackageValidationError("package_too_large")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha)) or digest(data) != expected_sha:
+        raise PackageValidationError("package_sha256_mismatch")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            members = archive.infolist()
+            names = [m.filename for m in members]
+            if len(names) != len(set(names)):
+                raise PackageValidationError("package_file_set_invalid")
+            if not 1 < len(names) <= MAX_PACKAGE_FILES + 1:
+                raise PackageValidationError("package_file_set_invalid")
+            if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name) for name in names):
+                raise PackageValidationError("package_path_unsafe")
+            if MANIFEST not in names:
+                raise PackageValidationError("manifest_invalid")
+            if (sum(m.file_size for m in members) > MAX_PACKAGE_BYTES
+                    or any(m.file_size > MAX_PACKAGE_FILE_BYTES for m in members)):
+                raise PackageValidationError("package_too_large")
+            for member in members:
+                if (member.flag_bits & 1 or member.compress_type != zipfile.ZIP_STORED
+                        or stat.S_IFMT(member.external_attr >> 16) != stat.S_IFREG):
+                    raise PackageValidationError("package_path_unsafe")
+            contents = {m.filename: archive.read(m) for m in members}
+    except PackageValidationError:
+        raise
+    except (OSError, zipfile.BadZipFile):
+        raise PackageValidationError("manifest_invalid") from None
+    try:
+        def unique_object(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError
+                value[key] = item
+            return value
+        manifest = json.loads(contents.pop(MANIFEST), object_pairs_hook=unique_object)
+        if set(manifest) != {"protocol", "launcher_abi", "version", "build_id", "files"}:
+            raise ValueError
+        files = manifest["files"]
+        if not isinstance(files, dict) or not REQUIRED_FILES.issubset(files):
+            raise PackageValidationError("package_file_set_invalid")
+        if set(contents) != set(files):
+            raise PackageValidationError("package_file_set_invalid")
+        if any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+               for value in files.values()):
+            raise ValueError
+    except PackageValidationError:
+        raise
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise PackageValidationError("manifest_invalid") from None
+    if type(manifest["protocol"]) is not int or manifest["protocol"] != PROTOCOL:
+        raise PackageValidationError("protocol_incompatible")
+    if type(manifest["launcher_abi"]) is not int or manifest["launcher_abi"] != LAUNCHER_ABI:
+        raise PackageValidationError("launcher_abi_incompatible")
+    try:
+        expected_version = source_version(contents["marinos-appbox-agent.py"])
+    except (UnicodeDecodeError, ValueError):
+        raise PackageValidationError("manifest_invalid") from None
+    if manifest["version"] != expected_version:
+        raise PackageValidationError("manifest_invalid")
+    if manifest["build_id"] != digest(canonical(files)):
+        raise PackageValidationError("manifest_invalid")
+    if any(digest(contents[name]) != checksum for name, checksum in files.items()):
+        raise PackageValidationError("package_file_checksum_mismatch")
+    try:
+        validate_managed_unit(contents["managed-agent.service"])
+    except (UnicodeDecodeError, ValueError):
+        raise PackageValidationError("manifest_invalid") from None
     for name, data in contents.items():
         if b"\r" in data:
-            raise ValueError("Noncanonical package")
+            raise PackageValidationError("manifest_invalid")
         if name.endswith(".py"):
-            compile(data, name, "exec")  # syntax only, never execute downloaded code
+            try:
+                compile(data, name, "exec")  # syntax only, never execute downloaded code
+            except SyntaxError:
+                raise PackageValidationError("manifest_invalid") from None
     return manifest, contents
 
 
@@ -199,9 +267,11 @@ def prepare_release(root, data, expected_sha):
     root.mkdir(parents=True, exist_ok=True)
     target = root / expected_sha
     if target.exists():
-        if target.is_symlink() or any((target / name).is_symlink() or
+        expected_names = set(manifest["files"]) | {MANIFEST, "release-receipt.json"}
+        if (target.is_symlink() or set(path.name for path in target.iterdir()) != expected_names
+                or any((target / name).is_symlink() or
                 not (target / name).is_file() or digest((target / name).read_bytes()) != manifest["files"][name]
-                for name in FILES):
+                for name in manifest["files"])):
             raise ValueError("Existing release differs from artifact")
         receipt = target / "release-receipt.json"
         metadata = target / MANIFEST

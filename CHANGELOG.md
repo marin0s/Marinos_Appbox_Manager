@@ -61,6 +61,9 @@
 - Recette et limites documentées dans `docs/appbox-deletion-hotfix.md`.
 
 ### Supervision agent sans polling permanent en idle
+- Compatibilité forward des packages managed : le manifeste authentifié déclare une liste extensible mais exacte et hashée, avec racine de fichiers obligatoires, limites de taille/nombre, chemins plats et contrôles explicites protocol/launcher ABI.
+- Les agents déjà déployés avec l'ancienne allowlist passent automatiquement par un package bridge reproductible, strictement compatible avec N, puis une seconde opération atomiquement chaînée installe le package complet contenant les nouveaux modules comme `rdad_refresh.py`.
+- Les échecs de préparation exposent désormais un code borné distinguant téléchargement, taille, SHA, manifeste, ensemble de fichiers, checksum, chemin, protocole, ABI et préparation locale, sans contenu sensible.
 - Réveil systemd sur la demande durable, timer rapide seulement pendant upgrade/reprise/notifications ; contrôle au boot puis retour idle, sans nouveau daemon.
 - Migration automatique du timer 5 s des nodes managed depuis une release confirmée : path/drop-in connus, écritures atomiques, sauvegarde et reprise/restauration durables, daemon-reload et activations asynchrones vérifiées.
 - Scheduling versionné épinglé indépendamment de current/controller/rescue ; lanceur et service de base fixes, agent.json, protocole/ABI 1, liste ZIP et rollback agent inchangés.
